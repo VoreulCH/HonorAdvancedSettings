@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <group
+        android:rotation="45"
+        android:pivotX="54"
+        android:pivotY="54">
+        <!-- full capsule base: red -->
+        <path
+            android:fillColor="#FF4136"
+            android:pathData="M26,54 a12,12 0 0 1 12,-12 h32 a12,12 0 0 1 0,24 h-32 a12,12 0 0 1 -12,-12 z" />
+        <!-- right half overlay: white -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M54,42 h16 a12,12 0 0 1 0,24 h-16 z" />
+        <!-- seam -->
+        <path
+            android:fillColor="#E8EAED"
+            android:pathData="M53,42 h2 v24 h-2 z" />
+        <!-- gloss on the red half -->
+        <path
+            android:fillColor="#66FFFFFF"
+            android:pathData="M36,46 h10 a2,2 0 0 1 2,2 v3 a2,2 0 0 1 -2,2 h-10 a2,2 0 0 1 -2,-2 v-3 a2,2 0 0 1 2,-2 z" />
+        <!-- outline so the white half reads on light launchers -->
+        <path
+            android:strokeColor="#D5D9DE"
+            android:strokeWidth="1"
+            android:fillColor="#00000000"
+            android:pathData="M26,54 a12,12 0 0 1 12,-12 h32 a12,12 0 0 1 0,24 h-32 a12,12 0 0 1 -12,-12 z" />
+    </group>
+</vector>
