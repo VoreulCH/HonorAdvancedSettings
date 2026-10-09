@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="xposed_scope">
+        <item>com.android.systemui</item>
+        <item>com.hihonor.android.launcher</item>
+        <item>com.hihonor.desktop.systemui</item>
+        <item>com.hihonor.photos</item>
+        <item>com.android.packageinstaller</item>
+        <item>android</item>
+    </string-array>
+</resources>
