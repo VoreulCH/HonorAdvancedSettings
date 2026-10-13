@@ -107,17 +107,17 @@ build-tools, Xposed api-82) into `tools/` before building.
 │   ├── src/io/github/voreulch/honoradvanced/
 │   │   ├── MainHook.java          # 入口分发 / entry dispatch
 │   │   ├── GlassHook.java         # 液态玻璃钩子 / liquid-glass hooks
-│   │   ├── InstallerHook.java     # 安装器净化钩子 / installer hooks
+│   │   ├── InstallerHook.java     # 安装器净化钩子（含旧版安装器兼容钩子集）/ installer hooks (incl. legacy-installer compat set)
 │   │   ├── Cfg.java               # 配置快照与门控 / config snapshot & gating
 │   │   ├── CfgProvider.java       # 跨进程配置桥 / cross-process config bridge
 │   │   └── SettingsActivity.java  # 模块界面 / module UI
-│   └── inject_dex.py              # dex 注入打包辅助 / packaging helper
-├── build.ps1                       # 一键构建流水线 / one-shot build pipeline
+├── build.ps1                       # 一键构建流水线（含 dex/资产注入）/ one-shot build pipeline (dex & asset injection included)
 └── voreulch.keystore               # 签名密钥（不入库）/ signing key (not committed)
 ```
 
 ## 版本历史 / Changelog
 
+* **1.4.20**（2026-10-14）：安装器净化新增「兼容模式」开关——安装器为较旧版本（如 14.0.22.x）时开启，切换到旧方案钩子集；其余开关在兼容模式下同样生效，关闭即恢复原行为，总开关关闭时全部回退原厂。
 * **1.4.19**（2026-10-10）：公开首发。整合液态玻璃（系统 / 锁屏 / 相册三线 + 总开关）与安装器净化（安全检测跳过 / 禁网 / 信息卡 / 降级安装）为单一模块；全新界面（分段胶囊底栏、玻璃卡片弹窗、捐赠与 QQ 群入口）；ContentProvider 跨进程配置同步；Android 15+ edge-to-edge 兼容。
   First public release: merges the liquid-glass lines (system / lock screen / gallery + master switch) and installer purify into one module, with a brand-new UI, cross-process config sync and Android 15+ edge-to-edge compatibility.
 
