@@ -47,10 +47,11 @@ public final class Cfg {
     public static final String K_PURIFY = "purify";       // installer purify master
     public static final String K_INFOCARD = "infocard";   // package info card
     public static final String K_DOWNGRADE = "downgrade"; // allow downgrade installs
+    public static final String K_COMPAT = "compat";       // installer compat mode (newer installer builds, e.g. 14.0.22.x)
 
     public static final String[] KEYS = {
             K_GLASS, K_SYSTEM, K_KEYGUARD, K_GALLERY,
-            K_PURIFY, K_INFOCARD, K_DOWNGRADE,
+            K_PURIFY, K_INFOCARD, K_DOWNGRADE, K_COMPAT,
     };
 
     /** null = preload not landed yet (default ON); set once, then frozen
@@ -63,12 +64,17 @@ public final class Cfg {
 
     /** hook side: pure memory read — no locks, no binder, no blocking. */
     public static boolean isOn(String key) {
+        return isOnDef(key, true);
+    }
+
+    /** same as isOn but with an explicit default (used by K_COMPAT: off unless confirmed). */
+    public static boolean isOnDef(String key, boolean def) {
         Map<String, Boolean> m = sSnapshot;
         if (m == null) {
-            return true; // standalone modules' default-ON behavior
+            return def;
         }
         Boolean v = m.get(key);
-        return v == null || v.booleanValue();
+        return v == null ? def : v.booleanValue();
     }
 
     /**
