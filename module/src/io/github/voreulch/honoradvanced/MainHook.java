@@ -18,13 +18,13 @@ public final class MainHook implements IXposedHookLoadPackage {
         ClassLoader cl = lpparam.classLoader;
 
         if ("android".equals(pkg)) {
-            XposedBridge.log("[HAS] v1.2.3 in system_server");
+            XposedBridge.log("[HAS] v1.4.20 in system_server");
             Cfg.startPreload(true); // observer: downgrade switch without reboot
             InstallerHook.initSystemServer(cl);
             return;
         }
         if ("com.android.packageinstaller".equals(pkg)) {
-            XposedBridge.log("[HAS] v1.2.3 in packageinstaller");
+            XposedBridge.log("[HAS] v1.4.20 in packageinstaller");
             Cfg.startPreload(true); // observer: "next install" picks up changes
             InstallerHook.init(cl);
             return;
