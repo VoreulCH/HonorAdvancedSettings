@@ -51,10 +51,16 @@ public class SettingsActivity extends Activity {
     private static class Binding {
         final String key;
         final boolean restart; // glass line needs a scope restart, installer line doesn't
+        final boolean def;     // default switch state (compat mode defaults OFF)
 
         Binding(String key, boolean restart) {
+            this(key, restart, true);
+        }
+
+        Binding(String key, boolean restart, boolean def) {
             this.key = key;
             this.restart = restart;
+            this.def = def;
         }
     }
 
@@ -67,9 +73,14 @@ public class SettingsActivity extends Activity {
     private static final Binding B_PURIFY   = new Binding(Cfg.K_PURIFY, false);
     private static final Binding B_INFOCARD = new Binding(Cfg.K_INFOCARD, false);
     private static final Binding B_DOWNGRADE = new Binding(Cfg.K_DOWNGRADE, false);
+    private static final Binding B_COMPAT   = new Binding(Cfg.K_COMPAT, false, false);
 
     private boolean prefsOn(String key) {
-        return getSharedPreferences(Cfg.PREFS_FILE, MODE_PRIVATE).getBoolean(key, true);
+        return prefsOn(key, true);
+    }
+
+    private boolean prefsOn(String key, boolean def) {
+        return getSharedPreferences(Cfg.PREFS_FILE, MODE_PRIVATE).getBoolean(key, def);
     }
 
     @Override
@@ -102,7 +113,10 @@ public class SettingsActivity extends Activity {
         }
         for (String k : Cfg.KEYS) {
             if (!p.contains(k)) {
-                ed.putBoolean(k, true);
+                // everything defaults ON except compat — auto-true here would
+                // silently enable compat on old-installer devices and gate the
+                // legacy set off (purify line dead). Compat must stay opt-in.
+                ed.putBoolean(k, !Cfg.K_COMPAT.equals(k));
                 dirty = true;
             }
         }
@@ -387,8 +401,9 @@ public class SettingsActivity extends Activity {
                 {"总开关", "跳过安全检测与指纹验证、禁止联网、隐藏推广及多余卡片，关闭后全部回退原厂", B_PURIFY},
                 {"安装包信息卡", "展示版本 / 大小 / SDK / 架构信息卡；关闭时同时隐藏安全模式提醒", B_INFOCARD},
                 {"允许降级安装", "允许安装低于当前版本号的 APK", B_DOWNGRADE},
+                {"兼容模式", "安装器为较旧版本时开启，切换到旧方案；其余开关同样生效", B_COMPAT},
         }, false));
-        box.addView(footnote("开关改动后重启作用域生效，降级安装需重启手机。"));
+        box.addView(footnote("开关后需重启安装器生效，降级开关需重启手机生效"));
 
         return sv;
     }
@@ -962,7 +977,7 @@ public class SettingsActivity extends Activity {
         } catch (Throwable ignored) {
         }
         // set before the listener so restoring the stored state fires nothing
-        sw.setChecked(prefsOn(b.key));
+        sw.setChecked(prefsOn(b.key, b.def));
         sw.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             @Override
             public void onCheckedChanged(CompoundButton button, boolean isChecked) {
