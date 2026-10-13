@@ -65,6 +65,9 @@ public final class CfgProvider extends ContentProvider {
         if (Cfg.K_DOWNGRADE.equals(key)) {
             return p.getBoolean("downgrade", true);
         }
+        if (Cfg.K_COMPAT.equals(key)) {
+            return false; // opt-in: only newer installer builds need it
+        }
         return true; // K_SYSTEM / K_PURIFY had no legacy counterpart
     }
 
