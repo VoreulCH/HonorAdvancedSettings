@@ -43,6 +43,21 @@ public final class InstallerHook {
         return Cfg.isOn(Cfg.K_PURIFY);
     }
 
+    /** compat mode: opt-in (default off), for newer installer builds (14.0.22.x line). */
+    private static boolean compatOn() {
+        return Cfg.isOnDef(Cfg.K_COMPAT, false);
+    }
+
+    /** old-obfuscation hook set (ly1/r12/g82/...) active: master on AND compat off. */
+    private static boolean legacyPurify() {
+        return purifyOn() && !compatOn();
+    }
+
+    /** compat hook set (br0/js0/nz0/oo0/c01/...) active: master on AND compat on. */
+    private static boolean compatPurify() {
+        return purifyOn() && compatOn();
+    }
+
     private static boolean on(String key) {
         return purifyOn() && Cfg.isOn(key);
     }
@@ -58,6 +73,15 @@ public final class InstallerHook {
         hookSafeResultBanner(cl);
         hookCleanCacheCard(cl);
         hookAllowDowngrade(cl);
+        // --- compat set for newer installer builds (e.g. 14.0.22.326) ---
+        hookSecurityCheckCompat(cl);
+        hookFingerprintAuthCompat(cl);
+        hookDiversionWaitCompat(cl);
+        hookCleanCacheCardCompat(cl);
+        hookSafeModeBannerCompat(cl);
+        hookSafeModeCardInfoCompat(cl);
+        hookAdRecommendCompat(cl);
+        hookSafeResultBannerCompat(cl);
     }
 
     public static void initSystemServer(ClassLoader cl) {
@@ -73,7 +97,7 @@ public final class InstallerHook {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                            if (!purifyOn()) return;
+                            if (!legacyPurify()) return;
                             try {
                                 Object dVar = param.args[10];
                                 Method m = dVar.getClass().getMethod("a", respClz);
@@ -98,7 +122,7 @@ public final class InstallerHook {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            if (purifyOn()) param.setResult(true);
+                            if (legacyPurify()) param.setResult(true);
                         }
                     });
             XposedBridge.log(TAG + "hook z62.E ok");
@@ -177,7 +201,7 @@ public final class InstallerHook {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            if (!purifyOn()) return;
+                            if (!legacyPurify()) return;
                             param.setResult(on(K_INFOCARD));
                         }
                     });
@@ -191,7 +215,7 @@ public final class InstallerHook {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            if (on(K_INFOCARD)) param.setResult(null);
+                            if (legacyPurify() && on(K_INFOCARD)) param.setResult(null);
                         }
                     });
             XposedBridge.log(TAG + "hook r12.s ok");
@@ -207,7 +231,7 @@ public final class InstallerHook {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            if (!on(K_INFOCARD)) return;
+                            if (!legacyPurify()) return;
                             try {
                                 fillInfoCard((View) param.args[0], (Activity) param.args[2], 0);
                             } catch (Throwable t) {
@@ -232,10 +256,27 @@ public final class InstallerHook {
         }
         PackageInfo newInfo = null;
         String pkgName = null;
+        // field names differ across installer builds: old line uses t0/x0,
+        // the 14.0.22.x compat line uses q0/u0 — try both.
         try {
             newInfo = (PackageInfo) XposedHelpers.getObjectField(activity, "t0");
+        } catch (Throwable ignored) {
+        }
+        if (newInfo == null) {
+            try {
+                newInfo = (PackageInfo) XposedHelpers.getObjectField(activity, "q0");
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
             pkgName = (String) XposedHelpers.getObjectField(activity, "x0");
         } catch (Throwable ignored) {
+        }
+        if (pkgName == null) {
+            try {
+                pkgName = (String) XposedHelpers.getObjectField(activity, "u0");
+            } catch (Throwable ignored) {
+            }
         }
         if (newInfo == null || newInfo.applicationInfo == null) {
             if (attempt < 10) {
@@ -502,7 +543,7 @@ public final class InstallerHook {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            if (purifyOn()) param.setResult(null);
+                            if (legacyPurify()) param.setResult(null);
                         }
                     });
             XposedBridge.log(TAG + "hook ad presenter l ok");
@@ -512,17 +553,19 @@ public final class InstallerHook {
     }
 
     private static void hookSafeResultBanner(ClassLoader cl) {
-        hideAfter(cl, "e2", "W0");
-        hideAfter(cl, "k2", "Y0");
+        hideAfter(cl, "e2", "W0", false);
+        hideAfter(cl, "k2", "Y0", false);
     }
 
-    private static void hideAfter(ClassLoader cl, String methodName, final String fieldName) {
+    /** hides the result-banner view after methodName; compat flag selects
+     *  which gate (legacy vs compat set) this hook obeys. */
+    private static void hideAfter(ClassLoader cl, String methodName, final String fieldName, final boolean compat) {
         try {
             XposedHelpers.findAndHookMethod("com.android.packageinstaller.PackageInstallerActivity", cl, methodName,
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
-                            if (!purifyOn()) return;
+                            if (compat ? !compatPurify() : !legacyPurify()) return;
                             try {
                                 Object v = XposedHelpers.getObjectField(param.thisObject, fieldName);
                                 if (v instanceof View) {
@@ -533,9 +576,9 @@ public final class InstallerHook {
                             }
                         }
                     });
-            XposedBridge.log(TAG + "hook " + methodName + " ok");
+            XposedBridge.log(TAG + "hook " + methodName + (compat ? " (compat)" : "") + " ok");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "hook " + methodName + " failed: " + t);
+            XposedBridge.log(TAG + "hook " + methodName + (compat ? " (compat)" : "") + " failed: " + t);
         }
     }
 
@@ -545,7 +588,7 @@ public final class InstallerHook {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            if (!purifyOn()) return;
+                            if (!legacyPurify()) return;
                             try {
                                 final Object callback = param.args[1];
                                 if (callback == null) {
@@ -604,7 +647,7 @@ public final class InstallerHook {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            if (!purifyOn()) return;
+                            if (!legacyPurify()) return;
                             try {
                                 Object cb = param.args[1];
                                 if (cb != null) {
@@ -622,5 +665,185 @@ public final class InstallerHook {
         } catch (Throwable t) {
             XposedBridge.log(TAG + "hook qf2.g failed: " + t);
         }
+    }
+
+    // ====================================================================
+    // Compat hook set — installer 14.0.22.x line (obfuscation: br0/c01/js0/
+    // nz0/oo0/er0, entity DivideButtonModule; class names verified against
+    // 14.0.22.326 via dex analysis 2026-10-13). All gated by compatPurify():
+    // purify master on AND 兼容模式 on. The legacy set above is gated by
+    // legacyPurify() so exactly one set is ever active.
+    // ====================================================================
+
+    private static void hookSecurityCheckCompat(final ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("br0", cl, "j", "br0$a",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!compatPurify()) return;
+                            try {
+                                final Object callback = param.args[0];
+                                if (callback == null) {
+                                    param.setResult(null);
+                                    return;
+                                }
+                                boolean isHn = (Boolean) XposedHelpers.callMethod(param.thisObject, "d");
+                                Class<?> br0Class = param.thisObject.getClass();
+                                final Object passResult = XposedHelpers.callStaticMethod(br0Class, "a", isHn);
+                                final Class<?> er0Class = cl.loadClass("er0");
+                                final Method deliver = callback.getClass().getMethod("c", er0Class);
+                                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        try {
+                                            deliver.invoke(callback, passResult);
+                                            XposedBridge.log(TAG + "compat: security check skipped");
+                                        } catch (Throwable t) {
+                                            XposedBridge.log(TAG + "compat deliver error: " + t);
+                                        }
+                                    }
+                                });
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "compat check skip error: " + t);
+                            }
+                            param.setResult(null);
+                        }
+                    });
+            XposedBridge.log(TAG + "hook br0.j (compat) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook br0.j (compat) failed: " + t);
+        }
+    }
+
+    private static void hookFingerprintAuthCompat(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("c01", cl, "d", Context.class, "c01$a",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!compatPurify()) return;
+                            try {
+                                Object cb = param.args[1];
+                                if (cb != null) {
+                                    cb.getClass().getMethod("b").invoke(cb);
+                                    cb.getClass().getMethod("a", boolean.class).invoke(cb, true);
+                                    XposedBridge.log(TAG + "compat: fingerprint auth bypassed");
+                                }
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "compat fingerprint error: " + t);
+                            }
+                            param.setResult(null);
+                        }
+                    });
+            XposedBridge.log(TAG + "hook c01.d (compat) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook c01.d (compat) failed: " + t);
+        }
+    }
+
+    private static void hookDiversionWaitCompat(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("nz0", cl, "g",
+                    "com.hihonor.packageinstaller.entity.resp.DivideButtonModule",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (compatPurify()) param.setResult(false);
+                        }
+                    });
+            XposedBridge.log(TAG + "hook nz0.g (compat) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook nz0.g (compat) failed: " + t);
+        }
+    }
+
+    private static void hookCleanCacheCardCompat(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("nz0", cl, "d",
+                    "com.hihonor.packageinstaller.entity.resp.CleanSpeedUpModule", boolean.class, boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (compatPurify()) param.setResult(true);
+                        }
+                    });
+            XposedBridge.log(TAG + "hook nz0.d (compat) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook nz0.d (compat) failed: " + t);
+        }
+    }
+
+    private static void hookSafeModeBannerCompat(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("js0", cl, "f",
+                    "com.hihonor.packageinstaller.utils.CardTipsRecord", String.class, boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!compatPurify()) return;
+                            param.setResult(on(K_INFOCARD));
+                        }
+                    });
+            XposedBridge.log(TAG + "hook js0.f (compat card tips gate) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook js0.f (compat) failed: " + t);
+        }
+        try {
+            XposedHelpers.findAndHookMethod("js0", cl, "k",
+                    "com.android.packageinstaller.PackageInstallerActivity", "com.hihonor.packageinstaller.rbi.RbiTempBean",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (compatPurify() && on(K_INFOCARD)) param.setResult(null);
+                        }
+                    });
+            XposedBridge.log(TAG + "hook js0.k (compat) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook js0.k (compat) failed: " + t);
+        }
+    }
+
+    private static void hookSafeModeCardInfoCompat(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("js0", cl, "j",
+                    View.class, String.class, Activity.class, boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!compatPurify() || !on(K_INFOCARD)) return;
+                            try {
+                                fillInfoCard((View) param.args[0], (Activity) param.args[2], 0);
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "compat info card error: " + t);
+                            }
+                            param.setResult(null);
+                        }
+                    });
+            XposedBridge.log(TAG + "hook js0.j (compat info card) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook js0.j (compat) failed: " + t);
+        }
+    }
+
+    private static void hookAdRecommendCompat(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("oo0", cl, "c",
+                    String.class, String.class, "uo0", "to0",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (compatPurify()) param.setResult(null);
+                        }
+                    });
+            XposedBridge.log(TAG + "hook oo0.c (compat ad) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook oo0.c (compat) failed: " + t);
+        }
+    }
+
+    private static void hookSafeResultBannerCompat(ClassLoader cl) {
+        hideAfter(cl, "l1", "T0", true);
+        hideAfter(cl, "r1", "V0", true);
     }
 }
