@@ -43,19 +43,30 @@ public final class InstallerHook {
         return Cfg.isOn(Cfg.K_PURIFY);
     }
 
-    /** compat mode: opt-in (default off), for newer installer builds (14.0.22.x line). */
-    private static boolean compatOn() {
-        return Cfg.isOnDef(Cfg.K_COMPAT, false);
+    /** compat mode 1: opt-in (default off), oldest obfuscation set (ly1/r12/g82). */
+    private static boolean compat1On() {
+        return Cfg.isOnDef(Cfg.K_COMPAT1, false);
     }
 
-    /** old-obfuscation hook set (ly1/r12/g82/...) active: master on AND compat off. */
+    /** compat mode 2: opt-in (default off), 14.0.22.326 set (br0/js0/nz0/oo0). */
+    private static boolean compat2On() {
+        return Cfg.isOnDef(Cfg.K_COMPAT2, false);
+    }
+
+    /** oldest set (ly1/r12/g82/...): master on AND compat mode 1 on. */
     private static boolean legacyPurify() {
-        return purifyOn() && !compatOn();
+        return purifyOn() && compat1On();
     }
 
-    /** compat hook set (br0/js0/nz0/oo0/c01/...) active: master on AND compat on. */
+    /** 14.0.22.326 set (br0/js0/nz0/oo0/c01/...): master on AND compat mode 2 on. */
     private static boolean compatPurify() {
-        return purifyOn() && compatOn();
+        return purifyOn() && compat2On();
+    }
+
+    /** 14.0.38.301 set (ed1/lt1/lc1/xt1, 2026-10 OTA) — the default:
+     *  active whenever the master is on, no compat switch needed. */
+    private static boolean defaultPurify() {
+        return purifyOn();
     }
 
     private static boolean on(String key) {
@@ -73,7 +84,7 @@ public final class InstallerHook {
         hookSafeResultBanner(cl);
         hookCleanCacheCard(cl);
         hookAllowDowngrade(cl);
-        // --- compat set for newer installer builds (e.g. 14.0.22.326) ---
+        // --- compat mode 2: installer 14.0.22.326 (obfuscation: br0/js0/nz0/oo0) ---
         hookSecurityCheckCompat(cl);
         hookFingerprintAuthCompat(cl);
         hookDiversionWaitCompat(cl);
@@ -82,6 +93,18 @@ public final class InstallerHook {
         hookSafeModeCardInfoCompat(cl);
         hookAdRecommendCompat(cl);
         hookSafeResultBannerCompat(cl);
+        // --- default set: installer 14.0.38.301 (2026-10 OTA: ed1/lt1/lc1/xt1;
+        //     active on the master alone, no compat switch needed; old names
+        //     r12/js0/nz0 exist but are unrelated classes) ---
+        hookSecurityCheckCompatV2(cl);
+        hookFingerprintAuthCompatV2(cl);
+        hookDiversionWaitCompatV2(cl);
+        hookCleanCacheCardCompatV2(cl);
+        hookSafeModeBannerCompatV2(cl);
+        hookSafeModeCardInfoCompatV2(cl);
+        hookAdRecommendCompatV2(cl);
+        hookStagingFastPathCompatV2(cl);
+        hookHideCheckResultCompatV2(cl);
     }
 
     public static void initSystemServer(ClassLoader cl) {
@@ -256,8 +279,8 @@ public final class InstallerHook {
         }
         PackageInfo newInfo = null;
         String pkgName = null;
-        // field names differ across installer builds: old line uses t0/x0,
-        // the 14.0.22.x compat line uses q0/u0 — try both.
+        // field names differ across installer builds: old line t0/x0, 14.0.22
+        // uses q0/u0, 14.0.38 uses P — try all, each cast-protected.
         try {
             newInfo = (PackageInfo) XposedHelpers.getObjectField(activity, "t0");
         } catch (Throwable ignored) {
@@ -265,6 +288,12 @@ public final class InstallerHook {
         if (newInfo == null) {
             try {
                 newInfo = (PackageInfo) XposedHelpers.getObjectField(activity, "q0");
+            } catch (Throwable ignored) {
+            }
+        }
+        if (newInfo == null) {
+            try {
+                newInfo = (PackageInfo) XposedHelpers.getObjectField(activity, "P");
             } catch (Throwable ignored) {
             }
         }
@@ -668,11 +697,13 @@ public final class InstallerHook {
     }
 
     // ====================================================================
-    // Compat hook set — installer 14.0.22.x line (obfuscation: br0/c01/js0/
+    // Compat hook set 2 — installer 14.0.22.x line (obfuscation: br0/c01/js0/
     // nz0/oo0/er0, entity DivideButtonModule; class names verified against
     // 14.0.22.326 via dex analysis 2026-10-13). All gated by compatPurify():
-    // purify master on AND 兼容模式 on. The legacy set above is gated by
-    // legacyPurify() so exactly one set is ever active.
+    // purify master on AND 兼容模式2 on. The oldest set above is gated by
+    // legacyPurify() (兼容模式1), the 38.301 default set below by
+    // defaultPurify() (master alone) — signature mismatches make the
+    // non-matching sets fail safely on any build.
     // ====================================================================
 
     private static void hookSecurityCheckCompat(final ClassLoader cl) {
@@ -845,5 +876,242 @@ public final class InstallerHook {
     private static void hookSafeResultBannerCompat(ClassLoader cl) {
         hideAfter(cl, "l1", "T0", true);
         hideAfter(cl, "r1", "V0", true);
+    }
+
+    // ====================================================================
+    // Default set — installer 14.0.38.301 (2026-10-16 OTA updated the
+    // system app via /data/app; obfuscation reshuffled: the info-card class
+    // is lc1, cards/diversion xt1, fingerprint lt1, check controller ed1
+    // [HnAppCheckJob], ad entry AbstractAdBusinessPresenter.g). Old names
+    // like r12/js0/nz0 still exist but are unrelated classes, so signature
+    // mismatches make the other sets fail safely. Gated by defaultPurify()
+    // (master alone) — only one set can ever match a given build.
+    // ====================================================================
+
+    private static void hookSecurityCheckCompatV2(final ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("ed1", cl, "b", "kd1", boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!defaultPurify()) return;
+                            try {
+                                final Object callback = param.args[0];
+                                if (callback == null) {
+                                    param.setResult(null);
+                                    return;
+                                }
+                                // pass result mirroring the stock cloud-success build
+                                // (gd1): fresh HnControlResult + s=true (cloud
+                                // verified) + b=true (install button present) +
+                                // e=1 (iconColor SAFE — b1() renders the risk
+                                // layout whenever F0.f()!=1, which caused the
+                                // "virus" warning on the first attempt);
+                                // risk/checkbox fields stay at benign defaults.
+                                Class<?> hcr = cl.loadClass(
+                                        "com.hihonor.packageinstaller.hncust.checkapk.HnControlResult");
+                                Object r = XposedHelpers.newInstance(hcr);
+                                XposedHelpers.setBooleanField(r, "s", true);
+                                XposedHelpers.setBooleanField(r, "b", true);
+                                XposedHelpers.setIntField(r, "e", 1);
+                                Class<?> dd1c = cl.loadClass("dd1");
+                                Object pass = XposedHelpers.newInstance(dd1c, r);
+                                Object vd1I = XposedHelpers.getObjectField(param.thisObject, "I");
+                                Method deliver = callback.getClass().getMethod("c", dd1c, cl.loadClass("vd1"));
+                                deliver.setAccessible(true);
+                                deliver.invoke(callback, pass, vd1I);
+                                XposedBridge.log(TAG + "compat383: security check skipped");
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "compat383 check skip error: " + t);
+                            }
+                            param.setResult(null);
+                        }
+                    });
+            XposedBridge.log(TAG + "hook ed1.b (compat383) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook ed1.b (compat383) failed: " + t);
+        }
+    }
+
+    private static void hookFingerprintAuthCompatV2(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("lt1", cl, "B0",
+                    Context.class, String.class, int.class, "ot1",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!defaultPurify()) return;
+                            try {
+                                Object cb = param.args[3];
+                                if (cb != null) {
+                                    cb.getClass().getMethod("b").invoke(cb);
+                                    cb.getClass().getMethod("a", boolean.class).invoke(cb, true);
+                                    XposedBridge.log(TAG + "compat383: fingerprint auth bypassed");
+                                }
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "compat383 fingerprint error: " + t);
+                            }
+                            param.setResult(null);
+                        }
+                    });
+            XposedBridge.log(TAG + "hook lt1.B0 (compat383) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook lt1.B0 (compat383) failed: " + t);
+        }
+    }
+
+    private static void hookAdRecommendCompatV2(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("com.hihonor.packageinstaller.presenter.AbstractAdBusinessPresenter", cl, "g",
+                    "o81", "com.hihonor.packageinstaller.rbi.RbiTempBean", "pu1", boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (defaultPurify()) param.setResult(null);
+                        }
+                    });
+            XposedBridge.log(TAG + "hook ad presenter g (compat383) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook ad presenter g (compat383) failed: " + t);
+        }
+    }
+
+    private static void hookDiversionWaitCompatV2(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("xt1", cl, "O",
+                    "com.hihonor.packageinstaller.entity.resp.DivideButtonModule",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (defaultPurify()) param.setResult(false);
+                        }
+                    });
+            XposedBridge.log(TAG + "hook xt1.O (compat383) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook xt1.O (compat383) failed: " + t);
+        }
+    }
+
+    private static void hookCleanCacheCardCompatV2(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("xt1", cl, "t",
+                    "com.hihonor.packageinstaller.entity.resp.CleanSpeedUpModule", boolean.class, boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (defaultPurify()) param.setResult(true);
+                        }
+                    });
+            XposedBridge.log(TAG + "hook xt1.t (compat383) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook xt1.t (compat383) failed: " + t);
+        }
+    }
+
+    private static void hookSafeModeBannerCompatV2(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("lc1", cl, "D1",
+                    "com.hihonor.packageinstaller.utils.CardTipsRecord", String.class, boolean.class, String.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!defaultPurify()) return;
+                            param.setResult(on(K_INFOCARD));
+                        }
+                    });
+            XposedBridge.log(TAG + "hook lc1.D1 (compat383 card tips gate) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook lc1.D1 (compat383) failed: " + t);
+        }
+    }
+
+    private static void hookSafeModeCardInfoCompatV2(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("lc1", cl, "u2",
+                    View.class, String.class, Activity.class, boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!defaultPurify() || !on(K_INFOCARD)) return;
+                            try {
+                                fillInfoCard((View) param.args[0], (Activity) param.args[2], 0);
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "compat383 info card error: " + t);
+                            }
+                            param.setResult(null);
+                        }
+                    });
+            XposedBridge.log(TAG + "hook lc1.u2 (compat383 info card) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook lc1.u2 (compat383) failed: " + t);
+        }
+    }
+
+    /**
+     * Staging wait: InstallStaging's presenter po1.a (checkInstalledPkg) waits
+     * for BOTH a Tencent no-detect strategy request and a diversion request
+     * (hard-coded 2000ms timeout) before jumping to the installer page — with
+     * networking blocked these just burn the timeout. Skip it and take the
+     * stock timeout path p(-1) (jumpActivity, "extra_tencent_no_detect_result"
+     * = -1) immediately.
+     */
+    private static void hookStagingFastPathCompatV2(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("po1", cl, "a",
+                    String.class, String.class, String.class, String.class, String.class,
+                    long.class, String.class, String.class, String.class,
+                    int.class, int.class, long.class, int.class, int.class,
+                    String.class, String.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!defaultPurify()) return;
+                            try {
+                                Object ref = XposedHelpers.getObjectField(param.thisObject, "a");
+                                Object staging = XposedHelpers.callMethod(ref, "get");
+                                if (staging != null
+                                        && (Boolean) XposedHelpers.callMethod(staging, "isActive")) {
+                                    XposedHelpers.callMethod(staging, "p", -1);
+                                    XposedBridge.log(TAG + "compat383: staging fast path (skip network waits)");
+                                }
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "compat383 staging fast path error: " + t);
+                            }
+                            param.setResult(null);
+                        }
+                    });
+            XposedBridge.log(TAG + "hook po1.a (compat383 staging fast path) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook po1.a (compat383) failed: " + t);
+        }
+    }
+
+    /**
+     * The delivered pass renders b1()'s "checked" section — a green
+     * "未发现风险" card (view-stub fields r0/t0 on the installer activity).
+     * Old-line purify hid these result banners too; hide them again.
+     */
+    private static void hookHideCheckResultCompatV2(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("com.android.packageinstaller.PackageInstallerActivity",
+                    cl, "b1", new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            if (!defaultPurify()) return;
+                            for (String f : new String[]{"r0", "t0"}) {
+                                try {
+                                    Object v = XposedHelpers.getObjectField(param.thisObject, f);
+                                    if (v instanceof View && ((View) v).getVisibility() == View.VISIBLE) {
+                                        ((View) v).setVisibility(View.GONE);
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        }
+                    });
+            XposedBridge.log(TAG + "hook b1 hide result (compat383) ok");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook b1 hide result (compat383) failed: " + t);
+        }
     }
 }
