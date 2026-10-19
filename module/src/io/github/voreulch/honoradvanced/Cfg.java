@@ -47,11 +47,12 @@ public final class Cfg {
     public static final String K_PURIFY = "purify";       // installer purify master
     public static final String K_INFOCARD = "infocard";   // package info card
     public static final String K_DOWNGRADE = "downgrade"; // allow downgrade installs
-    public static final String K_COMPAT = "compat";       // installer compat mode (newer installer builds, e.g. 14.0.22.x)
+    public static final String K_COMPAT1 = "compat1";   // installer compat mode 1 (oldest obfuscation: ly1/r12/g82)
+    public static final String K_COMPAT2 = "compat2";   // installer compat mode 2 (14.0.22.x obfuscation: br0/js0/nz0)
 
     public static final String[] KEYS = {
             K_GLASS, K_SYSTEM, K_KEYGUARD, K_GALLERY,
-            K_PURIFY, K_INFOCARD, K_DOWNGRADE, K_COMPAT,
+            K_PURIFY, K_INFOCARD, K_DOWNGRADE, K_COMPAT1, K_COMPAT2,
     };
 
     /** null = preload not landed yet (default ON); set once, then frozen
@@ -67,7 +68,7 @@ public final class Cfg {
         return isOnDef(key, true);
     }
 
-    /** same as isOn but with an explicit default (used by K_COMPAT: off unless confirmed). */
+    /** same as isOn but with an explicit default (used by the two compat modes: off unless confirmed). */
     public static boolean isOnDef(String key, boolean def) {
         Map<String, Boolean> m = sSnapshot;
         if (m == null) {
