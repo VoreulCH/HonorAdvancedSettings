@@ -65,8 +65,14 @@ public final class CfgProvider extends ContentProvider {
         if (Cfg.K_DOWNGRADE.equals(key)) {
             return p.getBoolean("downgrade", true);
         }
-        if (Cfg.K_COMPAT.equals(key)) {
-            return false; // opt-in: only newer installer builds need it
+        if (Cfg.K_COMPAT1.equals(key)) {
+            return false; // opt-in: only the earliest installer builds need it
+        }
+        if (Cfg.K_COMPAT2.equals(key)) {
+            // v1.4.20's single "compat" opt-in carries over here — the
+            // 38.301 set is the default since v1.4.22, so that old flag
+            // can only ever have meant the 14.0.22.x set
+            return p.getBoolean("compat", false);
         }
         return true; // K_SYSTEM / K_PURIFY had no legacy counterpart
     }
