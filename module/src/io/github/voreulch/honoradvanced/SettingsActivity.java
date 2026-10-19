@@ -47,6 +47,7 @@ public class SettingsActivity extends Activity {
     private ScrollView pageAbout;
     private TextView tabMineText, tabAboutText;
     private View navBar;
+    private Switch compat1Switch, compat2Switch; // cross-linked for mutual exclusion
 
     private static class Binding {
         final String key;
@@ -73,7 +74,8 @@ public class SettingsActivity extends Activity {
     private static final Binding B_PURIFY   = new Binding(Cfg.K_PURIFY, false);
     private static final Binding B_INFOCARD = new Binding(Cfg.K_INFOCARD, false);
     private static final Binding B_DOWNGRADE = new Binding(Cfg.K_DOWNGRADE, false);
-    private static final Binding B_COMPAT   = new Binding(Cfg.K_COMPAT, false, false);
+    private static final Binding B_COMPAT1  = new Binding(Cfg.K_COMPAT1, false, false);
+    private static final Binding B_COMPAT2  = new Binding(Cfg.K_COMPAT2, false, false);
 
     private boolean prefsOn(String key) {
         return prefsOn(key, true);
@@ -111,12 +113,20 @@ public class SettingsActivity extends Activity {
             }
             dirty = true;
         }
+        // v1.4.20's single "compat" opt-in became compat mode 2 in v1.4.22
+        // (the 38.301 set is now the default); carry the flag over so
+        // 14.0.22.x devices keep purifying after the upgrade
+        if (!p.contains(Cfg.K_COMPAT2) && p.contains("compat")) {
+            ed.putBoolean(Cfg.K_COMPAT2, p.getBoolean("compat", false));
+            ed.remove("compat");
+            dirty = true;
+        }
         for (String k : Cfg.KEYS) {
             if (!p.contains(k)) {
-                // everything defaults ON except compat — auto-true here would
-                // silently enable compat on old-installer devices and gate the
-                // legacy set off (purify line dead). Compat must stay opt-in.
-                ed.putBoolean(k, !Cfg.K_COMPAT.equals(k));
+                // everything defaults ON except the two compat modes —
+                // auto-true would silently switch devices off the default
+                // (38.301) set. Both must stay opt-in.
+                ed.putBoolean(k, !Cfg.K_COMPAT1.equals(k) && !Cfg.K_COMPAT2.equals(k));
                 dirty = true;
             }
         }
@@ -401,7 +411,8 @@ public class SettingsActivity extends Activity {
                 {"总开关", "跳过安全检测与指纹验证、禁止联网、隐藏推广及多余卡片，关闭后全部回退原厂", B_PURIFY},
                 {"安装包信息卡", "展示版本 / 大小 / SDK / 架构信息卡；关闭时同时隐藏安全模式提醒", B_INFOCARD},
                 {"允许降级安装", "允许安装低于当前版本号的 APK", B_DOWNGRADE},
-                {"兼容模式", "安装器为较旧版本时开启，切换到旧方案；其余开关同样生效", B_COMPAT},
+                {"兼容模式1", "安装器为早期版本时开启，切换到旧方案；其余开关同样生效", B_COMPAT1},
+                {"兼容模式2", "安装器为较旧版本时开启，切换到旧方案；其余开关同样生效", B_COMPAT2},
         }, false));
         box.addView(footnote("开关后需重启安装器生效，降级开关需重启手机生效"));
 
@@ -978,10 +989,30 @@ public class SettingsActivity extends Activity {
         }
         // set before the listener so restoring the stored state fires nothing
         sw.setChecked(prefsOn(b.key, b.def));
+        if (Cfg.K_COMPAT1.equals(b.key)) {
+            compat1Switch = sw;
+        } else if (Cfg.K_COMPAT2.equals(b.key)) {
+            compat2Switch = sw;
+            // both ON can only come from a hand-written config — normalize
+            // through compat1's own listener (write + notify) once, here
+            if (compat1Switch != null && compat1Switch.isChecked() && sw.isChecked()) {
+                compat1Switch.setChecked(false);
+            }
+        }
         sw.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             @Override
             public void onCheckedChanged(CompoundButton button, boolean isChecked) {
                 applyBinding(b, isChecked);
+                // the two compat modes are mutually exclusive: turning one
+                // ON force-turns the other OFF — its own listener performs
+                // the write + observer notify, so there is a single path
+                if (isChecked && Cfg.K_COMPAT1.equals(b.key) && compat2Switch != null
+                        && compat2Switch.isChecked()) {
+                    compat2Switch.setChecked(false);
+                } else if (isChecked && Cfg.K_COMPAT2.equals(b.key) && compat1Switch != null
+                        && compat1Switch.isChecked()) {
+                    compat1Switch.setChecked(false);
+                }
             }
         });
         row.addView(sw, new LinearLayout.LayoutParams(
