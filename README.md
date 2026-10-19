@@ -117,6 +117,7 @@ build-tools, Xposed api-82) into `tools/` before building.
 
 ## 版本历史 / Changelog
 
+* **1.4.22**（2026-10-20）：适配 2026-10 系统更新后的运行时安装器 14.0.38.301（新版混淆钩子集设为默认方案，总开关开启即生效，无需任何兼容开关）；安装提速——跳过「准备安装」阶段的腾讯免检与分流网络等待，禁网后不再干等超时；隐藏安装页「未发现风险」检测残留卡片；兼容模式拆分为「兼容模式1」（早期版本安装器）与「兼容模式2」（14.0.22.x），两者互斥（开启一方自动关闭另一方），旧「兼容模式」开关状态自动迁移到兼容模式2；信息卡 / 降级安装 / 禁止联网等开关在所有方案下均有效。
 * **1.4.20**（2026-10-14）：安装器净化新增「兼容模式」开关——安装器为较旧版本（如 14.0.22.x）时开启，切换到旧方案钩子集；其余开关在兼容模式下同样生效，关闭即恢复原行为，总开关关闭时全部回退原厂。
 * **1.4.19**（2026-10-10）：公开首发。整合液态玻璃（系统 / 锁屏 / 相册三线 + 总开关）与安装器净化（安全检测跳过 / 禁网 / 信息卡 / 降级安装）为单一模块；全新界面（分段胶囊底栏、玻璃卡片弹窗、捐赠与 QQ 群入口）；ContentProvider 跨进程配置同步；Android 15+ edge-to-edge 兼容。
   First public release: merges the liquid-glass lines (system / lock screen / gallery + master switch) and installer purify into one module, with a brand-new UI, cross-process config sync and Android 15+ edge-to-edge compatibility.
