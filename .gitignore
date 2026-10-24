@@ -1,0 +1,13 @@
+# Gradle
+.gradle/
+build/
+app/build/
+
+# signing (never commit — see KEYSTORE.txt)
+*.keystore
+local.properties
+
+# IDE
+.idea/
+*.iml
+.kotlin/
