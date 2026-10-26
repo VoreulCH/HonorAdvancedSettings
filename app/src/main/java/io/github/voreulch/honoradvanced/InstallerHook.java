@@ -33,10 +33,12 @@ import de.robv.android.xposed.XposedHelpers;
  * string anchors (survive class renames) with per-build name fallbacks,
  * methods via parameter-type signature scanning (survive method renames —
  * signatures anchor on stable entity full names like DivideButtonModule /
- * CleanSpeedUpModule / HnControlResult). The pass-result delivery tries the
- * 38.301 recipe (dd1(HnControlResult) via type) then the 14.0.22.x recipe
- * (static factory + single-arg callback). Known builds: 14.0.38.301 and
- * 14.0.22.326; future OTA reshuffles resolve as long as the anchored
+ * CleanSpeedUpModule / HnControlResult). Pass-result delivery first calls the
+ * installer's own static (boolean) -> wrapper "no need check" factory
+ * (14.0.32.303 xw1.a, 14.0.22.326 br0.a), then falls back to the 38.301
+ * recipe (dd1(HnControlResult) via type) and the 14.0.22.x recipe (static
+ * factory + single-arg callback). Known builds: 14.0.32.303, 14.0.38.301
+ * and 14.0.22.326; future OTA reshuffles resolve as long as the anchored
  * entities and callback shapes hold. Glass line hooks live in GlassHook.
  */
 public final class InstallerHook {
@@ -570,12 +572,23 @@ public final class InstallerHook {
                     if (!defaultPurify()) return;
                     Object callback = param.args[0];
                     if (callback == null) { param.setResult(null); return; }
-                    // two pass recipes, tried in order — each resolves every
-                    // collaborator by TYPE, never by obfuscated name
-                    if (!deliverPass383(param, callback)) {
-                        deliverPass326(param, callback);
+                    // pass recipes, tried in order — each resolves every
+                    // collaborator by TYPE, never by obfuscated name.
+                    // CRITICAL: only skip the stock check when a pass result
+                    // was actually delivered. The old unconditional
+                    // setResult(null) swallowed the check even when every
+                    // recipe missed (e.g. a new installer build whose
+                    // HnControlResult field layout changed) — the callback
+                    // then never fired and the UI spun on "安装包扫描中"
+                    // forever. On a miss the stock path must run instead.
+                    if (deliverPassStock(param, callback)
+                            || deliverPass383(param, callback)
+                            || deliverPass326(param, callback)) {
+                        param.setResult(null);
+                    } else {
+                        XposedBridge.log(TAG + "no pass recipe matched; "
+                                + "stock check left running");
                     }
-                    param.setResult(null);
                 }
             });
             XposedBridge.log(TAG + "[adapt] security-check hooked: " + target);
@@ -584,21 +597,98 @@ public final class InstallerHook {
         }
     }
 
-    /** 38.301 recipe: new dd1(new HnControlResult{s,b,e}) delivered through
-     *  the callback's two-arg method — dd1 located via its (HnControlResult)
-     *  constructor, the second arg via a same-typed field of the controller. */
+    /**
+     * Best recipe: call the installer's own "no need check" result builder.
+     * Every known build has a static (boolean) -> wrapper factory used when
+     * the app skips the cloud check locally:
+     *   14.0.32.303  xw1.a(true) -> ax1
+     *   14.0.22.326  br0.a(true) -> er0
+     * The factory is located by its RETURN TYPE (the callback's wrapper
+     * argument) through DexKit, so no obfuscated class/field name is pinned.
+     * This mirrors exactly what the stock app does and therefore carries the
+     * correct iconColor / allowContinueInstall / risk flags for that build.
+     */
+    private static boolean deliverPassStock(XC_MethodHook.MethodHookParam param, Object callback) {
+        try {
+            Class<?> hcr = HookEnv.cl.loadClass(
+                    "com.hihonor.packageinstaller.hncust.checkapk.HnControlResult");
+            for (Method dm : callback.getClass().getMethods()) {
+                Class<?>[] ps = dm.getParameterTypes();
+                if (dm.getReturnType() != void.class) continue;
+                // Only the two-arg result callback (wrapper + aux object) is
+                // unambiguous: 14.0.32.303 b(ax1, vx1), 38.301 c(dd1, vd1).
+                // One-arg callbacks differ per build (14.0.22.x a(er0) vs
+                // c(er0)); leave those to the 326/383 recipes below.
+                if (ps.length != 2) continue;
+                Class<?> wrapper = ps[0];
+                if (wrapper.isPrimitive() || wrapper.isInterface()
+                        || wrapper.getName().startsWith("java.")) {
+                    continue;
+                }
+                try {
+                    wrapper.getConstructor(hcr);
+                } catch (Throwable t) {
+                    continue; // not a check-result wrapper
+                }
+                Object v2 = findSecondArg(param.thisObject, callback, ps[1]);
+                if (v2 == null) continue;
+                Object pass = null;
+                for (Method f : DexKitHelper.findStaticMethods(
+                        sApk, HookEnv.cl, wrapper, boolean.class)) {
+                    try {
+                        f.setAccessible(true);
+                        Object v = f.invoke(null, true);
+                        if (v != null) { pass = v; break; }
+                    } catch (Throwable ignored) {
+                    }
+                }
+                if (pass == null) continue;
+                dm.setAccessible(true);
+                dm.invoke(callback, pass, v2);
+                XposedBridge.log(TAG + "[adapt] security check skipped "
+                        + "(stock factory -> " + wrapper.getName() + ")");
+                return true;
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "stock-factory recipe error: " + t);
+        }
+        return false;
+    }
+
+    /** Second callback argument: a non-null field of the controller (or the
+     *  callback itself) of the required type. */
+    private static Object findSecondArg(Object controller, Object callback, Class<?> type) {
+        for (Object holder : new Object[]{controller, callback}) {
+            for (Class<?> c = holder.getClass(); c != null && c != Object.class;
+                 c = c.getSuperclass()) {
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    if (f.getType() != type) continue;
+                    try {
+                        f.setAccessible(true);
+                        Object v = f.get(holder);
+                        if (v != null) return v;
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /** 38.301 / 14.0.32.303 manual recipe: new wrapper(new HnControlResult)
+     *  delivered through the callback's two-arg method. Only fields whose
+     *  types still match are set — field `s` changed from boolean to String
+     *  in 14.0.32.303 and aborted the whole recipe in v2.0.0. */
     private static boolean deliverPass383(XC_MethodHook.MethodHookParam param, Object callback) {
         try {
             Class<?> hcr = HookEnv.cl.loadClass(
                     "com.hihonor.packageinstaller.hncust.checkapk.HnControlResult");
             Object r = XposedHelpers.newInstance(hcr);
-            // field names ARE obfuscated per build and carry semantics that
-            // cannot be told apart reflectively — these three stay pinned to
-            // the 38.301 line (s=cloud verified, b=install button, e=icon
-            // color SAFE; the "virus warning" incident came from e missing).
-            XposedHelpers.setBooleanField(r, "s", true);
-            XposedHelpers.setBooleanField(r, "b", true);
-            XposedHelpers.setIntField(r, "e", 1);
+            // b = allowContinueInstall (boolean), e = iconColor (int) in both
+            // 38.301 and 14.0.32.303. Leave the risk/dialog booleans at their
+            // false defaults; never touch names whose type changed.
+            setBooleanIfPresent(r, "b", true);
+            setIntIfPresent(r, "e", 1);
             for (Method dm : callback.getClass().getMethods()) {
                 Class<?>[] ps = dm.getParameterTypes();
                 if (ps.length != 2 || dm.getReturnType() != void.class) continue;
@@ -609,14 +699,8 @@ public final class InstallerHook {
                     continue;
                 }
                 Object pass = ctor.newInstance(r);
-                Object v2 = null;
-                for (java.lang.reflect.Field f : param.thisObject.getClass().getDeclaredFields()) {
-                    if (f.getType() == ps[1]) {
-                        f.setAccessible(true);
-                        Object v = f.get(param.thisObject);
-                        if (v != null) { v2 = v; break; }
-                    }
-                }
+                Object v2 = findSecondArg(param.thisObject, callback, ps[1]);
+                if (v2 == null) continue;
                 dm.setAccessible(true);
                 dm.invoke(callback, pass, v2);
                 XposedBridge.log(TAG + "[adapt] security check skipped (383 recipe)");
@@ -626,6 +710,28 @@ public final class InstallerHook {
         } catch (Throwable t) {
             XposedBridge.log(TAG + "383 recipe error: " + t);
             return false;
+        }
+    }
+
+    private static void setBooleanIfPresent(Object obj, String name, boolean value) {
+        try {
+            java.lang.reflect.Field f = obj.getClass().getDeclaredField(name);
+            if (f.getType() == boolean.class) {
+                f.setAccessible(true);
+                f.setBoolean(obj, value);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void setIntIfPresent(Object obj, String name, int value) {
+        try {
+            java.lang.reflect.Field f = obj.getClass().getDeclaredField(name);
+            if (f.getType() == int.class) {
+                f.setAccessible(true);
+                f.setInt(obj, value);
+            }
+        } catch (Throwable ignored) {
         }
     }
 

@@ -1,5 +1,10 @@
 package io.github.voreulch.honoradvanced;
 
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.util.ArrayList;
+import java.util.List;
+
 import de.robv.android.xposed.XposedBridge;
 
 /**
@@ -67,5 +72,37 @@ public final class DexKitHelper {
             XposedBridge.log("[HAS] DexKit findClass(strings) failed: " + t);
             return null;
         }
+    }
+
+    /**
+     * Find every static method with the given return type and parameter list.
+     * Used to locate the installer's own "local safe result" factory
+     * (e.g. xw1.a(boolean) / br0.a(boolean)) instead of hard-coding the
+     * obfuscated HnControlResult field names of one build.
+     */
+    public static List<Method> findStaticMethods(String apkPath, ClassLoader cl,
+                                                 Class<?> returnType,
+                                                 Class<?>... paramTypes) {
+        List<Method> out = new ArrayList<>();
+        org.luckypray.dexkit.DexKitBridge b = bridge(apkPath);
+        if (b == null) return out;
+        try {
+            org.luckypray.dexkit.query.FindMethod query =
+                    org.luckypray.dexkit.query.FindMethod.create()
+                            .matcher(org.luckypray.dexkit.query.matchers.MethodMatcher.create()
+                                    .returnType(returnType)
+                                    .paramTypes(paramTypes));
+            org.luckypray.dexkit.result.MethodDataList list = b.findMethod(query);
+            for (org.luckypray.dexkit.result.MethodData md : list) {
+                if (!Modifier.isStatic(md.getModifiers())) continue;
+                try {
+                    out.add(md.getMethodInstance(cl));
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[HAS] DexKit findStaticMethods failed: " + t);
+        }
+        return out;
     }
 }
