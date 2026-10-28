@@ -143,11 +143,11 @@ class SettingsActivity : ComponentActivity() {
         }
         for (k in Cfg.KEYS) {
             if (!p.contains(k)) {
-                // every switch defaults ON EXCEPT the DIY master — auto-
-                // true here would silently flip upgraders onto the extreme
-                // slider values (same class of bug as the v1.4.20 compat
-                // incident). DIY must stay opt-in.
-                ed.putBoolean(k, k != Cfg.K_GLASS_EXTREME)
+                // every switch defaults ON EXCEPT the opt-in ones — auto-true
+                // here would silently flip upgraders onto the extreme sliders
+                // (v1.4.20 compat incident) or enable the system_server-side
+                // notification-ducking hook unasked. Both must stay opt-in.
+                ed.putBoolean(k, k != Cfg.K_GLASS_EXTREME && k != Cfg.K_NODUCK)
                 dirty = true
             }
         }
@@ -277,6 +277,7 @@ class SettingsActivity : ComponentActivity() {
                             Page.Mine -> MinePage { page = it }
                             Page.Glass -> GlassPage { page = Page.Mine }
                             Page.Installer -> InstallerPage { page = Page.Mine }
+                            Page.Misc -> MiscPage { page = Page.Mine }
                             Page.About -> AboutPage()
                         }
                         if (rootDialogVisible) ScopeRestartDialog { rootDialogVisible = false }
@@ -286,7 +287,7 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
-    private enum class Page { Mine, Glass, Installer, About }
+    private enum class Page { Mine, Glass, Installer, Misc, About }
 
     // ================= Mine (home) =================
 
@@ -297,6 +298,7 @@ class SettingsActivity : ComponentActivity() {
             item { Subtitle("基于MagicOS11开发") }
             item { ActionCard("液态玻璃", "系统 / 锁屏 / 相册三线玻璃效果与总开关") { go(Page.Glass) } }
             item { ActionCard("安装器净化", "跳过安全检测、禁止联网、信息卡与降级安装") { go(Page.Installer) } }
+            item { ActionCard("杂项", "屏蔽通知回避等独立小功能") { go(Page.Misc) } }
             item {
                 ActionCard("重启作用域（需ROOT）", "点击申请ROOT授权，可重启系统界面 / 相册 / 安装器") { requestRootThenPickScope() }
             }
@@ -326,7 +328,7 @@ class SettingsActivity : ComponentActivity() {
                         prefs().edit().putBoolean(Cfg.K_GLASS_EXTREME, diyOn).commit()
                     }.padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
-                            Text("DIY 液态", fontSize = 16.sp, color = MiuixTheme.colorScheme.onSurface)
+                            Text("DIY 液态玻璃", fontSize = 16.sp, color = MiuixTheme.colorScheme.onSurface)
                             Text("开启后下方滑条生效；关闭回退普通版固定参数", fontSize = 12.sp,
                                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
                         }
@@ -427,6 +429,22 @@ class SettingsActivity : ComponentActivity() {
                 ))
             }
             item { Footnote("开关后需重启安装器生效，降级开关需重启手机生效") }
+        }
+    }
+
+    // ================= Misc =================
+
+    @Composable
+    private fun MiscPage(back: () -> Unit) {
+        LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp)) {
+            item { BackHeader("杂项", back) }
+            item { TipText("独立小功能，各自单独开关。开关后需重启系统界面生效。") }
+            item {
+                SwitchCard(listOf(
+                    SwRow("屏蔽通知回避", "播放音乐时来消息通知不再压低音乐音量，通知音与音乐同时播放；闹钟不受影响", Cfg.K_NODUCK, true, false)
+                ))
+            }
+            item { Footnote("默认关闭；开启并重启系统界面后生效") }
         }
     }
 
