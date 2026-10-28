@@ -74,7 +74,6 @@ public final class InstallerHook {
         hookSafeModeCardInfoCompatV2(cl);
         hookAdRecommendCompatV2(cl);
         hookStagingFastPathCompatV2(cl);
-        hookHideCheckResultCompatV2(cl);
     }
 
     public static void initSystemServer(ClassLoader cl) {
@@ -151,6 +150,12 @@ public final class InstallerHook {
         if (!"com.android.packageinstaller.PackageInstallerActivity".equals(activity.getClass().getName())) {
             card.setVisibility(View.GONE);
             return;
+        }
+        if (attempt == 0) {
+            // second path to the security-result card: this hook holds the
+            // activity directly, so it also covers builds where the delivery
+            // callback can't be unwrapped to the PIA
+            scheduleHideSecurityCard(activity);
         }
         PackageInfo newInfo = null;
         String pkgName = null;
@@ -546,19 +551,27 @@ public final class InstallerHook {
         try {
             // 38.301 ed1.b(cb, boolean) vs 14.0.22.x br0.j(cb): in both the
             // callback is the FIRST parameter and is an interface.
-            Class<?>[] cs = locateAll(new String[]{"ed1", "br0"}, "HnAppCheckJob", "insertRiskAppDb");
+            // 14.0.22.327's facade br0 also has h(xv0) — another one-arg-void
+            // method taking an AD-listener interface — so shape alone can't
+            // pick the entry: post-check that the callback interface carries
+            // a result-delivery method (a parameter type wrapping
+            // HnControlResult). xv0's methods take no such type, so h() is
+            // skipped and j() wins.
+            Class<?>[] cs = locateAll(new String[]{"ed1", "br0", "bx1"}, "HnAppCheckJob", "insertRiskAppDb");
             Method m = null;
             for (Class<?> c : cs) {
                 for (Method mm : c.getDeclaredMethods()) {
                     Class<?>[] ps = mm.getParameterTypes();
                     if (ps.length == 2 && ps[0].isInterface() && ps[1] == boolean.class
-                            && mm.getReturnType() == void.class) { m = mm; break; }
+                            && mm.getReturnType() == void.class
+                            && carriesResultDelivery(ps[0])) { m = mm; break; }
                 }
                 if (m != null) break;
                 for (Method mm : c.getDeclaredMethods()) {
                     Class<?>[] ps = mm.getParameterTypes();
                     if (ps.length == 1 && ps[0].isInterface()
-                            && mm.getReturnType() == void.class) { m = mm; break; }
+                            && mm.getReturnType() == void.class
+                            && carriesResultDelivery(ps[0])) { m = mm; break; }
                 }
                 if (m != null) break;
             }
@@ -584,21 +597,47 @@ public final class InstallerHook {
         }
     }
 
-    /** 38.301 recipe: new dd1(new HnControlResult{s,b,e}) delivered through
-     *  the callback's two-arg method — dd1 located via its (HnControlResult)
-     *  constructor, the second arg via a same-typed field of the controller. */
+    /** true when the callback interface exposes at least one void method
+     *  with a parameter type that wraps HnControlResult (a public
+     *  (HnControlResult) constructor) — i.e. it is a check-result channel. */
+    private static boolean carriesResultDelivery(Class<?> iface) {
+        try {
+            // 38.301's kd1 is a MARKER interface (zero methods): the delivery
+            // methods live on the impl class (PIA.b), which deliverPass*
+            // already scans — a marker cannot be disqualified, so it passes.
+            if (iface.getMethods().length == 0) return true;
+            Class<?> hcr = HookEnv.cl.loadClass(
+                    "com.hihonor.packageinstaller.hncust.checkapk.HnControlResult");
+            for (Method im : iface.getMethods()) {
+                if (im.getReturnType() != void.class) continue;
+                for (Class<?> pt : im.getParameterTypes()) {
+                    try {
+                        pt.getConstructor(hcr);
+                        return true;
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    /** 38.301/32.303 recipe: a pass result delivered through the callback's
+     *  two-arg method — the result wrapper located via its (HnControlResult)
+     *  constructor, the second arg via a same-typed field of the controller.
+     *  The result itself comes EITHER from the controller's own no-arg
+     *  HnControlResult factory (the system's own "safe default" build —
+     *  recognized by public e==1 (SAFE icon) and b==true (install button)),
+     *  or, failing that, from a hand-built HnControlResult with the pinned
+     *  semantic fields set individually (s missing on some builds no longer
+     *  kills the whole recipe — the "virus warning" incident was e missing). */
     private static boolean deliverPass383(XC_MethodHook.MethodHookParam param, Object callback) {
         try {
             Class<?> hcr = HookEnv.cl.loadClass(
                     "com.hihonor.packageinstaller.hncust.checkapk.HnControlResult");
-            Object r = XposedHelpers.newInstance(hcr);
-            // field names ARE obfuscated per build and carry semantics that
-            // cannot be told apart reflectively — these three stay pinned to
-            // the 38.301 line (s=cloud verified, b=install button, e=icon
-            // color SAFE; the "virus warning" incident came from e missing).
-            XposedHelpers.setBooleanField(r, "s", true);
-            XposedHelpers.setBooleanField(r, "b", true);
-            XposedHelpers.setIntField(r, "e", 1);
+            Object r = buildPassResult(param.thisObject, hcr);
+            if (r == null) return false;
             for (Method dm : callback.getClass().getMethods()) {
                 Class<?>[] ps = dm.getParameterTypes();
                 if (ps.length != 2 || dm.getReturnType() != void.class) continue;
@@ -620,11 +659,62 @@ public final class InstallerHook {
                 dm.setAccessible(true);
                 dm.invoke(callback, pass, v2);
                 XposedBridge.log(TAG + "[adapt] security check skipped (383 recipe)");
+                scheduleHideSecurityCard(callback);
                 return true;
             }
             return false;
         } catch (Throwable t) {
             XposedBridge.log(TAG + "383 recipe error: " + t);
+            return false;
+        }
+    }
+
+    /** pass result for the 38.301/32.303 line: prefer the controller's own
+     *  no-arg HnControlResult factory that yields e==1 && b==true (verified
+     *  against 32.303: p() sets iconColor e=1 + button b=true; q() sets
+     *  e=3 risk and does not match); fall back to a hand-built result. */
+    private static Object buildPassResult(Object controller, Class<?> hcr) {
+        try {
+            for (Method fm : controller.getClass().getDeclaredMethods()) {
+                if (fm.getParameterTypes().length != 0 || fm.getReturnType() != hcr) continue;
+                try {
+                    fm.setAccessible(true);
+                    Object cand = fm.invoke(controller);
+                    if (cand == null) continue;
+                    if (safeIntField(cand, "e") == 1 && safeBoolField(cand, "b")) {
+                        XposedBridge.log(TAG + "[adapt] using controller default pass result");
+                        return cand;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        // hand-built fallback: pinned semantic fields, set individually so a
+        // missing one degrades instead of killing the recipe
+        try {
+            Object r = XposedHelpers.newInstance(hcr);
+            try { XposedHelpers.setBooleanField(r, "s", true); } catch (Throwable ignored) { }
+            try { XposedHelpers.setBooleanField(r, "b", true); } catch (Throwable ignored) { }
+            try { XposedHelpers.setIntField(r, "e", 1); } catch (Throwable ignored) { }
+            return r;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static int safeIntField(Object o, String name) {
+        try {
+            return o.getClass().getField(name).getInt(o);
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    private static boolean safeBoolField(Object o, String name) {
+        try {
+            return o.getClass().getField(name).getBoolean(o);
+        } catch (Throwable t) {
             return false;
         }
     }
@@ -660,26 +750,40 @@ public final class InstallerHook {
             factory.setAccessible(true);
             final Object passResult = factory.invoke(null, isHn);
             if (passResult == null) return false;
-            for (final Method dm : callback.getClass().getMethods()) {
+            // Deliver through EVERY matching one-arg method. 14.0.22.327's
+            // callback carries two result channels — a(er0), which the
+            // activity gates behind a paging check our result fails, and
+            // c(er0), the direct renderer. The gated channel swallows the
+            // call silently, so firing all matches guarantees the direct
+            // one runs; single-channel builds are unaffected.
+            java.util.ArrayList<Method> delivers = new java.util.ArrayList<>();
+            for (Method dm : callback.getClass().getMethods()) {
                 Class<?>[] ps = dm.getParameterTypes();
                 if (ps.length == 1 && ps[0] == passResult.getClass()
                         && dm.getReturnType() == void.class) {
                     dm.setAccessible(true);
-                    new Handler(Looper.getMainLooper()).post(new Runnable() {
-                        @Override
-                        public void run() {
-                            try {
-                                dm.invoke(callback, passResult);
-                                XposedBridge.log(TAG + "[adapt] security check skipped (326 recipe)");
-                            } catch (Throwable t) {
-                                XposedBridge.log(TAG + "326 deliver error: " + t);
-                            }
-                        }
-                    });
-                    return true;
+                    delivers.add(dm);
                 }
             }
-            return false;
+            if (delivers.isEmpty()) return false;
+            final Method[] ds = delivers.toArray(new Method[0]);
+            final Object cb = callback;
+            final Object pr = passResult;
+            new Handler(Looper.getMainLooper()).post(new Runnable() {
+                @Override
+                public void run() {
+                    for (Method d : ds) {
+                        try {
+                            d.invoke(cb, pr);
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + "326 deliver error: " + t);
+                        }
+                    }
+                    XposedBridge.log(TAG + "[adapt] security check skipped (326 recipe, " + ds.length + " channel(s))");
+                    scheduleHideSecurityCard(cb);
+                }
+            });
+            return true;
         } catch (Throwable t) {
             XposedBridge.log(TAG + "326 recipe error: " + t);
             return false;
@@ -745,6 +849,14 @@ public final class InstallerHook {
                         m = mm;
                         break;
                     }
+                    // 14.0.22.327: d(String, String, long, RbiTempBean)
+                    // initConfig — same entity, different slot
+                    if (ps.length == 4
+                            && "com.hihonor.packageinstaller.rbi.RbiTempBean".equals(ps[3].getName())
+                            && ps[0] == String.class && ps[1] == String.class) {
+                        m = mm;
+                        break;
+                    }
                 }
             }
             if (m == null) {
@@ -772,7 +884,7 @@ public final class InstallerHook {
         try {
             // 38.301 xt1.O and 14.0.22.x nz0.g share the exact signature
             // (DivideButtonModule) -> boolean — one rule covers both.
-            Class<?>[] cs = locateAll(new String[]{"xt1", "nz0"},
+            Class<?>[] cs = locateAll(new String[]{"xt1", "nz0", "hc2", "pz0"},
                     "WebInterceptStrategyUtil", "LinkTrafficUtils");
             Method m = resolveAny(cs, "boolean",
                     "com.hihonor.packageinstaller.entity.resp.DivideButtonModule");
@@ -793,7 +905,7 @@ public final class InstallerHook {
         try {
             // 38.301 xt1.t and 14.0.22.x nz0.d share the exact signature
             // (CleanSpeedUpModule, boolean, boolean) -> boolean.
-            Class<?>[] cs = locateAll(new String[]{"xt1", "nz0"},
+            Class<?>[] cs = locateAll(new String[]{"xt1", "nz0", "hc2", "pz0"},
                     "WebInterceptStrategyUtil", "LinkTrafficUtils");
             Method m = resolveAny(cs, "boolean",
                     "com.hihonor.packageinstaller.entity.resp.CleanSpeedUpModule",
@@ -816,8 +928,8 @@ public final class InstallerHook {
             // card-tips gate: 38.301 lc1.D1 is (CardTipsRecord, String,
             // boolean, String) -> boolean; 14.0.22.x js0.f is the 3-arg
             // ancestor. Try both signatures across all candidates.
-            Class<?>[] cs = locateAll(new String[]{"lc1", "js0"},
-                    "AdNetworkUtil", "AdCategoryStateListenerImpl");
+            Class<?>[] cs = locateAll(new String[]{"lc1", "js0", "vz1"},
+                    "AdNetworkUtil", "SafeModeShowUtils");
             Method m = resolveAny(cs, "boolean",
                     "com.hihonor.packageinstaller.utils.CardTipsRecord",
                     "java.lang.String", "boolean", "java.lang.String");
@@ -861,8 +973,8 @@ public final class InstallerHook {
         try {
             // info-card fill: 38.301 lc1.u2 and 14.0.22.x js0.j share the
             // exact signature (View, String, Activity, boolean) -> void.
-            Class<?>[] cs = locateAll(new String[]{"lc1", "js0"},
-                    "AdNetworkUtil", "AdCategoryStateListenerImpl");
+            Class<?>[] cs = locateAll(new String[]{"lc1", "js0", "vz1"},
+                    "AdNetworkUtil", "SafeModeShowUtils");
             Method m = resolveAny(cs, "void",
                     "android.view.View", "java.lang.String",
                     "android.app.Activity", "boolean");
@@ -897,7 +1009,7 @@ public final class InstallerHook {
         try {
             // po1.a's 18-parameter shape is entirely framework types — the
             // most unique signature in the app; resolve by shape, not name.
-            Class<?>[] cs = locateAll(new String[]{"po1"},
+            Class<?>[] cs = locateAll(new String[]{"po1", "eu1"},
                     "InstallStagingPresenter", "TencentNoDetectUtils");
             Method m = resolveAny(cs, "void",
                     "java.lang.String", "java.lang.String", "java.lang.String",
@@ -932,36 +1044,82 @@ public final class InstallerHook {
 
     /**
      * The delivered pass renders a "checked" section — a green "未发现风险"
-     * card. Method and view-stub field names differ per build (38.301:
-     * b1 + r0/t0; 14.0.22.x: l1/r1 + T0/V0) — register every known combo,
-     * misses fail soft, exactly one ever matches a given build.
+     * card. Hiding it no longer hooks any per-build render method or view
+     * field (those names rotate every obfuscation round): the card is the
+     * ViewStub `view_stub_security` inflated as `app_install_check_security_
+     * result` — a stable resource NAME on every known build (verified on
+     * 38.301 and 32.303).
+     *
+     * Reaching the PIA activity from the delivery callback needs more than
+     * the this$0 chain: on both known builds the callback's outer object is
+     * the TOP-LEVEL detect controller (bx1/dd1), which is not an inner class
+     * — the chain dies there. But that controller holds the activity in a
+     * field (bx1.n), so findActivity walks the outer chain AND scans each
+     * hop's fields for an Activity instance. The hide runs IMMEDIATELY after
+     * delivery (the render happens synchronously inside the delivery call,
+     * so the stub is already inflated by the time we look) and falls back to
+     * a short poll (300ms x 10) for builds that render later.
      */
-    private static void hookHideCheckResultCompatV2(ClassLoader cl) {
-        String[][] combos = {
-                {"b1", "r0"}, {"b1", "t0"},
-                {"l1", "T0"}, {"r1", "V0"},
-        };
-        int n = 0;
-        for (final String[] combo : combos) {
-            try {
-                XposedHelpers.findAndHookMethod("com.android.packageinstaller.PackageInstallerActivity",
-                        cl, combo[0], new XC_MethodHook() {
-                            @Override
-                            protected void afterHookedMethod(MethodHookParam param) {
-                                if (!defaultPurify()) return;
-                                try {
-                                    Object v = XposedHelpers.getObjectField(param.thisObject, combo[1]);
-                                    if (v instanceof View && ((View) v).getVisibility() == View.VISIBLE) {
-                                        ((View) v).setVisibility(View.GONE);
-                                    }
-                                } catch (Throwable ignored) {
-                                }
+    private static void scheduleHideSecurityCard(Object callbackOrActivity) {
+        try {
+            final Activity act = findActivity(callbackOrActivity);
+            if (act == null) {
+                XposedBridge.log(TAG + "[adapt] hide card: no activity reached from callback");
+                return;
+            }
+            final int resid = act.getResources().getIdentifier(
+                    "app_install_check_security_result", "id", act.getPackageName());
+            if (resid == 0) return;
+            Runnable hide = new Runnable() {
+                int tries = 0;
+                @Override
+                public void run() {
+                    try {
+                        View v = act.findViewById(resid);
+                        if (v == null) {                    // stub not inflated yet
+                            if (++tries < 10) {
+                                new Handler(Looper.getMainLooper()).postDelayed(this, 300);
                             }
-                        });
-                n++;
+                            return;
+                        }
+                        if (v.getVisibility() == View.VISIBLE) {
+                            v.setVisibility(View.GONE);
+                            XposedBridge.log(TAG + "[adapt] security result card hidden");
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            };
+            // immediate: the delivery call rendered the card synchronously —
+            // hiding on the next main-loop tick beats it to the first frame
+            new Handler(Looper.getMainLooper()).post(hide);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hide card error: " + t);
+        }
+    }
+
+    /** Walks the synthetic-outer chain; at every hop also scans the object's
+     *  fields for an Activity instance — controllers are top-level classes
+     *  that keep the PIA in a plain field, not in an inner-class reference. */
+    private static Activity findActivity(Object start) {
+        Object cur = start;
+        for (int i = 0; i < 6 && cur != null; i++) {
+            if (cur instanceof Activity) return (Activity) cur;
+            try {
+                for (java.lang.reflect.Field f : cur.getClass().getDeclaredFields()) {
+                    if (!Activity.class.isAssignableFrom(f.getType())) continue;
+                    f.setAccessible(true);
+                    Object v = f.get(cur);
+                    if (v instanceof Activity) return (Activity) v;
+                }
             } catch (Throwable ignored) {
             }
+            try {
+                cur = XposedHelpers.getObjectField(cur, "this$0");
+            } catch (Throwable t) {
+                return null;
+            }
         }
-        XposedBridge.log(TAG + "[adapt] hide-result combos hooked: " + n);
+        return null;
     }
 }
