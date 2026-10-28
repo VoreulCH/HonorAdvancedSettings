@@ -18,13 +18,13 @@ public final class MainHook implements IXposedHookLoadPackage {
         ClassLoader cl = lpparam.classLoader;
 
         if ("android".equals(pkg)) {
-            XposedBridge.log("[HAS] v2.0.0 in system_server");
+            XposedBridge.log("[HAS] v2.0.2 in system_server");
             Cfg.startPreload(true); // observer: downgrade switch without reboot
             InstallerHook.initSystemServer(cl);
             return;
         }
         if ("com.android.packageinstaller".equals(pkg)) {
-            XposedBridge.log("[HAS] v2.0.0 in packageinstaller");
+            XposedBridge.log("[HAS] v2.0.2 in packageinstaller");
             Cfg.startPreload(true); // observer: "next install" picks up changes
             InstallerHook.init(cl, lpparam.appInfo.sourceDir);
             return;
@@ -36,6 +36,9 @@ public final class MainHook implements IXposedHookLoadPackage {
         // runtime on the frozen config snapshot (loaded once by the
         // background preload thread; restart the scope to apply changes)
         Cfg.startPreload(false);
+        if ("com.android.systemui".equals(pkg)) {
+            MiscHook.initSystemUI(cl); // misc line: notification-ducking blocker
+        }
         new GlassHook().handleLoadPackage(lpparam);
     }
 }
