@@ -129,11 +129,11 @@ public final class GlassHook implements IXposedHookLoadPackage {
     private static final float DEFAULT_RADIUS = 0.5f;
     private static final float DEFAULT_MASK = 0.65f;
     private static final float DEFAULT_SAT = 1.2f;
-    private static final float DEFAULT_NTF_MASK = 0.25f;
+    private static final float DEFAULT_NTF_MASK = 0.4f;
     private static final float DEFAULT_REFRACT = 1.0f;
     private static final float DEFAULT_EDGE = 1.4f;
     private static final float DEFAULT_RIM = 1.0f;
-    private static final float DEFAULT_TBLUR = 0.3f;
+    private static final float DEFAULT_TBLUR = 0.6f;
 
     // extreme liquid mode: mask/tblur/nmask all 0.1 — near-transparent glass,
     // very low readability. Opt-in (K_GLASS_EXTREME).
@@ -268,7 +268,7 @@ public final class GlassHook implements IXposedHookLoadPackage {
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         ClassLoader cl = lpparam.classLoader;
         sLpCl = cl;
-        log("[HAS] glass v2.0.0 in process: " + lpparam.packageName);
+        log("[HAS] glass v2.0.2 in process: " + lpparam.packageName);
 
         hookTransparentMode(cl);
         hookBlurParams(cl);
