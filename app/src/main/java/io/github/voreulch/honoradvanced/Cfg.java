@@ -48,9 +48,10 @@ public final class Cfg {
     public static final String K_PURIFY = "purify";       // installer purify master
     public static final String K_INFOCARD = "infocard";   // package info card
     public static final String K_DOWNGRADE = "downgrade"; // allow downgrade installs
+    public static final String K_NODUCK = "noduck";       // misc: block notification audio ducking
     public static final String[] KEYS = {
             K_GLASS, K_SYSTEM, K_KEYGUARD, K_GALLERY, K_GLASS_EXTREME,
-            K_PURIFY, K_INFOCARD, K_DOWNGRADE,
+            K_PURIFY, K_INFOCARD, K_DOWNGRADE, K_NODUCK,
     };
 
     // ===== DIY slider keys (percent 0-100, hooks read them when
