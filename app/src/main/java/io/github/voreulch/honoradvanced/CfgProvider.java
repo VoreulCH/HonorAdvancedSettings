@@ -69,7 +69,10 @@ public final class CfgProvider extends ContentProvider {
             return p.getBoolean("downgrade", true);
         }
         if (Cfg.K_GLASS_EXTREME.equals(key)) {
-            return false; // opt-in: extreme transparency hurts readability
+            return false; // opt-in: extreme sliders hurt readability
+        }
+        if (Cfg.K_NODUCK.equals(key)) {
+            return false; // opt-in: hooks system_server — must stay off until enabled
         }
         return true; // K_SYSTEM / K_PURIFY had no legacy counterpart
     }
