@@ -46,6 +46,8 @@ cross-process config sync via a ContentProvider bridge.
 | 安装包信息卡 / Info card | 展示版本 / 大小 / SDK / 架构信息卡；可关闭（关闭时同时隐藏安全模式提醒） Version / size / SDK / ABI info card, toggleable (off also hides the safe-mode reminder) |
 | 允许降级安装 / Downgrade | 允许安装低于当前版本号的 APK Allows installing lower-version APKs |
 | 安装提速 / Faster staging | 跳过「准备安装」阶段的腾讯免检与分流网络等待（禁网后不再干等超时） Skips the Tencent no-detect + diversion network waits during staging |
+| 风险安装弹窗 / Risk tip dialog | 高风险应用安装前的「风险提示」自动继续，无需手动点「继续安装」 Auto-continues the risk-tip dialog |
+| 匿名来源弹窗 / Anonymous source | 无来源包名（PC/文件管理器传入）时静默放行、零弹窗；任何失败都自动回退为可见可点的原厂弹窗，绝不吞触摸 Manual-free anonymous-source handling with a visible-dialog fallback on any failure |
 | 自适应钩子 / Adaptive hooks | 类经 DexKit 字符串锚定位、方法经参数签名扫描定位（锚=跨版本稳定的实体完整名）；放行结果双配方结构探测——安装器 OTA 混淆重排后大概率免更新 Classes located via DexKit string anchors, methods via parameter-signature scanning (anchored on stable entity full names); pass-result delivery tries two known recipes — installer OTA obfuscation reshuffles usually need no module update |
 
 ## 环境要求 / Requirements
@@ -121,6 +123,8 @@ gradle assembleRelease
 
 ## 版本历史 / Changelog
 
+* **2.1.2**（2026-10-31，合并 2.0.3~2.1.2）：安装器净化新增第五版适配 **14.0.39.301**（现覆盖 38.301 / 32.303 / 22.326 / 22.327 / 39.301，多锚点合并定位）；新增**风险安装弹窗自动继续**与**匿名来源弹窗零弹出**——无来源包名（PC 工具 / 文件管理器传入）时静默放行，任何一步失败都自动回退为原厂可见弹窗，绝不出现吞触摸的隐形窗口；修复安装包信息卡误标「降级安装」（此前部分构建拿安装来源应用的版本做比较，全新应用也会被标红）；删除全部调试诊断代码，日志只保留安装与运行验证行；代码精简与零引用依赖清理（APK 4.20MB → 3.97MB）；关于页版本号改为动态读取。
+* **2.0.3**（2026-10-28）：代码审查精简版（零行为变化）。关于页版本号改为动态读取（此前硬编码停留在 2.0.0）；补上玻璃线诊断日志缺失的调试开关门控（此前默认向 Xposed 日志刷屏）；删除死代码（恒不生效的相册校准路径、无引用常量与 import 等，GlassHook 减 88 行）；移除零引用依赖 material-kolor / miuix-preference / miuix-icons，APK 缩小 245KB（4.2MB→3.97MB）。
 * **2.0.2**（2026-10-28，合并 2.0.1）：新增「杂项」页与**屏蔽通知回避**——通知铃声响起时不再压低正在播放的音乐（两者同时发声，闹钟不受影响，开关即时生效）；「DIY液态」文案修正为「DIY液态玻璃」；安装器净化适配 **14.0.32.303 与 14.0.22.327**（净化线现全覆盖 38.301 / 32.303 / 22.326 / 22.327 四版，自适应零开关）；安全检测放行改用安装器原生的安全默认结果构造；隐藏安装页「未发现风险」卡片（与渲染同帧隐藏，无闪现）；广告钩子签名形状扩展；液态玻璃通知卡片 / 工具栏按钮参数回迁 1.4.22 认可配方。
 * **2.0.0**（2026-10-24）：大版本重构。**DIY 模式**——14 个 0~100 滑条（遮罩 / 模糊 / 圆角 / 饱和度 / 边缘光 / 折射 / 边框 / 厚度 / 色散 / 锁屏参数）实时覆盖烤入配方，默认关闭、滑条默认值=旧极致观感；**界面 miuix 化**（Kotlin + Compose + miuix 组件库，液态玻璃底栏，APK 从 689KB 的纯 Java 版跃迁后瘦身至 4.2MB）；**安装器净化自适应钩子集**——类经 DexKit 字符串锚、方法经参数签名扫描定位（锚=跨版本稳定的实体完整名），放行结果双配方结构探测，安装器 OTA 混淆重排后大概率无需更新模块，**14.0.22.x 旧版安装器同样自动适配，兼容模式开关取消**；安装提速（跳过准备安装阶段的网络等待）；全面代码审查修复（升级用户 DIY 开关误开防护等）。
 * **1.4.22**（2026-10-20）：适配 2026-10 系统更新后的运行时安装器 14.0.38.301（新版混淆钩子集设为默认方案，总开关开启即生效，无需任何兼容开关）；安装提速——跳过「准备安装」阶段的腾讯免检与分流网络等待，禁网后不再干等超时；隐藏安装页「未发现风险」检测残留卡片；兼容模式拆分为「兼容模式1」（早期版本安装器）与「兼容模式2」（14.0.22.x），两者互斥（开启一方自动关闭另一方），旧「兼容模式」开关状态自动迁移到兼容模式2；信息卡 / 降级安装 / 禁止联网等开关在所有方案下均有效。
