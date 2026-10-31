@@ -50,7 +50,8 @@ public final class CfgProvider extends ContentProvider {
             return probeCursor();
         }
         MatrixCursor cursor = new MatrixCursor(
-                new String[]{"key", "val"}, Cfg.KEYS.length + Cfg.DIY_KEYS.length);
+                new String[]{"key", "val"},
+                Cfg.KEYS.length + Cfg.TUNE_KEYS.length + Cfg.FN_KEYS.length);
         Context context = getContext();
         if (context != null) {
             SharedPreferences prefs = context.getSharedPreferences(
@@ -58,8 +59,11 @@ public final class CfgProvider extends ContentProvider {
             for (String key : Cfg.KEYS) {
                 cursor.addRow(new Object[]{key, migrated(prefs, key) ? 1 : 0});
             }
-            for (String key : Cfg.DIY_KEYS) {
-                cursor.addRow(new Object[]{key, prefs.getInt(key, Cfg.diyDefPct(key))});
+            for (String key : Cfg.TUNE_KEYS) {
+                cursor.addRow(new Object[]{key, prefs.getInt(key, Cfg.tuneDefPct(key))});
+            }
+            for (String key : Cfg.FN_KEYS) {
+                cursor.addRow(new Object[]{key, prefs.getInt(key, Cfg.fnDefPct(key))});
             }
         }
         return cursor;
