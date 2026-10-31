@@ -104,6 +104,7 @@ class SettingsActivity : ComponentActivity() {
     // 模块 provider、也没法自证，所以不列进来 —— 它在开机时随进程加载。
     private val S_SYSTEMUI = listOf("com.android.systemui")
     private val S_PHOTOS = listOf("com.hihonor.photos")
+    private val S_LAUNCHER = listOf("com.hihonor.android.launcher")
     private val S_INSTALLER = listOf("com.android.packageinstaller")
     private val S_THERMAL = listOf("com.android.systemui", "com.hihonor.iaware")
 
@@ -111,11 +112,6 @@ class SettingsActivity : ComponentActivity() {
     private fun prefs() = getSharedPreferences(Cfg.PREFS_FILE, MODE_PRIVATE)
 
     private fun prefsOn(key: String, def: Boolean) = prefs().getBoolean(key, def)
-
-    // theme: locked to follow system night mode — the old System/Light/Dark
-    // picker and its persisted "theme_mode" key were removed with the miuix
-    // rework (migratePrefs drops any leftover value)
-
     /** bumped on every ON_RESUME — keyed backdrop rebuild fixes the stale
      *  grey glass pill that appears after switching back from another app */
     private val resumeTick = androidx.compose.runtime.mutableIntStateOf(0)
@@ -176,6 +172,7 @@ class SettingsActivity : ComponentActivity() {
 
     /** one prop sync at a time: rapid toggling must not pile up su threads. */
     @Volatile private var propSyncBusy = false
+
 
     /** write persist.sys.has.hottemp (root); verify the read-back and report.
      *  Runs off the main thread with a hard timeout so a pending su prompt can
@@ -280,25 +277,38 @@ class SettingsActivity : ComponentActivity() {
                 dirty = true
             }
         }
-        // v2.3.12: DIY 出厂值对齐标准配方（打开 DIY 观感 = 标准配方）。
-        // 两种情况：
-        //  · 当前 DIY 关着 -> 那些滑条值一次都没生效过，全部对齐；
-        //  · 当前 DIY 开着 -> 他真在用，只把**仍等于旧默认**的键升级，拖过的不动。
-        // 注意 diyInUse 读的是"当前"开关状态，不是"历史上开过没有"——所以"调完
-        // 又关掉"的用户在这里会被当成第一种。对齐前把旧值备份到 prev_*，
-        // 万一要找回调校可以用 adb 读 shared_prefs 捞（备份键不进 provider、不进 UI）。
-        if (!p.getBoolean(Cfg.K_DIY_ALIGNED, false)) {
-            val diyInUse = p.getBoolean(Cfg.K_GLASS_EXTREME, false)
-            for (k in Cfg.DIY_KEYS) {
-                if (!p.contains(k)) continue
-                val v = p.getInt(k, -1)
-                if (!diyInUse || v == Cfg.diyLegacyPct(k)) {
-                    ed.putInt("prev_$k", v)
-                    ed.putInt(k, Cfg.diyDefPct(k))
+        // v2.5.3: DIY（glass_extreme + 14 根滑条）已整体移除，被「分区域强度」和
+        // 「精细调节」两层取代。这里把旧键清干净，别让它们留在 prefs 里发霉。
+        for (stale in arrayOf("live_tune", "glass_extreme", "diy_aligned",
+                "diy_mask", "diy_tblur", "diy_bmask", "diy_bblur", "diy_kblur",
+                "diy_wmask", "diy_radius", "diy_sat", "diy_edge", "diy_refract",
+                "diy_rim", "diy_thick", "diy_disp", "diy_kbbright",
+                "prev_diy_mask", "prev_diy_tblur", "prev_diy_bmask", "prev_diy_bblur",
+                "prev_diy_kblur", "prev_diy_wmask", "prev_diy_radius", "prev_diy_sat",
+                "prev_diy_edge", "prev_diy_refract", "prev_diy_rim", "prev_diy_thick",
+                "prev_diy_disp", "prev_diy_kbbright")) {
+            if (p.contains(stale)) {
+                ed.remove(stale)
+                dirty = true
+            }
+        }
+        // v2.6.3: 通用孤儿键清理。
+        // 精细调节（fn_*）和粗调（tune_*）的键以前是手写进 stale 列表的，
+        // 每删一个参数就要记得补一条 —— 漏一次，旧值就留在 prefs 里静默生效
+        // （v2.6.3 删 fn_winblur 时正好撞上：hook 里已经不信这个键了，但用户
+        // 之前存的值还在，将来哪天同名键复活就会"诈尸"）。
+        // 现在按白名单统一扫：凡是以 fn_/tune_ 开头、又不在当前定义里的键，
+        // 一律清掉。以后增删参数不用再动这里。
+        run {
+            val known = HashSet<String>()
+            known.addAll(Cfg.FN_KEYS)
+            known.addAll(Cfg.TUNE_KEYS)
+            for (k in p.all.keys.toTypedArray()) {
+                if ((k.startsWith("fn_") || k.startsWith("tune_")) && k !in known) {
+                    ed.remove(k)
+                    dirty = true
                 }
             }
-            ed.putBoolean(Cfg.K_DIY_ALIGNED, true)
-            dirty = true
         }
         // clean up obsolete keys: compat switches (dropped with the adaptive
         // hook set), the removed theme picker's value, and the old UI-pref
@@ -524,112 +534,336 @@ class SettingsActivity : ComponentActivity() {
     private fun GlassPage(back: () -> Unit) {
         val probeCtx = LocalContext.current
         LaunchedEffect(Unit) { FrameworkProbe.refresh(probeCtx, true) }
-        var diyOn by remember { mutableStateOf(prefs().getBoolean(Cfg.K_GLASS_EXTREME, false)) }
-        LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp)) {
-            item { BackHeader("液态玻璃", back) }
-            item { TipText("系统 / 锁屏 / 相册三线玻璃效果与总开关。开关改动后需重启系统界面（或重启手机）生效。") }
-            item {
-                SwitchCard(listOf(
-                    SwRow("总开关", "液态玻璃总闸，含 HIGH 强制渲染、LIQUID 材质判定等系统级底层，关闭后全部回退原厂", Cfg.K_GLASS, true, scopes = S_SYSTEMUI),
-                    SwRow("系统液态玻璃", "状态栏通知与控制中心的观感（模糊半径、遮罩、饱和度等参数）", Cfg.K_SYSTEM, true, scopes = S_SYSTEMUI),
-                    SwRow("锁屏液态玻璃", "锁屏按钮与通知卡片的玻璃效果", Cfg.K_KEYGUARD, true, scopes = S_SYSTEMUI),
-                    SwRow("相册液态玻璃", "相册照片页工具栏的玻璃效果", Cfg.K_GALLERY, true, scopes = S_PHOTOS)
-                ))
-            }
-            item {
-                CardShell {
-                    Row(Modifier.fillMaxWidth().clickable {
-                        diyOn = !diyOn
-                        prefs().edit().putBoolean(Cfg.K_GLASS_EXTREME, diyOn).commit()
-                    }.padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text("DIY 液态玻璃", fontSize = 16.sp, color = MiuixTheme.colorScheme.onSurface)
-                            Text("开启后下方滑条生效；关闭回退普通版固定参数", fontSize = 12.sp,
-                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
-                        }
-                        val hv = androidx.compose.ui.platform.LocalView.current
-                        Switch(checked = diyOn, onCheckedChange = {
-                            hv.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
-                            diyOn = it
-                            prefs().edit().putBoolean(Cfg.K_GLASS_EXTREME, it).commit()
-                        })
-                    }
+        var subPage by remember { mutableStateOf("") }
+        var openGroup by remember { mutableStateOf("") }
+        // 三级子页的物理返回：先回二级菜单，而不是直接退出整个「液态玻璃」页。
+        // 之前漏了这个，子页按返回键会一路弹回首页（用户报的 bug）。
+        BackHandler(enabled = subPage.isNotEmpty()) { subPage = "" }
+        LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp),
+            contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp)) {
+            if (subPage.isEmpty()) {
+                item { BackHeader("液态玻璃", back) }
+                item { TipText("总开关控制所有玻璃效果；下面三条线各自进去开关和逐项调节。") }
+                item {
+                    SwitchCard(listOf(
+                        SwRow("总开关", "液态玻璃总闸，含 HIGH 强制渲染、LIQUID 材质判定等系统级底层，关闭后全部回退原厂", Cfg.K_GLASS, true, scopes = S_SYSTEMUI)
+                    ))
                 }
-            }
-            item {
-                AnimatedVisibility(
-                    visible = diyOn,
-                    enter = androidx.compose.animation.expandVertically(),
-                    exit = androidx.compose.animation.shrinkVertically()
-                ) {
+                item {
+                    NavRow("系统液态玻璃", "通知卡片、工具栏按钮与亮度条，含光学 / 模糊 / 高光",
+                        onClick = { subPage = "sys" })
+                }
+                item {
+                    NavRow("锁屏液态玻璃", "锁屏界面的通知卡片玻璃",
+                        onClick = { subPage = "kl" })
+                }
+                item {
+                    NavRow("通知横幅液态玻璃", "来消息时从屏幕顶部弹出的那一条",
+                        onClick = { subPage = "bn" })
+                }
+                item {
+                    NavRow("桌面液态玻璃", "桌面卡片与文件夹的模糊 / 饱和度 / 亮度",
+                        onClick = { subPage = "desk" })
+                }
+                item {
+                    SwitchCard(listOf(
+                        SwRow("相册液态玻璃", "相册照片页工具栏的玻璃效果", Cfg.K_GALLERY, true, scopes = S_PHOTOS)
+                    ))
+                }
+                item { Footnote("开关改动后需重启系统界面（或重启手机）生效。") }
+            } else if (subPage == "desk") {
+                item { BackHeader("桌面液态玻璃", { subPage = "" }) }
+                item {
+                    SwitchCard(listOf(
+                        SwRow("桌面液态玻璃", "桌面卡片与文件夹的玻璃效果", Cfg.K_DESK, true, scopes = S_LAUNCHER)
+                    ))
+                }
+                item {
                     Column {
-                        SectionLabel("DIY 参数（0%~100%）")
-                        CardShell {
-                            DiySliderRow("通知栏 + 工具栏遮罩", Cfg.D_MASK)
-                            DiySliderRow("通知栏 + 工具栏模糊", Cfg.D_TBLUR)
-                            DiySliderRow("通知横幅遮罩", Cfg.D_BMASK)
-                            DiySliderRow("通知横幅模糊", Cfg.D_BBLUR)
-                            DiySliderRow("锁屏通知模糊", Cfg.D_KBLUR)
-                            DiySliderRow("锁屏组件 + 按钮遮罩", Cfg.D_WMASK)
-                            DiySliderRow("锁屏通知亮度", Cfg.D_KBBRIGHT)
-                            DiySliderRow("圆角", Cfg.D_RADIUS)
-                            DiySliderRow("饱和度", Cfg.D_SAT)
-                            DiySliderRow("边缘光", Cfg.D_EDGE)
-                            DiySliderRow("折射", Cfg.D_REFRACT)
-                            DiySliderRow("边框", Cfg.D_RIM)
-                            DiySliderRow("厚度", Cfg.D_THICK)
-                            DiySliderRow("色散", Cfg.D_DISP)
+                        SectionLabel("精细调节（100% = 原厂 · 改完重启「桌面」生效）")
+                        Footnote("⚠️ 这一页改完要**重启桌面**才生效（不是重启系统界面）。桌面的玻璃参数跑在桌面自己的进程里。")
+                        ParamGroup("桌面卡片", "desk", openGroup, { openGroup = it }) {
+                            TuneRow("模糊半径", Cfg.F_DESK_RADIUS,
+                                "桌面卡片和文件夹背后那层模糊的力度。调高更糊更有玻璃感，调低更清晰能看清图标。")
+                            TuneRow("饱和度", Cfg.F_DESK_SAT,
+                                "卡片透出的壁纸颜色鲜艳度。原厂偏淡，想让桌面更绚丽就往高拖。")
+                            TuneRow("亮度", Cfg.F_DESK_BRIGHT, "卡片整体提亮或压暗。")
                         }
-                        Footnote("DIY 滑条改动后重启系统界面（或手机）生效。锁屏通知遮罩与通知栏遮罩共用底层；锁屏通知/壁纸模糊共用底层。")
+                        Footnote("桌面的「液态玻璃」其实只有模糊 + 形状 + 遮罩：系统在桌面这条链上是把折射和高光都设成 null 的（setGlassParamEx(null) / setHighLightParamEx(null)），所以调不出锁屏那种厚玻璃折射感。这是系统的设计，不是模块限制。")
+                    }
+                }
+            } else if (subPage == "sys") {
+                item { BackHeader("系统液态玻璃", { subPage = "" }) }
+                item {
+                    SwitchCard(listOf(
+                        SwRow("系统液态玻璃", "状态栏通知与控制中心的观感", Cfg.K_SYSTEM, true, scopes = S_SYSTEMUI)
+                    ))
+                }
+                item {
+                    Column {
+                        SectionLabel("精细调节（100% = 原厂 · 改完重启「系统界面」生效）")
+                        TuneSwitch("强制液态玻璃", Cfg.F_FORCE_LIQUID,
+                            "有些界面系统会自己判定成磨砂（比如通知横幅、某些卡片），你没法改。打开这个开关，强制它们也走液态折射。如果哪个界面变糊或变色，关掉即可。",
+                            onLabel = "已开启", offLabel = "已关闭")
+                        ParamGroup("通知消息卡片", "ntf", openGroup, { openGroup = it }) {
+                            TuneRow("卡片底色浓度", Cfg.F_NTF_MASK, "下拉通知栏里那一条条消息卡片，背后那层暗色遮罩的浓淡。")
+                            TuneRow("卡片叠加色", Cfg.F_NTF_OVL, "叠在底色上的第二层颜色，影响整体色调。")
+                            TuneRow("卡片亮度", Cfg.F_NTF_BRIGHT, "卡片整体提亮或压暗。原厂 0.08，觉得发白就往下调。")
+                            TuneRow("卡片饱和度", Cfg.F_NTF_SAT, "卡片透出的背景色彩鲜艳度，原厂 1.2。")
+                            TuneRow("卡片圆角", Cfg.F_NTF_CORNER, "通知卡片四个角有多圆，越大越润。")
+                            TuneRow("工具栏内卡片底色", Cfg.F_NTFB_MASK, "工具栏（下滑两次）里那几张通知卡的底色浓度。")
+                            TuneRow("工具栏内卡片叠加", Cfg.F_NTFB_OVL, "工具栏内通知卡的第二层叠加色。")
+                            TuneRow("工具栏内卡片亮度", Cfg.F_NTFB_BRIGHT, "工具栏内通知卡的亮度。")
+                        }
+                        ParamGroup("工具栏大按钮", "cc", openGroup, { openGroup = it }) {
+                            TuneRow("按钮底色浓度", Cfg.F_CC_MASK, "WiFi、蓝牙、飞行模式那些方块按钮的底色浓度。")
+                            TuneRow("按钮叠加色", Cfg.F_CC_OVL, "方块按钮的第二层叠加色。")
+                            TuneRow("按钮亮度", Cfg.F_CC_BRIGHT, "原厂 0.12，比通知卡更亮。觉得工具栏发白就调这一项。")
+                            TuneRow("按钮饱和度", Cfg.F_CC_SAT, "方块按钮透出的背景鲜艳度。")
+                            TuneRow("按钮圆角", Cfg.F_CC_CORNER, "方块按钮四个角有多圆。")
+                        }
+                        ParamGroup("工具栏小按钮", "btn", openGroup, { openGroup = it }) {
+                            TuneRow("按钮底色浓度", Cfg.F_BTN_MASK, "手电筒、相机那种圆形小按钮的底色浓度。")
+                            TuneRow("按钮叠加色", Cfg.F_BTN_OVL, "圆形小按钮的第二层叠加色。")
+                            TuneRow("按钮亮度", Cfg.F_BTN_BRIGHT, "原厂 0.08。")
+                            TuneRow("按钮饱和度", Cfg.F_BTN_SAT, "圆形小按钮透出的背景鲜艳度。")
+                            TuneRow("按钮圆角", Cfg.F_BTN_CORNER, "圆形小按钮的圆角。")
+                        }
+                        ParamGroup("亮度/音量条", "sl", openGroup, { openGroup = it }) {
+                            TuneRow("条底色浓度", Cfg.F_SL_MASK, "能左右拖动的那根长条的底色浓度。")
+                            TuneRow("条叠加色", Cfg.F_SL_OVL, "长条的第二层叠加色。")
+                            TuneRow("条亮度", Cfg.F_SL_BRIGHT, "原厂 0.12。")
+                            TuneRow("条饱和度", Cfg.F_SL_SAT, "长条透出的背景鲜艳度。")
+                            TuneRow("条圆角", Cfg.F_SL_CORNER, "长条两端有多圆。")
+                        }
+                        ParamGroup("玻璃光学（全局）", "opt", openGroup, { openGroup = it }) {
+                            TuneRow("折射强度", Cfg.F_OPT_REFRACT, "玻璃边缘把背景弯折的力度，越大越像真玻璃。")
+                            TuneRow("折射深度", Cfg.F_OPT_DEPTH, "折射影响的范围有多深。")
+                            TuneRow("玻璃厚度", Cfg.F_OPT_THICK, "边缘折射带有多宽，越厚越像一块厚玻璃。")
+                            TuneRow("色散", Cfg.F_OPT_DISP, "边缘的彩色色边，越高彩虹感越强。")
+                        }
+                        ParamGroup("模糊（全局）", "blur", openGroup, { openGroup = it }) {
+                            TuneRow("卡片模糊半径", Cfg.F_BLUR_CARD, "卡片背后背景糊掉的程度，越小越清晰。不管横幅，横幅有自己的一根。")
+                            TuneRow("动态卡模糊", Cfg.F_BLUR_DYNAMIC, "动态卡片单独用的模糊半径。同样不管横幅。")
+                            TuneRow("模糊取样精度", Cfg.F_BLUR_SCALE, "模糊前的降采样比例，影响性能与颗粒感。")
+                        }
+                        ParamGroup("边缘高光（全局）", "hl", openGroup, { openGroup = it }) {
+                            TuneRow("高光宽度", Cfg.F_HL_THICK, "玻璃边缘那圈亮边的粗细。")
+                            TuneRow("高光亮度", Cfg.F_HL_ALPHA, "那圈亮边的透明度，越低越淡。")
+                            TuneRow("高光角度", Cfg.F_HL_ANGLE, "光源方向，0 到 360 度。原厂 250，改它能让光从别的方向照过来。", rangeMax = 360, unit = "°", stepCount = 71)
+                            TuneSwitch("关闭全部高光", Cfg.F_HL_ON, "一次性关掉所有玻璃边缘的亮边。")
+                            TuneSwitch("关闭大按钮高光", Cfg.F_HL_CC, "只关工具栏方块按钮的亮边。")
+                            TuneSwitch("关闭小按钮高光", Cfg.F_HL_BTN, "只关圆形小按钮的亮边。")
+                            TuneSwitch("关闭亮度条高光", Cfg.F_HL_SL, "只关亮度/音量条的亮边。")
+                        }
+                        Footnote("每个数字都是原厂值的百分比。100 = 原厂，低于 100 变弱、高于 100 变强。点右边的 ! 看这一项管什么。")
+                    }
+                }
+            } else if (subPage == "kl") {
+                item { BackHeader("锁屏液态玻璃", { subPage = "" }) }
+                item {
+                    SwitchCard(listOf(
+                        SwRow("锁屏液态玻璃", "锁屏按钮与通知卡片的玻璃效果", Cfg.K_KEYGUARD, true, scopes = S_SYSTEMUI)
+                    ))
+                }
+                item {
+                    Column {
+                        SectionLabel("精细调节（100% = 原厂）")
+                        Footnote("⚠️ 这一页改完**必须重启手机**才生效。只重启「系统界面」不够——锁屏上的按钮、图标、文字在系统界面刚启动的头两秒就画好了，那时设置还没读进来，会静默跳过。")
+                        ParamGroup("锁屏通知卡片", "kl", openGroup, { openGroup = it }) {
+                            TuneRow("卡片底色浓度", Cfg.F_KL_MASK, "锁屏界面上那几条通知卡片，背后那层暗色遮罩的浓淡。")
+                            TuneRow("卡片叠加色", Cfg.F_KL_OVL, "叠在锁屏卡片底色上的第二层颜色。")
+                            TuneRow("卡片亮度", Cfg.F_KL_BRIGHT, "锁屏通知卡整体提亮或压暗。原厂按壁纸亮度自动算，模块默认锁在 0.1。")
+                            TuneRow("卡片饱和度", Cfg.F_KL_SAT, "锁屏卡片透出的背景鲜艳度，原厂 1.2。")
+                            TuneRow("卡片圆角", Cfg.F_KL_CORNER, "锁屏通知卡四个角有多圆。")
+                        }
+                        Footnote("锁屏的配方和桌面不一样：卡片更暗、亮度更低。以上只影响锁屏。")
+                        ParamGroup("锁屏时钟玻璃", "kgclock", openGroup, { openGroup = it }) {
+                            TuneRow("时钟腐蚀强度", Cfg.F_KG_ERODE,
+                                "锁屏那个大时钟的玻璃「厚度」。原厂按字体和字号自动算（0.45 到 2.49 之间），你没法管。往上拖边缘更厚更糊、像块厚玻璃；往下拖边缘变薄变锐利。")
+                        }
+                        Footnote("时钟这一项走的是另一条链路（keyguardengine 的腐蚀表），不是上面那套卡片参数。调它不会影响通知卡。")
+                        ParamGroup("锁屏按钮与文字", "kgelem", openGroup, { openGroup = it }) {
+                            TuneRow("底部按钮", Cfg.F_KG_BTN,
+                                "锁屏底部那几个玻璃按钮——手电筒、相机那一排，连图标带底下那块圆角底板一起。调低更透更淡，调高更浓更实。")
+                            TuneRow("锁形图标", Cfg.F_KG_ICON,
+                                "锁屏上方那个小锁图标，还有节日彩蛋图标（春节/中秋那种）。")
+                            TuneRow("提示文字", Cfg.F_KG_TXT,
+                                "「上滑解锁」这类提示、充电状态文字、杂志锁屏的标题。只改文字底下那层玻璃的浓度，不改文字本身的颜色。")
+                        }
+                        Footnote("这三项管的是元素**背后的玻璃浓度**（模糊半径 / 饱和度 / 亮度），不是图标颜色。图标颜色由系统的壁纸取色算，模块改不了。")
+                        ParamGroup("按钮的光学", "btnopt", openGroup, { openGroup = it }) {
+                            TuneRow("折射深度", Cfg.F_KG_BTN_DEP, "按钮玻璃「往里凹」的深度。越深越像一块厚玻璃，越浅越像贴在屏上的膜。只在底部按钮上生效。")
+                            TuneRow("色散", Cfg.F_KG_BTN_DIS, "按钮边缘那道彩色边的强弱（像肥皂泡那种）。调低更干净。")
+                            TuneRow("玻璃厚度", Cfg.F_KG_BTN_THK, "按钮边缘折射带的宽度。原厂已经很厚，觉得糊就往下调。")
+                            TuneRow("边缘光", Cfg.F_KG_BTN_EDGE, "按钮边缘那圈亮边的浓淡。")
+                        }
+                        ParamGroup("图标的光学", "iconopt", openGroup, { openGroup = it }) {
+                            TuneRow("折射深度", Cfg.F_KG_ICON_DEP, "只作用在锁形图标和节日图标上，和按钮那根互不影响。")
+                            TuneRow("色散", Cfg.F_KG_ICON_DIS, "图标边缘的彩色边强弱。")
+                            TuneRow("玻璃厚度", Cfg.F_KG_ICON_THK, "图标那一小块玻璃的折射带宽度。")
+                            TuneRow("边缘光", Cfg.F_KG_ICON_EDGE, "图标边缘亮边的浓淡。")
+                        }
+                        ParamGroup("文字的光学", "txtopt", openGroup, { openGroup = it }) {
+                            TuneRow("折射深度", Cfg.F_KG_TXT_DEP, "提示文字底下那层玻璃的凹陷深度。")
+                            TuneRow("色散", Cfg.F_KG_TXT_DIS, "文字玻璃边缘的彩色边。")
+                            TuneRow("玻璃厚度", Cfg.F_KG_TXT_THK, "文字那层玻璃的折射带宽度。")
+                            TuneRow("边缘光", Cfg.F_KG_TXT_EDGE, "文字玻璃边缘亮边的浓淡。")
+                        }
+                        Footnote("「光学」这四组是三套完全独立的参数：按钮、图标、文字各有自己的深度/色散/厚度/边缘光，拖其中一组不会影响另外两组。")
+                        ParamGroup("锁屏小组件", "kgwidget", openGroup, { openGroup = it }) {
+                            TuneRow("小组件透明度", Cfg.F_KG_WIDGET,
+                                "锁屏上那几块小组件——天气、闹钟、步数那些圆角卡片。100% 是系统原样，调低更透、能看见后面的壁纸；调高更实。注意是整块一起变透，里面的文字也会跟着淡。")
+                        }
+                        Footnote("小组件走的是独立的一条链（AppWidgetHelper → KgAppWidgetHostView），和上面的按钮、时钟都不是一套，所以单独一根。")
+                        ParamGroup("锁屏壁纸玻璃", "kgbg", openGroup, { openGroup = it }) {
+                            TuneRow("壁纸模糊半径", Cfg.F_KG_BG_RADIUS,
+                                "锁屏壁纸那层模糊的力度。原厂跟「通透度」绑死：通透度 100 时半径只有 9（很轻），0 时 32（很糊）。想让壁纸更糊就往高拖，更清楚就往低拖。")
+                            TuneRow("壁纸饱和度", Cfg.F_KG_BG_SAT,
+                                "锁屏壁纸透出来的颜色鲜艳度。原厂是写死的 1.3，跟通透度完全无关——所以你觉得淡或太艳都没法调。现在能了。")
+                            TuneRow("指纹饱和度", Cfg.F_KG_FP_SAT,
+                                "锁屏指纹区域那圈玻璃的鲜艳度。原厂只有 1.3 / 1.2 两档（按通透度分），没法细调。")
+                        }
+                        Footnote("这一组管的是「整块锁屏壁纸」，不是上面的卡片或按钮。三个都是乘在原厂值上，100% = 完全不动。")
+                    }
+                }
+            } else {
+                item { BackHeader("通知横幅液态玻璃", { subPage = "" }) }
+                item {
+                    SwitchCard(listOf(
+                        SwRow("通知横幅液态玻璃", "来通知时顶部弹出的横幅玻璃效果", Cfg.K_BANNER, true, scopes = S_SYSTEMUI)
+                    ))
+                }
+                item {
+                    Column {
+                        SectionLabel("精细调节（100% = 原厂 · 改完重启「系统界面」生效）")
+                        ParamGroup("通知横幅", "bn", openGroup, { openGroup = it }) {
+                            TuneRow("横幅底色浓度", Cfg.F_BN_MASK, "来通知时从屏幕顶部弹出的那条横幅，背后暗色遮罩的浓淡。")
+                            TuneRow("横幅叠加色", Cfg.F_BN_OVL, "横幅的第二层叠加色。")
+                            TuneRow("横幅亮度", Cfg.F_BN_BRIGHT, "原厂是 0（完全不提亮），和通知卡的 0.08 完全不同，必须单独调。")
+                            TuneRow("横幅饱和度", Cfg.F_BN_SAT, "原厂白天 1.8、夜间 1.5，比通知卡艳得多。觉得太冲就往下调。")
+                            TuneRow("横幅模糊", Cfg.F_BN_BLUR, "横幅背后背景糊掉的程度。原厂已乘过一次 0.5，这里在其基础上再调。")
+                        }
+                        Footnote("横幅的亮度和饱和度跟通知卡完全不同（原厂亮度 0、饱和度 1.8），所以单独一组。")
                     }
                 }
             }
-            item { Footnote("开关改动后需重启系统界面（或重启手机）生效。") }
         }
     }
 
-    // ================= Installer =================
+    /** 二级菜单入口：点击进入三级子页。 */
+    @Composable
+    private fun NavRow(title: String, desc: String, onClick: () -> Unit) {
+        CardShell {
+            Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(18.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(title, fontSize = 16.sp, color = MiuixTheme.colorScheme.onSurface)
+                    Text(desc, fontSize = 12.sp,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                }
+                Text(">", fontSize = 20.sp, color = MiuixTheme.colorScheme.primary)
+            }
+        }
+    }
 
     @Composable
-    private fun DiySliderRow(label: String, key: String) {
-        var pct by remember { mutableStateOf(prefs().getInt(key, Cfg.diyDefPct(key))) }
+    private fun ParamGroup(
+        title: String,
+        id: String,
+        state: String,
+        onState: (String) -> Unit,
+        content: @Composable ColumnScope.() -> Unit
+    ) {
+        val open = state == id
+        CardShell {
+            Row(
+                Modifier.fillMaxWidth().clickable { onState(if (open) "" else id) }
+                    .padding(horizontal = 18.dp, vertical = 16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(title, fontSize = 16.sp, color = MiuixTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f))
+                Text(if (open) "收起" else "展开", fontSize = 13.sp,
+                    color = MiuixTheme.colorScheme.primary)
+            }
+            if (open) {
+                Box(Modifier.fillMaxWidth().padding(horizontal = 18.dp).height(1.dp)
+                    .background(MiuixTheme.colorScheme.onSurface.copy(alpha = 0.08f)))
+                Column(Modifier.padding(bottom = 8.dp), content = content)
+            }
+        }
+    }
+
+    /**
+     * 开关型精细参数：原厂已开启，打开这里 = 关掉它。
+     * 值语义 0 = 跟随原厂，1 = 强制关闭。
+     */
+    @Composable
+    private fun TuneSwitch(label: String, key: String, tip: String = "",
+                           onLabel: String = "已关闭", offLabel: String = "原厂") {
+        val hv = androidx.compose.ui.platform.LocalView.current
+        var on by remember { mutableStateOf(prefs().getInt(key, Cfg.fnDefPct(key)) != 0) }
+        Row(
+            Modifier.fillMaxWidth().clickable {
+                on = !on
+                hv.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
+                prefs().edit().putInt(key, if (on) 1 else 0).commit()
+            }.padding(horizontal = 18.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(label, fontSize = 15.sp, color = MiuixTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f))
+            if (tip.isNotEmpty()) {
+                InfoDot(tip)
+                Spacer(Modifier.width(8.dp))
+            }
+            Text(if (on) onLabel else offLabel, fontSize = 13.sp,
+                color = MiuixTheme.colorScheme.primary)
+        }
+    }
+
+    @Composable
+    /**
+     * 一根精细调节滑条。
+     *
+     * [stepCount] 是 Slider 的 steps 参数（吸附格数 - 1）。默认 19 = 把 0..200
+     * 切成 20 格、每格 10（即 5% 吸附）。
+     *
+     * ⚠ 角度那根必须传 71：rangeMax=360 时用 19 会变成 18°/格，
+     * **原厂值 250 根本不在网格上**（只能落在 234 或 252），用户一动就回不去。
+     * 71 格 = 5°/格，250 正好是 5 的倍数；haptic 的 %10 判断在两种网格下都能命中。
+     */
+    private fun TuneRow(label: String, key: String, tip: String = "",
+                        rangeMax: Int = 200, unit: String = "%", stepCount: Int = 19) {
+        // fn_ 开头的是精细参数、其余是分区域强度，两者的出厂默认分开烧录
+        val defPct = if (key.startsWith("fn_")) Cfg.fnDefPct(key) else Cfg.tuneDefPct(key)
+        var pct by remember { mutableStateOf(prefs().getInt(key, defPct)) }
         Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text(label, fontSize = 15.sp, color = MiuixTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
-                Text("$pct%", fontSize = 13.sp, color = MiuixTheme.colorScheme.primary)
-            }
-            BoxWithConstraints(Modifier.fillMaxWidth().padding(top = 2.dp)) {
-                val w = maxWidth
-                val view = androidx.compose.ui.platform.LocalView.current
-                Slider(
-                    value = pct.toFloat(),
-                    onValueChange = { v ->
-                        val nv = v.toInt()
-                        if (nv != pct && nv % 5 == 0) {
-                            view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
-                        }
-                        pct = nv
-                    },
-                    valueRange = 0f..100f,
-                    // 5% 一档（21 个停靠点）。早先是 steps=4（25% 一档）+ 锚点画在
-                    // 20/40/60/80 + 震动条件 %20 —— 三套网格互不相干，默认值 65/60/40
-                    // 这些根本停不下来，一拖就跳到 50 或 75，震动还永远不触发。
-                    steps = 19,
-                    onValueChangeFinished = { prefs().edit().putInt(key, pct).commit() },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                // 四等分参考线（不参与吸附，纯视觉刻度）
-                val frac = pct / 100f
-                for (i in 1..4) {
-                    val f = i / 5f
-                    Box(Modifier.align(Alignment.CenterStart)
-                        .offset(x = 14.dp + (w - 28.dp) * f - 4.dp)
-                        .size(8.dp)
-                        .clip(CircleShape)
-                        .background(if (f <= frac + 0.001f) Color.White.copy(alpha = 0.85f)
-                                    else MiuixTheme.colorScheme.onSurface.copy(alpha = 0.25f)))
+                Text(label, fontSize = 15.sp, color = MiuixTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f))
+                if (tip.isNotEmpty()) {
+                    InfoDot(tip)
+                    Spacer(Modifier.width(8.dp))
                 }
+                Text("$pct$unit", fontSize = 13.sp, color = MiuixTheme.colorScheme.primary)
             }
+            val view = androidx.compose.ui.platform.LocalView.current
+            Slider(
+                value = pct.toFloat(),
+                onValueChange = { v ->
+                    val nv = v.toInt()
+                    if (nv != pct && nv % 10 == 0) {
+                        view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
+                    }
+                    pct = nv
+                },
+                valueRange = 0f..rangeMax.toFloat(),
+                steps = stepCount,
+                onValueChangeFinished = { prefs().edit().putInt(key, pct).commit() },
+                modifier = Modifier.fillMaxWidth()
+            )
         }
     }
 
@@ -878,6 +1112,35 @@ class SettingsActivity : ComponentActivity() {
         Text(text, fontSize = 12.sp, textAlign = TextAlign.Center,
             color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
             modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp))
+    }
+
+    /**
+     * 圆形感叹号：点一下弹出这段说明。
+     * 用来替代底部大段脚注 —— 每项调节旁边各挂一个，想看哪项点哪项，不占版面。
+     */
+    @Composable
+    private fun InfoDot(tip: String) {
+        var open by remember { mutableStateOf(false) }
+        Box(
+            Modifier.size(17.dp).clip(CircleShape)
+                .background(MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.20f))
+                .clickable { open = true },
+            contentAlignment = Alignment.Center
+        ) {
+            Text("!", fontSize = 11.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+        }
+        if (open) {
+            Dialog(onDismissRequest = { open = false }) {
+                Column(
+                    Modifier.clip(RoundedCornerShape(18.dp))
+                        .background(MiuixTheme.colorScheme.surface)
+                        .padding(20.dp)
+                ) {
+                    Text(tip, fontSize = 14.sp, lineHeight = 21.sp,
+                        color = MiuixTheme.colorScheme.onSurface)
+                }
+            }
+        }
     }
 
     @Composable
