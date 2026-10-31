@@ -36,9 +36,9 @@ public final class DexKitHelper {
             System.loadLibrary("dexkit");
             sBridge = org.luckypray.dexkit.DexKitBridge.create(apkPath);
             sApk = apkPath;
-            XposedBridge.log("[HAS] DexKit bridge ready for " + apkPath);
+            Diag.log("DexKit bridge ready for " + apkPath);
         } catch (Throwable t) {
-            XposedBridge.log("[HAS] DexKit bridge init failed: " + t);
+            Diag.err("DexKit bridge init failed", t);
         }
         return sBridge;
     }
@@ -64,7 +64,7 @@ public final class DexKitHelper {
             if (found != null && found.getName().contains("$")) return null;
             return found;
         } catch (Throwable t) {
-            XposedBridge.log("[HAS] DexKit findClass(strings) failed: " + t);
+            Diag.err("DexKit findClass(strings) failed", t);
             return null;
         }
     }
