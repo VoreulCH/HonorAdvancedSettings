@@ -8,7 +8,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * 荣耀高级设置 — entry dispatcher.
  * Routes each scoped process to its hook set:
  *   android / packageinstaller        -> InstallerHook (荣耀安装器净化)
- *   systemui / launcher / photos      -> GlassHook (荣耀液态玻璃恢复, prop-gated by master switch)
+ *   systemui / launcher / photos      -> GlassHook (荣耀液态玻璃恢复, Cfg snapshot-gated switches)
  */
 public final class MainHook implements IXposedHookLoadPackage {
 
@@ -18,13 +18,13 @@ public final class MainHook implements IXposedHookLoadPackage {
         ClassLoader cl = lpparam.classLoader;
 
         if ("android".equals(pkg)) {
-            XposedBridge.log("[HAS] v2.0.2 in system_server");
+            XposedBridge.log("[HAS] v2.1.2 in system_server");
             Cfg.startPreload(true); // observer: downgrade switch without reboot
             InstallerHook.initSystemServer(cl);
             return;
         }
         if ("com.android.packageinstaller".equals(pkg)) {
-            XposedBridge.log("[HAS] v2.0.2 in packageinstaller");
+            XposedBridge.log("[HAS] v2.1.2 in packageinstaller");
             Cfg.startPreload(true); // observer: "next install" picks up changes
             InstallerHook.init(cl, lpparam.appInfo.sourceDir);
             return;
