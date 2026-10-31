@@ -220,7 +220,8 @@ public final class GlassHook implements IXposedHookLoadPackage {
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         ClassLoader cl = lpparam.classLoader;
-        log("[HAS] glass v2.2.9 in process: " + lpparam.packageName);
+        // 进程横幅由 MainHook.enter() 统一打（带真实版本号）；这里早先硬编码了
+        // "glass v2.2.9"，每次发版都会变成过期信息，删掉只留一处。
 
         hookTransparentMode(cl);
         hookBlurParams(cl);
@@ -1329,7 +1330,7 @@ public final class GlassHook implements IXposedHookLoadPackage {
     }
 
     private static void log(String msg) {
-        XposedBridge.log("[" + TAG + "] " + msg);
+        Diag.log(msg);
     }
 
     /**
