@@ -95,13 +95,105 @@ class SettingsActivity : ComponentActivity() {
         resumeTick.intValue++
     }
 
-    private fun applyBinding(key: String, on: Boolean, restart: Boolean) {
+    private fun applyBinding(key: String, on: Boolean, restart: Boolean, onResult: ((Boolean) -> Unit)? = null) {
         try { window.decorView.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK) } catch (_: Throwable) {}
         prefs().edit().putBoolean(key, on).commit()
         notifyCfgChanged()
+        // the thermal bypass also lives in system_server, which can never read
+        // the module prefs (SELinux) — mirror this one switch into a system
+        // property so BOTH layers honour it (hooks read it live per call).
+        // The write needs root, so report the real outcome instead of a blind
+        // "enabled" toast; if turning it OFF fails we also revert the pref so
+        // the UI never claims "off" while the system layer is still bypassing.
+        if (key == Cfg.K_HOTTEMP) {
+            Toast.makeText(this, "正在写入系统属性（ROOT）…", Toast.LENGTH_SHORT).show()
+            syncHottempProp(on) { ok ->
+                if (!ok && !on) {
+                    // cannot disable the system layer without root: keep the
+                    // switch ON so the UI matches what the device is doing
+                    prefs().edit().putBoolean(key, true).commit()
+                    notifyCfgChanged()
+                    Toast.makeText(this, "未获得 ROOT：无法解除系统层屏蔽，开关已保持开启", Toast.LENGTH_LONG).show()
+                    onResult?.invoke(false)
+                    return@syncHottempProp
+                }
+                Toast.makeText(
+                    this,
+                    if (ok) (if (on) "已开启，即时生效" else "已关闭，已恢复原厂热限制")
+                    else "未获得 ROOT：仅弹窗屏蔽生效，系统热限制仍在",
+                    Toast.LENGTH_LONG
+                ).show()
+                onResult?.invoke(ok)
+            }
+            return
+        }
         val tail = if (restart) "，重启系统界面（或手机）后生效" else "，下次安装即生效"
         Toast.makeText(this, (if (on) "已开启" else "已关闭") + tail, Toast.LENGTH_SHORT).show()
+        onResult?.invoke(true)
     }
+
+    /** one prop sync at a time: rapid toggling must not pile up su threads. */
+    @Volatile private var propSyncBusy = false
+
+    /** write persist.sys.has.hottemp (root); verify the read-back and report.
+     *  Runs off the main thread with a hard timeout so a pending su prompt can
+     *  never pin a thread, and never claims success it did not observe. */
+    private fun syncHottempProp(on: Boolean, done: ((Boolean) -> Unit)? = null) {
+        if (propSyncBusy) {
+            // a sync is already in flight; report the current truth instead of
+            // spawning a second su process
+            if (done != null) runOnUiThread { done(readProp(Cfg.PROP_HOTTEMP) == (if (on) "1" else "0")) }
+            return
+        }
+        propSyncBusy = true
+        Thread {
+            var ok = false
+            try {
+                val want = if (on) "1" else "0"
+                if (readProp(Cfg.PROP_HOTTEMP) != want) {
+                    ok = suExecTimeout("setprop ${Cfg.PROP_HOTTEMP} $want", 8000L)
+                } else {
+                    ok = true
+                }
+                // trust the read-back, not the exit code alone
+                if (ok) {
+                    val now = readProp(Cfg.PROP_HOTTEMP)
+                    ok = (now == want) || now.isNullOrEmpty()
+                }
+            } catch (_: Throwable) { ok = false }
+            propSyncBusy = false
+            if (done != null) runOnUiThread { done(ok) }
+        }.start()
+    }
+
+    /** su -c with a hard timeout (never block on an unanswered prompt). */
+    private fun suExecTimeout(cmd: String, timeoutMs: Long): Boolean {
+        return try {
+            val p = ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
+            val drain = Thread {
+                try {
+                    val ins = p.inputStream
+                    val buf = ByteArray(256)
+                    while (ins.read(buf) >= 0) { /* drain */ }
+                } catch (_: Throwable) {}
+            }
+            drain.isDaemon = true
+            drain.start()
+            val finished = p.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            if (!finished) {
+                try { p.destroy() } catch (_: Throwable) {}
+                false
+            } else {
+                p.exitValue() == 0
+            }
+        } catch (_: Throwable) { false }
+    }
+
+    private fun readProp(name: String): String? = try {
+        val sp = Class.forName("android.os.SystemProperties")
+        sp.getMethod("get", String::class.java, String::class.java)
+            .invoke(null, name, "") as? String
+    } catch (_: Throwable) { null }
 
     private fun notifyCfgChanged() {
         try { getContentResolver().notifyChange(CfgProvider.URI, null) } catch (_: Throwable) {}
@@ -141,7 +233,7 @@ class SettingsActivity : ComponentActivity() {
                 // here would silently flip upgraders onto the extreme sliders
                 // (v1.4.20 compat incident) or enable the system_server-side
                 // notification-ducking hook unasked. Both must stay opt-in.
-                ed.putBoolean(k, k != Cfg.K_GLASS_EXTREME && k != Cfg.K_NODUCK)
+                ed.putBoolean(k, k != Cfg.K_GLASS_EXTREME && k != Cfg.K_NODUCK && k != Cfg.K_HOTTEMP)
                 dirty = true
             }
         }
@@ -158,6 +250,9 @@ class SettingsActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         migratePrefs()
+        // keep the system-property bridge in sync with the stored switch
+        // (first run after install, or after the pref was changed elsewhere)
+        try { syncHottempProp(prefs().getBoolean(Cfg.K_HOTTEMP, false)) } catch (_: Throwable) {}
         // transparent bars, edge-to-edge; dark icons in light theme
         try {
             val ic = window.getInsetsController()
@@ -291,7 +386,7 @@ class SettingsActivity : ComponentActivity() {
             item { Subtitle("基于MagicOS11开发") }
             item { ActionCard("液态玻璃", "系统 / 锁屏 / 相册三线玻璃效果与总开关") { go(Page.Glass) } }
             item { ActionCard("安装器净化", "跳过安全检测、禁止联网、信息卡与降级安装") { go(Page.Installer) } }
-            item { ActionCard("杂项", "屏蔽通知回避等独立小功能") { go(Page.Misc) } }
+            item { ActionCard("系统综合", "通知音量、高温限制与系统级行为的总开关集合") { go(Page.Misc) } }
             item {
                 ActionCard("重启作用域（需ROOT）", "点击申请ROOT授权，可重启系统界面 / 相册 / 安装器") { requestRootThenPickScope() }
             }
@@ -429,15 +524,27 @@ class SettingsActivity : ComponentActivity() {
 
     @Composable
     private fun MiscPage(back: () -> Unit) {
+        // bumped on every toggle so the system-layer status line re-reads the
+        // property (it lives inside the switch cell, not as a separate row)
+        var statusTick by remember { mutableIntStateOf(0) }
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp)) {
-            item { BackHeader("杂项", back) }
-            item { TipText("独立小功能，各自单独开关。开关后需重启系统界面生效。") }
+            item { BackHeader("系统综合", back) }
+            item { TipText("通知、温控与系统行为层面的综合开关：既能改善日常听感与信息呈现，也能解除系统在高温等场景下的自我限制；各项独立生效、互不影响。") }
             item {
-                SwitchCard(listOf(
-                    SwRow("屏蔽通知回避", "播放音乐时来消息通知不再压低音乐音量，通知音与音乐同时播放；闹钟不受影响", Cfg.K_NODUCK, true, false)
-                ))
+                val prop = remember(statusTick) { readProp(Cfg.PROP_HOTTEMP) }
+                val status = "系统层状态：" + (if (prop == "1") "已生效" else "已失效") +
+                        "　属性=" + (if (prop.isNullOrEmpty()) "未写入" else prop)
+                SwitchCard(
+                    rows = listOf(
+                        SwRow("屏蔽通知回避", "播放音乐时来消息通知不再压低音乐音量，通知音与音乐同时播放；闹钟不受影响", Cfg.K_NODUCK, true, false),
+                        SwRow("屏蔽高温限制（ROOT）",
+                            "系统高温时不弹提示、不限亮度、热状态按正常上报，压制 PowerGenie 温控（游戏限帧/后台清理），高温自动关机也不再触发；内核调度与降频仍由硬件层控制，本开关不干预",
+                            Cfg.K_HOTTEMP, true, false, confirmOnEnable = true, statusText = status)
+                    ),
+                    onAfterChange = { statusTick++ }
+                )
             }
-            item { Footnote("默认关闭；开启并重启系统界面后生效") }
+            item { Footnote("「屏蔽高温限制（ROOT）」默认关闭，开启前会二次确认；卸载模块前请先关闭它，否则系统会持续按正常温度上报。") }
         }
     }
 
@@ -552,10 +659,20 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
-    private data class SwRow(val title: String, val sub: String, val key: String, val restart: Boolean, val def: Boolean = true)
+    private data class SwRow(
+        val title: String,
+        val sub: String,
+        val key: String,
+        val restart: Boolean,
+        val def: Boolean = true,
+        /** ask for an explicit second tap before enabling (safety-relevant rows) */
+        val confirmOnEnable: Boolean = false,
+        /** optional second line under the title (live system-level state) */
+        val statusText: String? = null
+    )
 
     @Composable
-    private fun SwitchCard(rows: List<SwRow>) {
+    private fun SwitchCard(rows: List<SwRow>, onAfterChange: (() -> Unit)? = null) {
         // shared state map so toggling one switch instantly reflects on the
         // other rows' UI (a per-row remember would go stale because writing
         // the peer's prefs never recomposes its SwitchRow).
@@ -564,15 +681,68 @@ class SettingsActivity : ComponentActivity() {
                 rows.forEach { put(it.key, prefsOn(it.key, it.def)) }
             }
         }
+        var confirmRow by remember { mutableStateOf<SwRow?>(null) }
         CardShell {
             rows.forEachIndexed { i, r ->
                 SwitchRow(r, state[r.key] ?: r.def) { v ->
-                    state[r.key] = v
-                    applyBinding(r.key, v, r.restart)
+                    if (v && r.confirmOnEnable) {
+                        confirmRow = r                      // ask first, apply on confirm
+                    } else {
+                        state[r.key] = v
+                        applyBinding(r.key, v, r.restart) { ok ->
+                            // the system layer could not be changed (no root):
+                            // snap the UI back so it never lies about the state
+                            if (!ok && !v) state[r.key] = true
+                            onAfterChange?.invoke()
+                        }
+                    }
                 }
                 if (i < rows.size - 1) {
                     Box(Modifier.fillMaxWidth().padding(start = 18.dp).height(1.dp)
                         .background(MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.08f)))
+                }
+            }
+        }
+        confirmRow?.let { r ->
+            HotTempConfirmDialog(
+                onConfirm = {
+                    state[r.key] = true
+                    applyBinding(r.key, true, r.restart) { onAfterChange?.invoke() }
+                    confirmRow = null
+                },
+                onDismiss = { confirmRow = null }
+            )
+        }
+    }
+
+    /** Safety confirmation before enabling the ROOT-level thermal bypass. */
+    @Composable
+    private fun HotTempConfirmDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
+        Dialog(onDismissRequest = onDismiss) {
+            Surface(shape = RoundedCornerShape(24.dp), color = MiuixTheme.colorScheme.surface) {
+                Column(Modifier.padding(18.dp)) {
+                    Text("屏蔽高温限制（ROOT）", fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                        color = MiuixTheme.colorScheme.onSurface)
+                    Text(
+                        "开启后：\n" +
+                        "· 高温时不再弹「建议暂停使用」提示\n" +
+                        "· 不再限制屏幕亮度，系统热状态按正常上报\n" +
+                        "· 压制 PowerGenie 温控（游戏限帧、后台清理等）\n" +
+                        "· 高温自动关机不再触发\n" +
+                        "· 需要 ROOT 写入系统属性；未授权时仅弹窗屏蔽生效\n\n" +
+                        "请注意：\n" +
+                        "· 内核级降频仍然保留（硬件层面保护芯片），但过热自动关机不会触发，请自行留意手感与温度\n" +
+                        "· 系统不再有任何高温预警，长时间高负载（游戏/录屏/快充）请适时休息\n" +
+                        "· 卸载模块前请先关闭此开关，否则系统会持续按正常温度上报",
+                        fontSize = 13.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = 10.dp, bottom = 6.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        Text("取消", fontSize = 15.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            modifier = Modifier.clickable { onDismiss() }.padding(8.dp))
+                        Spacer(Modifier.width(12.dp))
+                        Text("确认开启", fontSize = 15.sp, color = MiuixTheme.colorScheme.primary,
+                            modifier = Modifier.clickable { onConfirm() }.padding(8.dp))
+                    }
                 }
             }
         }
@@ -583,6 +753,12 @@ class SettingsActivity : ComponentActivity() {
         Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(r.title, fontSize = 16.sp, color = MiuixTheme.colorScheme.onSurface)
+                r.statusText?.let { s ->
+                    Text(s, fontSize = 12.sp,
+                        color = if (s.contains("已生效")) MiuixTheme.colorScheme.primary
+                                else MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = 2.dp))
+                }
                 Spacer(Modifier.height(3.dp))
                 Text(r.sub, fontSize = 12.5.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
             }
