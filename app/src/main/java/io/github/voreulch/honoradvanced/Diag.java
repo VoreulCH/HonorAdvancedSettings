@@ -177,6 +177,21 @@ public final class Diag {
         log(msg);
     }
 
+    /**
+     * 每进程固定几行、**不受诊断开关控制**的关键状态。
+     *
+     * <p>专治一个诊断盲区：Cfg 还没从 provider 落地时，开着诊断也打不出东西
+     * （开关本身就存在 Cfg 里）。可偏偏那一刻正是"用户的设置没生效、hook 只能
+     * 用默认值"的时刻 —— 玻璃突然发亮、温控开关失灵都发生在这个窗口。
+     * 这类行数量固定（每进程一两行），常开不会污染日志。
+     */
+    public static void note(String msg) {
+        try {
+            XposedBridge.log(head("N") + msg);
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static void warn(String msg) {
         if (!on() && !sEssential) {
             return;
