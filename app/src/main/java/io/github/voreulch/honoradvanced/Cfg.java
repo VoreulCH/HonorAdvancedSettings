@@ -49,9 +49,10 @@ public final class Cfg {
     public static final String K_INFOCARD = "infocard";   // package info card
     public static final String K_DOWNGRADE = "downgrade"; // allow downgrade installs
     public static final String K_NODUCK = "noduck";       // misc: block notification audio ducking
+    public static final String K_HOTTEMP = "hottemp";     // misc: suppress the system high-temperature popups
     public static final String[] KEYS = {
             K_GLASS, K_SYSTEM, K_KEYGUARD, K_GALLERY, K_GLASS_EXTREME,
-            K_PURIFY, K_INFOCARD, K_DOWNGRADE, K_NODUCK,
+            K_PURIFY, K_INFOCARD, K_DOWNGRADE, K_NODUCK, K_HOTTEMP,
     };
 
     // ===== DIY slider keys (percent 0-100, hooks read them when
@@ -75,6 +76,47 @@ public final class Cfg {
             D_RADIUS, D_SAT, D_EDGE, D_REFRACT, D_RIM, D_THICK, D_DISP,
             D_KBBRIGHT,
     };
+
+    /**
+     * Cross-process gate for the high-temperature bypass. system_server can
+     * never read the module prefs/provider (SELinux), so SettingsActivity
+     * mirrors this one switch into a system property with root; every hook
+     * (SystemUI *and* system_server) reads the property live, so toggling
+     * takes effect immediately — no scope restart, no reboot.
+     * Missing/unreadable -> "0" (OFF): a root-level safety bypass must never
+     * be silently active on a fresh install.
+     */
+    public static final String PROP_HOTTEMP = "persist.sys.has.hottemp";
+
+    // Cached reader: the thermal hooks fire on EVERY HAL temperature callback
+    // (several per second) and on EVERY status query, so a Class.forName +
+    // getMethod per call would be real overhead inside system_server and
+    // PowerGenie. Resolve the Method once, then re-read the property at most
+    // once per second (a toggle therefore lands within ~1s, still "instant").
+    private static volatile java.lang.reflect.Method sPropGet;
+    private static volatile long sPropAt;
+    private static volatile boolean sPropVal = true;
+
+    public static boolean hottempOn() {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - sPropAt < 1000L) {
+            return sPropVal;
+        }
+        try {
+            java.lang.reflect.Method m = sPropGet;
+            if (m == null) {
+                Class<?> sp = Class.forName("android.os.SystemProperties");
+                m = sp.getMethod("get", String.class, String.class);
+                sPropGet = m;
+            }
+            sPropVal = !"0".equals(m.invoke(null, PROP_HOTTEMP, "0"));
+        } catch (Throwable t) {
+            // keep the last known value and back off instead of retrying the
+            // (possibly failing) reflection on every single callback
+        }
+        sPropAt = now;
+        return sPropVal;
+    }
 
     /** default percent for each DIY slider (matches the old EXTREME values) */
     public static int diyDefPct(String key) {
