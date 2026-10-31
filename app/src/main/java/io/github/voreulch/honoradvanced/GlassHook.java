@@ -166,6 +166,8 @@ public final class GlassHook implements IXposedHookLoadPackage {
     private static ClassLoader sAppCl;
     private static boolean sKgHooksInstalled;
     private static boolean sGlassExtreme;
+    private static boolean sFrostGateWarned;
+    private static int sRecipeLogged = 0;
     private static int sTextInvertLogged = 0;
     private static boolean sKeyguardBg = false;
     private static boolean sKgEngineNotify = false;
@@ -195,8 +197,10 @@ public final class GlassHook implements IXposedHookLoadPackage {
     // the duration of the call so the EdgeLightParamEx constructor (built
     // synchronously inside turnOnViewBlur) can pick the keyguard-only scale.
     private static boolean sKgCardNow = false;
-    private static final Set<Object> sKgConfigs =
-            Collections.newSetFromMap(new WeakHashMap<Object, Boolean>());
+    // WeakHashMap 本身不是线程安全的：initBulrParams 里 add、turnOnViewBlur 里
+    // contains，两张卡片可能在不同线程构建。包一层同步视图（只做 add/contains）。
+    private static final Set<Object> sKgConfigs = Collections.synchronizedSet(
+            Collections.newSetFromMap(new WeakHashMap<Object, Boolean>()));
     private static Bitmap sSynthBmp;
     private static WeakReference<Drawable> sSynthSrcRef;
     private static WeakReference<Bitmap> sStockBmpRef;
@@ -209,12 +213,15 @@ public final class GlassHook implements IXposedHookLoadPackage {
     private static int sKgBgAppliedGen = -1;
     private static int sKgBgLogged = 0;
     private static int sKgBgServed = 0;
-    private static final java.util.HashMap<String, Integer> sMissCounts =
-            new java.util.HashMap<String, Integer>();
+    // logMiss 会从位图合成、图标兜底等多条路径进来，可能是不同线程。
+    private static final java.util.concurrent.ConcurrentHashMap<String, Integer> sMissCounts =
+            new java.util.concurrent.ConcurrentHashMap<String, Integer>();
     private static int sKgIconLogged = 0;
     private static volatile Handler sKgHandler;
-    private static final java.util.ArrayList<IconTarget> sIconTargets =
-            new java.util.ArrayList<IconTarget>();
+    // trackIconTarget 在锁屏布局时写、reapplyIconTargets 遍历重放：写少读多，
+    // 用写时复制列表，遍历期间新增不会抛 ConcurrentModificationException。
+    private static final java.util.List<IconTarget> sIconTargets =
+            new java.util.concurrent.CopyOnWriteArrayList<IconTarget>();
     private static int sTileBlurLogged = 0;
 
     @Override
@@ -621,6 +628,24 @@ public final class GlassHook implements IXposedHookLoadPackage {
         boolean gal = galOn();
         sGalleryScene = gal ? DEFAULT_GSCENE : 0;
         sGalleryBar = gal;
+
+        // 配方来源：排查"玻璃发亮/发灰"先看这一行。
+        // standard = baked 标准配方；diy = 14 根滑条；off = 系统综合关闭走原生玻璃。
+        // 用 note()（不受诊断开关控制）：Cfg 未就绪那一刻诊断本身也是关的，可偏偏
+        // 那正是"用户设置没生效"的窗口，这一行必须留下来。每进程最多两行。
+        if (sRecipeLogged < 2) {
+            sRecipeLogged++;
+            String line = "recipe: " + (ext ? "diy" : (sys ? "standard" : "off"))
+                    + " mask=" + sMaskScale + " nmask=" + sNtfMask
+                    + " tblur=" + sTileBlurScale + " sat=" + sSatScale
+                    + " radius=" + sRadiusScale;
+            if (Cfg.ready()) {
+                Diag.note(line);
+            } else {
+                Diag.note(line + "  [Cfg 未就绪！本次按 baked 标准配方，"
+                        + "用户开关/DIY 滑条这一轮不生效]");
+            }
+        }
     }
 
     /**
@@ -669,9 +694,28 @@ public final class GlassHook implements IXposedHookLoadPackage {
             XposedBridge.hookAllMethods(tmm, "isFrostedBlurType", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
-                    if (glassOn()) {
-                        param.setResult(false);
+                    if (!glassOn()) return;
+                    // 与 isLiquidBlurType 保持对称：只有透明模式真的开着才把
+                    // FROSTED 判成 false。早先这里是无条件 false —— 用户关掉系统
+                    // 的透明模式后，液态和磨砂会同时返回 false，宿主拿到"两个都不是"
+                    // 的状态会退化成不模糊。字段读不到时保持原值（catch 兜底）。
+                    try {
+                        if (!XposedHelpers.getBooleanField(
+                                param.thisObject, "mIsTransparentModeOn")) {
+                            return;
+                        }
+                    } catch (Throwable t) {
+                        // 字段读不到就保持原值（不压磨砂）。这条路以前是硬编码
+                        // false、不依赖任何字段；现在多了个依赖，一旦宿主改字段名
+                        // 就会静默退化 —— 所以留一条一次性日志，别让它悄悄失效。
+                        if (!sFrostGateWarned) {
+                            sFrostGateWarned = true;
+                            log("frost-type gate: mIsTransparentModeOn 读不到 ("
+                                    + t.getClass().getSimpleName() + ")，磨砂判定未接管");
+                        }
+                        return;
                     }
+                    param.setResult(false);
                 }
             });
 
@@ -1124,7 +1168,10 @@ public final class GlassHook implements IXposedHookLoadPackage {
 
     private static int scaleAlpha(int color, float scale) {
         int a = (color >>> 24) & 0xFF;
-        int na = Math.round(a * scale);
+        // 必须钳到 0..255。DIY 的 rim / kedge 上限是 2.0（100%），255×2=510 直接
+        // <<24 会截断成 0x65 —— 边框从"完全不透明"翻转成"40% 透明"，效果完全反了。
+        // 同一个文件里 scaleBlurParam / veilA 都做了钳制，这里早先漏了。
+        int na = Math.max(0, Math.min(255, Math.round(a * scale)));
         return (na << 24) | (color & 0x00FFFFFF);
     }
 
@@ -1444,10 +1491,16 @@ public final class GlassHook implements IXposedHookLoadPackage {
                         log("rim: setColor arg=0x" + Integer.toHexString(c)
                                 + " alpha=" + alpha + " scale=" + sRimScale);
                     }
-                    if (sRimScale >= 0.999f || alpha == 0) {
+                    // 注意这里是 abs 而不是 >=：sRimScale 的 DIY 上限是 2.0，
+                    // 用 >=0.999 会把「放大」整段跳过（滑条拖过 50% 就没反应）。
+                    // 同一个方法上面 5 行的 sEdgeScale 用的就是 abs，这里早先是笔误。
+                    if (Math.abs(sRimScale - 1.0f) <= 0.001f || alpha == 0) {
                         return;
                     }
-                    param.args[0] = (Math.round(alpha * sRimScale) << 24) | (c & 0xFFFFFF);
+                    // 配合上面的 abs：现在 scale 可以 >1，alpha*scale 会超过 255，
+                    // 不钳制会让 <<24 溢出到颜色位（边框反而变透明）。
+                    int na = Math.max(0, Math.min(255, Math.round(alpha * sRimScale)));
+                    param.args[0] = (na << 24) | (c & 0xFFFFFF);
                 }
             });
 
