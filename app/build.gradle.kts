@@ -14,13 +14,17 @@ android {
         applicationId = "io.github.voreulch.honoradvanced"
         minSdk = 33
         targetSdk = 35
-        versionCode = 69
-        versionName = "2.2.9"
+        versionCode = 80
+        versionName = "2.3.10"
         // keep native filter consistent with the hand-built APK (no ABI split)
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        // hook 侧用它打日志里的模块版本（编译期常量内联，不会随发版漂移）
+        buildConfig = true
+    }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
