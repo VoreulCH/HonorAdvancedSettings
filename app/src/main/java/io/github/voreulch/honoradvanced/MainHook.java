@@ -18,15 +18,26 @@ public final class MainHook implements IXposedHookLoadPackage {
         ClassLoader cl = lpparam.classLoader;
 
         if ("android".equals(pkg)) {
-            XposedBridge.log("[HAS] v2.1.2 in system_server");
+            XposedBridge.log("[HAS] v2.2.9 in system_server");
             Cfg.startPreload(true); // observer: downgrade switch without reboot
             InstallerHook.initSystemServer(cl);
+            MiscHook.initSystemServer(cl); // thermal normalization (high-temp bypass)
             return;
         }
         if ("com.android.packageinstaller".equals(pkg)) {
-            XposedBridge.log("[HAS] v2.1.2 in packageinstaller");
+            XposedBridge.log("[HAS] v2.2.9 in packageinstaller");
             Cfg.startPreload(true); // observer: "next install" picks up changes
             InstallerHook.init(cl, lpparam.appInfo.sourceDir);
+            return;
+        }
+        if ("com.hihonor.powergenie".equals(pkg) || "com.hihonor.iaware".equals(pkg)) {
+            // PowerGenie's own thermal engine (reads the HAL directly, so the
+            // system_server status normalisation can never reach it). Its
+            // services actually run inside the com.hihonor.iaware process
+            // (dumpsys: powergenie ServiceRecord processName=com.hihonor.iaware),
+            // hence both packages are scoped and routed here.
+            XposedBridge.log("[HAS] v2.2.9 in " + pkg + " (powergenie thermal)");
+            MiscHook.initPowerGenie(cl);
             return;
         }
         if ("io.github.voreulch.honoradvanced".equals(pkg)) {
