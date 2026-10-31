@@ -10,8 +10,6 @@ import android.os.HandlerThread;
 import java.util.HashMap;
 import java.util.Map;
 
-import de.robv.android.xposed.XposedBridge;
-
 /**
  * Switch store read by hooks. SettingsActivity writes shared_prefs/config.xml
  * (no root). On this device Vector lacks LSPosed's prefs serving and SELinux
@@ -50,9 +48,25 @@ public final class Cfg {
     public static final String K_DOWNGRADE = "downgrade"; // allow downgrade installs
     public static final String K_NODUCK = "noduck";       // misc: block notification audio ducking
     public static final String K_HOTTEMP = "hottemp";     // misc: suppress the system high-temperature popups
+    public static final String K_DIAG = "diag";           // about: verbose diagnostics into the LSPosed log
     public static final String[] KEYS = {
             K_GLASS, K_SYSTEM, K_KEYGUARD, K_GALLERY, K_GLASS_EXTREME,
-            K_PURIFY, K_INFOCARD, K_DOWNGRADE, K_NODUCK, K_HOTTEMP,
+            K_PURIFY, K_INFOCARD, K_DOWNGRADE, K_NODUCK, K_HOTTEMP, K_DIAG,
+    };
+
+    /**
+     * 作用域清单（与 res/values/arrays.xml 的 xposed_scope 一致）。
+     * 两处用途：CfgProvider 校验 probe 上报来源；UI 判断某个开关依赖的进程有没有跑起来。
+     */
+    public static final String[] SCOPES = {
+            "com.android.systemui",
+            "com.hihonor.android.launcher",
+            "com.hihonor.desktop.systemui",
+            "com.hihonor.photos",
+            "com.android.packageinstaller",
+            "com.hihonor.powergenie",
+            "com.hihonor.iaware",
+            "android",
     };
 
     // ===== DIY slider keys (percent 0-100, hooks read them when
@@ -167,6 +181,27 @@ public final class Cfg {
     }
 
     /**
+     * 诊断用：把当前快照拼成一行。未就绪时明确说"未就绪"，绝不假装有值 ——
+     * 反馈日志里最常见的问题就是分不清"开关是关的"还是"根本没读到"。
+     */
+    public static String dump() {
+        Map<String, int[]> m = sSnapshot;
+        if (m == null) {
+            return "(快照未就绪，hook 侧按默认值运行)";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String k : KEYS) {
+            int[] v = m.get(k);
+            sb.append(k).append('=').append(v == null ? "?" : v[0]).append(' ');
+        }
+        for (String k : DIY_KEYS) {
+            int[] v = m.get(k);
+            sb.append(k).append('=').append(v == null ? "?" : v[0]).append(' ');
+        }
+        return sb.toString().trim();
+    }
+
+    /**
      * Call once per scoped process from handleLoadPackage.
      *
      * @param watchChanges true for installer scopes: after the initial load,
@@ -192,27 +227,38 @@ public final class Cfg {
                     }
                 }
                 if (sSnapshot == null) {
-                    XposedBridge.log("[HAS] Cfg preload gave up; staying "
-                            + "default-ON (no further provider queries)");
+                    // system_server 读不到模块 provider 是**预期**的（SELinux），
+                // 记成 E 级错误只会在排查时误导人 —— 降为警告并写明原因
+                Diag.warn("Cfg preload gave up; staying default-ON"
+                        + " (system_server 属预期；其他进程说明 provider 不可达)");
                     return;
                 }
                 if (!watchChanges) {
-                    XposedBridge.log("[HAS] Cfg frozen for process lifetime");
+                    Diag.log("Cfg frozen for process lifetime (diag still live)");
+                    // v2.3.0: even frozen scopes keep ONE live value — the diagnostics
+                    // switch. It has to take effect the moment the user flips it
+                    // (asking them to restart SystemUI just to turn logging on
+                    // would be absurd), and refreshing a single key cannot disturb
+                    // the baked-in glass parameters.
+                    registerObserver(false);
                     return;
                 }
-                registerObserver();
+                registerObserver(true);
             }
         }, "HAS-CfgPreload");
         t.setDaemon(true);
         t.start();
     }
 
-    private static void registerObserver() {
+    /**
+     * @param full true  = 刷新整份快照（installer/system_server 线）
+     *             false = 只刷新诊断开关（玻璃线：快照保持冻结）
+     */
+    private static void registerObserver(final boolean full) {
         try {
             Context ctx = AndroidAppHelper.currentApplication();
             if (ctx == null) {
-                XposedBridge.log("[HAS] Cfg: no context, observer skipped "
-                        + "(snapshot stays at initial load)");
+                Diag.warn("Cfg: no context, observer skipped (snapshot stays at initial load)");
                 return;
             }
             HandlerThread ht = new HandlerThread("HAS-CfgObs");
@@ -221,12 +267,75 @@ public final class Cfg {
                     CfgProvider.URI, true, new ContentObserver(new Handler(ht.getLooper())) {
                 @Override
                 public void onChange(boolean selfChange) {
-                    loadOnce(); // this thread holds no system locks
+                    // this thread holds no system locks — safe to do binder work
+                    if (full) {
+                        loadOnce();
+                    } else {
+                        refreshDiag();
+                    }
                 }
             });
-            XposedBridge.log("[HAS] Cfg watching provider changes");
+            Diag.log("Cfg watching provider changes (" + (full ? "full" : "diag only") + ")");
         } catch (Throwable t) {
-            XposedBridge.log("[HAS] Cfg observer failed: " + t);
+            Diag.err("Cfg observer failed", t);
+        }
+    }
+
+    // ==================== 诊断开关的实时通道 (v2.3.0) ====================
+
+    /** -1 = 还没从 provider 收到过实时值（此时退回快照里的那份）。 */
+    private static volatile int sDiagLive = -1;
+
+    /** 诊断开关是否打开。无 root：走 prefs→provider→observer 这条链。 */
+    public static boolean diagOn() {
+        int live = sDiagLive;
+        if (live >= 0) {
+            return live != 0;
+        }
+        Map<String, int[]> m = sSnapshot;
+        if (m != null) {
+            int[] v = m.get(K_DIAG);
+            return v != null && v[0] != 0;
+        }
+        return false;
+    }
+
+    /** 只取 diag 一个键，不碰冻结的玻璃快照。 */
+    private static void refreshDiag() {
+        Context ctx = null;
+        try {
+            ctx = AndroidAppHelper.currentApplication();
+        } catch (Throwable ignored) {
+        }
+        if (ctx == null) {
+            return;
+        }
+        Cursor c = null;
+        try {
+            c = ctx.getContentResolver().query(
+                    CfgProvider.URI, null, null, null, null);
+            if (c == null) {
+                return;
+            }
+            int ki = c.getColumnIndex("key");
+            int vi = c.getColumnIndex("val");
+            if (ki < 0 || vi < 0) {
+                return;
+            }
+            while (c.moveToNext()) {
+                if (K_DIAG.equals(c.getString(ki))) {
+                    sDiagLive = c.getInt(vi);
+                    break;
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (c != null) {
+                try {
+                    c.close();
+                } catch (Throwable ignored) {
+                }
+            }
         }
     }
 
@@ -274,7 +383,7 @@ public final class Cfg {
         }
         Map<String, int[]> old = sSnapshot;
         if (old == null || !old.equals(m)) {
-            XposedBridge.log("[HAS] Cfg via provider: " + m);
+            Diag.state("Cfg via provider", m);
         }
         sSnapshot = m;
         return true;
