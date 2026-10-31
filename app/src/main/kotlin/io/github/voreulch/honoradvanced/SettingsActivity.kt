@@ -275,10 +275,30 @@ class SettingsActivity : ComponentActivity() {
                 // here would silently flip upgraders onto the extreme sliders
                 // (v1.4.20 compat incident) or enable the system_server-side
                 // notification-ducking hook unasked. Both must stay opt-in.
-                ed.putBoolean(k, k != Cfg.K_GLASS_EXTREME && k != Cfg.K_NODUCK &&
-                        k != Cfg.K_HOTTEMP && k != Cfg.K_DIAG)
+                // 判定统一走 Cfg.isOptIn，别再在这里手写键名。
+                ed.putBoolean(k, !Cfg.isOptIn(k))
                 dirty = true
             }
+        }
+        // v2.3.12: DIY 出厂值对齐标准配方（打开 DIY 观感 = 标准配方）。
+        // 两种情况：
+        //  · 当前 DIY 关着 -> 那些滑条值一次都没生效过，全部对齐；
+        //  · 当前 DIY 开着 -> 他真在用，只把**仍等于旧默认**的键升级，拖过的不动。
+        // 注意 diyInUse 读的是"当前"开关状态，不是"历史上开过没有"——所以"调完
+        // 又关掉"的用户在这里会被当成第一种。对齐前把旧值备份到 prev_*，
+        // 万一要找回调校可以用 adb 读 shared_prefs 捞（备份键不进 provider、不进 UI）。
+        if (!p.getBoolean(Cfg.K_DIY_ALIGNED, false)) {
+            val diyInUse = p.getBoolean(Cfg.K_GLASS_EXTREME, false)
+            for (k in Cfg.DIY_KEYS) {
+                if (!p.contains(k)) continue
+                val v = p.getInt(k, -1)
+                if (!diyInUse || v == Cfg.diyLegacyPct(k)) {
+                    ed.putInt("prev_$k", v)
+                    ed.putInt(k, Cfg.diyDefPct(k))
+                }
+            }
+            ed.putBoolean(Cfg.K_DIY_ALIGNED, true)
+            dirty = true
         }
         // clean up obsolete keys: compat switches (dropped with the adaptive
         // hook set), the removed theme picker's value, and the old UI-pref
@@ -585,18 +605,20 @@ class SettingsActivity : ComponentActivity() {
                     value = pct.toFloat(),
                     onValueChange = { v ->
                         val nv = v.toInt()
-                        if (nv != pct && nv % 20 == 0) {
+                        if (nv != pct && nv % 5 == 0) {
                             view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
                         }
                         pct = nv
                     },
                     valueRange = 0f..100f,
-                    steps = 4,
+                    // 5% 一档（21 个停靠点）。早先是 steps=4（25% 一档）+ 锚点画在
+                    // 20/40/60/80 + 震动条件 %20 —— 三套网格互不相干，默认值 65/60/40
+                    // 这些根本停不下来，一拖就跳到 50 或 75，震动还永远不触发。
+                    steps = 19,
                     onValueChangeFinished = { prefs().edit().putInt(key, pct).commit() },
                     modifier = Modifier.fillMaxWidth()
                 )
-                // white anchor dots on the filled capsule, grey beyond —
-                // dot center = fraction of full track width (snap math)
+                // 四等分参考线（不参与吸附，纯视觉刻度）
                 val frac = pct / 100f
                 for (i in 1..4) {
                     val f = i / 5f
