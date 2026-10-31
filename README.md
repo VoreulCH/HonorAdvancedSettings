@@ -19,7 +19,7 @@
 
 面向荣耀 MagicOS 11 的一站式 LSPosed 模块，整合了前作 **荣耀液态玻璃恢复（HonorLiquidGlassRestore）** 与 **荣耀安装器净化（HonorInstallerPurify）** 的全部功能，并重写了模块界面：
 
-- **液态玻璃**：还原系统 OTA 更新阉割的控制中心 / 通知中心液态玻璃，覆盖系统、锁屏、相册三条线，每线独立开关；定稿配方烤入，装上即得调校后的观感；另有 DIY 模式提供 14 个 0~100 滑条实时调观感。
+- **液态玻璃**：还原系统 OTA 更新阉割的控制中心 / 通知中心液态玻璃，覆盖**系统 / 锁屏 / 通知横幅 / 桌面 / 相册**五条线，每线独立开关；配方按界面分组、共 **71 项精确参数**（100% = 原厂，0~200% 可调），从「通知卡底色」到「锁屏时钟的玻璃腐蚀强度」都能单独拖。
 - **安装器净化**：跳过安装器联网安全检测与指纹预装提示、禁止联网、隐藏推广卡片，支持降级安装；**钩子点自适应解析**（DexKit 字符串锚 + 参数签名扫描），荣耀安装器 OTA 混淆重排后大概率无需更新模块。
 - **高温限制解除**（需 ROOT）：高温时不弹「建议暂停使用」提示、不限制屏幕亮度、系统热状态按正常上报、压制 PowerGenie 温控（游戏限帧 / 后台清理）、高温自动关机不再触发；默认关闭、开启前二次确认，内核调度与降频不受影响。
 - **应用内开关**：所有功能在 miuix 风格界面以开关呈现，配置经 ContentProvider 桥跨进程同步，安装器线改开关无需重启，玻璃线一键重启作用域。
@@ -27,7 +27,8 @@
 An all-in-one LSPosed module for Honor MagicOS 11 that merges the previous
 **HonorLiquidGlassRestore** and **HonorInstallerPurify** modules: restores the
 liquid-glass effect gutted by the system update (system shade / lock screen /
-gallery, each independently switchable), cleans up the package installer
+heads-up banner / launcher / gallery, each independently switchable, with 71
+fine-grained parameters grouped per surface), cleans up the package installer
 (skip the online security check & preinstall fingerprint prompt, block
 networking, hide promo cards, allow downgrades), and — with root — lifts the
 system's high-temperature restrictions (no popup, no brightness cap, thermal
@@ -44,7 +45,9 @@ toggleable in-app, with cross-process config sync via a ContentProvider bridge.
 | 锁屏液态玻璃 / Lock screen | 锁屏通知卡片与快捷按钮获得与通知栏一致的液态玻璃：卡面亮度、纱深浅、边光、合成模糊半径逐项对齐；静态壁纸下从锐利壁纸经原厂 `ViewBlur.blurBitmap` 管线合成位图 Lock-screen cards & buttons match the shade look item by item; a blur bitmap is synthesized from sharp wallpapers through the stock pipeline |
 | 相册液态玻璃 / Gallery | 相册照片页工具栏的液态玻璃效果 Liquid glass on the gallery photo-page toolbar |
 | 分线开关 / Per-line switches | 三条线独立开关；系统级底层钩子（材质判定 / HIGH 强制渲染）归总开关管辖，避免关闭分开关连带破坏依赖底层的玻璃效果 Per-line switches; system-level hooks live under the master switch so turning a sub-switch off never breaks the shared base |
-| DIY 模式 / DIY mode | 14 个 0~100 滑条（遮罩 / 模糊 / 圆角 / 饱和度 / 边缘光 / 折射 / 边框 / 厚度 / 色散 / 锁屏参数等），实时覆盖烤入配方；默认关闭，滑条默认值=旧极致观感 14 sliders (mask / blur / radius / saturation / edge / refraction / rim / thickness / dispersion / keyguard params) overriding the baked-in look in real time; opt-in, defaults match the old extreme preset |
+| 桌面液态玻璃 / Launcher | 桌面卡片与文件夹的模糊 / 饱和度 / 亮度，独立开关 Card & folder blur / saturation / brightness, own switch |
+| 精细调节 / Fine tuning | **71 项参数，按界面分组**：系统 42（通知卡 / 大按钮 / 小按钮 / 滑块 / 光学 / 模糊 / 高光）、锁屏 25（通知卡 / 时钟腐蚀 / 按钮·图标·文字各 5 / 小组件 / 壁纸指纹）、横幅 5、桌面 3。100% = 原厂 71 parameters grouped per surface: 42 system, 25 lock screen, 5 banner, 3 launcher; 100% = stock |
+| 强制液态 / Force liquid | 某些界面系统会自己判定成磨砂，这个开关强制它们走液态折射 Forces surfaces the system renders as frosted onto the liquid path |
 
 ### 安装器净化 / Installer purify
 
@@ -129,10 +132,10 @@ gradle assembleRelease
 │       ├── AndroidManifest.xml            # xposedmodule 元数据与作用域
 │       ├── java/io/github/voreulch/honoradvanced/
 │       │   ├── MainHook.java              # 入口分发 / entry dispatch
-│       │   ├── GlassHook.java             # 液态玻璃钩子（含 DIY 滑条参数）/ liquid-glass hooks
+│       │   ├── GlassHook.java             # 液态玻璃钩子（71 项精细调节）/ liquid-glass hooks
 │       │   ├── InstallerHook.java         # 安装器净化钩子（自适应解析）/ adaptive installer hooks
 │       │   ├── DexKitHelper.java          # DexKit 运行时 dex 搜索封装
-│       │   ├── Cfg.java                   # 配置快照与门控（开关 + DIY 滑条值）
+│       │   ├── Cfg.java                   # 配置快照与门控（开关 + 精细调节值）
 │       │   ├── CfgProvider.java           # 跨进程配置桥 / cross-process config bridge
 │       │   └── ...SettingsActivity.kt 等   # 见 kotlin/ 目录（miuix UI）
 │       ├── kotlin/io/github/voreulch/honoradvanced/
@@ -151,6 +154,7 @@ gradle assembleRelease
 
 - **2.1.2（58）**：适配荣耀安装器 **14.0.39.301** 新构建；修复部分渠道（如 MT 管理器）安装时匿名来源弹窗消失后「安装」按钮点不动的问题；修复安装全新应用被误标「降级安装」；移除历史调试代码、压缩冗余。
 - **2.0.2（48）**：新增「杂项」页与**屏蔽通知回避**（通知音响起时不再压低正在播放的音乐，闹钟不受影响）；安装器净化适配 **14.0.32.303 / 14.0.22.327**（累计覆盖 38.301 · 32.303 · 22.326 · 22.327 四版，自适应零开关）；隐藏安装页「未发现风险」残留卡片（与渲染同帧，无闪现）；液态玻璃通知卡片 / 工具栏按钮参数回迁 1.4.22 认可配方。
+- **3.0.1（119）**：**液态玻璃大更新** —— 从「一套配方」改成 **71 项按界面分组的精细调节**（系统 42 / 锁屏 25 / 横幅 5 / 桌面 3 + 强制液态开关）；打通锁屏四条以前调不了的链路（时钟腐蚀表 / 按钮·图标·文字的通用参数包 / 小组件 / 壁纸与指纹）；新增桌面液态玻璃（独立开关）；三级菜单重构；**DIY 模式整体移除**（被精细调节完全覆盖）；修 4 个真 bug（桌面光学被绝对值覆盖、参数重复应用叠乘、强制液态开关状态造假、高温旁路缓存初值方向写反）。
 - **2.0.0（46）**：大版本重构 —— DIY 模式（14 个 0~100 滑条实时调观感）、界面 miuix 化、安装器净化自适应钩子集（兼容模式开关取消）、安装提速。
 - 2.0.3 ~ 2.0.9 为内部迭代版本，未单独发布，改动已全部并入 2.1.2。
 
