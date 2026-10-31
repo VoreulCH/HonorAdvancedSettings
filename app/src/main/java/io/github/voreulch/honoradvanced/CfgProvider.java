@@ -20,6 +20,24 @@ public final class CfgProvider extends ContentProvider {
     public static final Uri URI =
             Uri.parse("content://" + AUTHORITY + "/switches");
 
+    /**
+     * 作用域自证通道（v2.3.0）。
+     *
+     * <p>每个被 hook 的进程启动时 insert 一行 "{pkg, ver}"，写入发生在**模块 app
+     * 进程**（provider 天然跑在自己的进程里），hook 侧只出一次 binder 调用。
+     * 于是模块界面不用 root、不用读 LSPosed 数据库，就能知道"这个作用域是不是
+     * 真的跑起来了"——而且它验证的是**实际生效**，不是"勾选过"：
+     * 勾了但进程没重启时，这里会诚实地显示未生效。
+     */
+    public static final Uri URI_PROBE =
+            Uri.parse("content://" + AUTHORITY + "/probe");
+
+    /** 上报存这里（与开关分开，避免污染开关快照）。 */
+    public static final String PREFS_PROBE = "probe";
+
+    public static final String COL_PKG = "pkg";
+    public static final String COL_VER = "ver";
+
     @Override
     public boolean onCreate() {
         return true;
@@ -28,6 +46,9 @@ public final class CfgProvider extends ContentProvider {
     @Override
     public Cursor query(Uri uri, String[] projection, String selection,
                         String[] selectionArgs, String sortOrder) {
+        if (URI_PROBE.equals(uri)) {
+            return probeCursor();
+        }
         MatrixCursor cursor = new MatrixCursor(
                 new String[]{"key", "val"}, Cfg.KEYS.length + Cfg.DIY_KEYS.length);
         Context context = getContext();
@@ -42,6 +63,48 @@ public final class CfgProvider extends ContentProvider {
             }
         }
         return cursor;
+    }
+
+    /** 已上报的作用域（pkg / 模块版本 / 上报时间）。 */
+    private Cursor probeCursor() {
+        MatrixCursor c = new MatrixCursor(
+                new String[]{COL_PKG, COL_VER, "at"}, Cfg.SCOPES.length);
+        Context ctx = getContext();
+        if (ctx == null) {
+            return c;
+        }
+        SharedPreferences p = ctx.getSharedPreferences(PREFS_PROBE, Context.MODE_PRIVATE);
+        for (String pkg : Cfg.SCOPES) {
+            String raw = p.getString(pkg, null);
+            if (raw == null) {
+                continue;
+            }
+            int ver = 0;
+            long at = 0L;
+            int bar = raw.indexOf('|');
+            if (bar > 0) {
+                try {
+                    ver = Integer.parseInt(raw.substring(0, bar));
+                } catch (Throwable ignored) {
+                }
+                try {
+                    at = Long.parseLong(raw.substring(bar + 1));
+                } catch (Throwable ignored) {
+                }
+            }
+            c.addRow(new Object[]{pkg, ver, at});
+        }
+        return c;
+    }
+
+    /** 只有声明过的宿主包名能上报，别的 app 塞不进来。 */
+    private static boolean isKnownScope(String pkg) {
+        for (String s : Cfg.SCOPES) {
+            if (s.equals(pkg)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -77,6 +140,9 @@ public final class CfgProvider extends ContentProvider {
         if (Cfg.K_HOTTEMP.equals(key)) {
             return false; // opt-in: root-level thermal bypass — always explicit
         }
+        if (Cfg.K_DIAG.equals(key)) {
+            return false; // opt-in: verbose logging must never switch itself on
+        }
         return true; // K_SYSTEM / K_PURIFY had no legacy counterpart
     }
 
@@ -87,7 +153,23 @@ public final class CfgProvider extends ContentProvider {
 
     @Override
     public Uri insert(Uri uri, ContentValues values) {
-        return null;
+        if (!URI_PROBE.equals(uri) || values == null) {
+            return null;
+        }
+        String pkg = values.getAsString(COL_PKG);
+        if (pkg == null || !isKnownScope(pkg)) {
+            return null;
+        }
+        Integer ver = values.getAsInteger(COL_VER);
+        Context ctx = getContext();
+        if (ctx == null) {
+            return null;
+        }
+        boolean ok = ctx.getSharedPreferences(PREFS_PROBE, Context.MODE_PRIVATE)
+                .edit()
+                .putString(pkg, (ver == null ? 0 : ver) + "|" + System.currentTimeMillis())
+                .commit();
+        return ok ? uri : null;
     }
 
     @Override
