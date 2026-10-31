@@ -66,6 +66,16 @@ toggleable in-app, with cross-process config sync via a ContentProvider bridge.
 | 屏蔽通知回避 / No audio ducking | 通知铃声响起时不再压低正在播放的音乐，两者同时发声；闹钟不受影响（默认关闭） Notification sounds stop ducking your music; alarms unaffected (opt-in) |
 | 屏蔽高温限制（ROOT）/ Thermal bypass | 高温时不弹「建议暂停使用」、不限屏幕亮度、系统热状态按正常上报、压制 PowerGenie 温控（游戏限帧 / 后台清理）、高温自动关机不再触发；开关格内实时显示系统层状态与属性值。**需 ROOT**（未授权时仅弹窗屏蔽生效），默认关闭、开启前二次确认；**内核调度与降频不受本开关影响** Disables the system's high-temperature restrictions with one switch (popup, brightness cap, thermal status reporting, PowerGenie policies, emergency shutdown); requires root, opt-in with a confirmation dialog; kernel-level throttling is untouched |
 
+### 作用域自检与诊断 / Scope self-check & diagnostics
+
+| 功能 Feature | 说明 Description |
+| --- | --- |
+| 作用域自检 / Scope self-check | 每个被 hook 的进程启动时向模块上报一次（走模块自己的 ContentProvider，不需要 ROOT），首页顶部实时显示模块是否生效、已加载哪些作用域；各开关下方**只在未生效时**点名具体作用域（如「作用域状态：系统界面作用域未生效（勾选并重启作用域生效）」），生效后自动隐藏。LSPosed 与 Vector 通用，也适用于任何分叉版本 |
+| 重启作用域 / Restart scopes | 可勾选多个一次重启：系统界面 / 相册 / 安装器 / 桌面 / 桌面模式 / 温控服务（需 ROOT） |
+| 诊断日志 / Verbose diagnostics | 关于页开关，开启后向 LSPosed 模块日志输出环境快照（模块/框架/宿主版本、进程身份、设备）、开关快照、每个钩子的挂载结果、运行事件与异常堆栈；重复日志压缩为 `*N`。开启即时生效，日常建议关闭 |
+| 检查更新 / Update check | 点击查询 GitHub 最新 release（超时或断网会说明具体原因），发现新版本直接打开 APK 下载页 |
+
+
 ## 环境要求 / Requirements
 
 * 已 root 的荣耀 MagicOS 11（Android 17）设备：Magisk / KernelSU / ReSukkiSU + LSPosed（或 Vector 等第三方管理器）；模块要求 Android 13+（minSdk 33）。
@@ -145,6 +155,7 @@ gradle assembleRelease
 - 2.0.3 ~ 2.0.9 为内部迭代版本，未单独发布，改动已全部并入 2.1.2。
 
 ## 版本历史 / Changelog
+* **2.3.10**（2026-11-01）：新增**作用域自检**——每个被 hook 的进程启动时向模块自证一次（无需 ROOT，LSPosed / Vector 通用），首页顶部显示「模块已生效 / 未生效」与已加载的作用域；各开关下方只在作用域未生效时点名具体作用域，生效后自动隐藏；打开开关时若依赖的作用域没生效会立刻提醒。「重启作用域」改为**可多选批量重启**（系统界面 / 相册 / 安装器 / 桌面 / 桌面模式 / 温控服务）。关于页新增**诊断日志**（环境快照、钩子挂载点、开关状态、异常堆栈，重复日志压缩为 `*N`，开启即时生效）、**检查更新**（GitHub 最新版本，超时/失败给出具体原因，有新版直接打开下载）与**特别鸣谢**名单。
 
 > 版本号规则（2026-11-01 起）：**新功能进位到 2.x**（如 2.1 → 2.2），**修复用 2.x.xx**（第三段为该项功能的迭代次数）。
 
