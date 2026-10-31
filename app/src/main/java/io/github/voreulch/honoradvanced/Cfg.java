@@ -42,7 +42,8 @@ public final class Cfg {
     public static final String K_SYSTEM = "system";       // status-bar notifications + control-center look tuning
     public static final String K_KEYGUARD = "keyguard";   // lockscreen buttons + cards (merged)
     public static final String K_GALLERY = "gallery";     // gallery photo page
-    public static final String K_GLASS_EXTREME = "glass_extreme"; // DIY mode master: 14 percent sliders replace the baked-in look
+    public static final String K_BANNER = "banner";       // heads-up banner (来通知时弹出的那条)
+    public static final String K_DESK = "desk";           // launcher 卡片玻璃（v2.6.20）
     public static final String K_PURIFY = "purify";       // installer purify master
     public static final String K_INFOCARD = "infocard";   // package info card
     public static final String K_DOWNGRADE = "downgrade"; // allow downgrade installs
@@ -50,7 +51,7 @@ public final class Cfg {
     public static final String K_HOTTEMP = "hottemp";     // misc: suppress the system high-temperature popups
     public static final String K_DIAG = "diag";           // about: verbose diagnostics into the LSPosed log
     public static final String[] KEYS = {
-            K_GLASS, K_SYSTEM, K_KEYGUARD, K_GALLERY, K_GLASS_EXTREME,
+            K_GLASS, K_SYSTEM, K_KEYGUARD, K_GALLERY, K_BANNER, K_DESK,
             K_PURIFY, K_INFOCARD, K_DOWNGRADE, K_NODUCK, K_HOTTEMP, K_DIAG,
     };
 
@@ -69,26 +70,270 @@ public final class Cfg {
             "android",
     };
 
-    // ===== DIY slider keys (percent 0-100, hooks read them when
-    // K_GLASS_EXTREME / DIY mode is on) =====
-    public static final String D_MASK = "diy_mask";       // 通知栏+工具栏遮罩
-    public static final String D_TBLUR = "diy_tblur";     // 通知栏+工具栏模糊
-    public static final String D_BMASK = "diy_bmask";     // 通知横幅遮罩
-    public static final String D_BBLUR = "diy_bblur";     // 通知横幅模糊
-    public static final String D_KBLUR = "diy_kblur";     // 锁屏通知模糊
-    public static final String D_WMASK = "diy_wmask";     // 锁屏组件+按钮遮罩
-    public static final String D_RADIUS = "diy_radius";   // 圆角
-    public static final String D_SAT = "diy_sat";         // 饱和度
-    public static final String D_EDGE = "diy_edge";       // 边缘光
-    public static final String D_REFRACT = "diy_refract"; // 折射
-    public static final String D_RIM = "diy_rim";         // 边框
-    public static final String D_THICK = "diy_thick";     // 厚度
-    public static final String D_DISP = "diy_disp";       // 色散
-    public static final String D_KBBRIGHT = "diy_kbbright"; // 锁屏通知亮度
-    public static final String[] DIY_KEYS = {
-            D_MASK, D_TBLUR, D_BMASK, D_BBLUR, D_KBLUR, D_WMASK,
-            D_RADIUS, D_SAT, D_EDGE, D_REFRACT, D_RIM, D_THICK, D_DISP,
-            D_KBBRIGHT,
+    // ===== 分控件强度（v2.5.0）=====
+    //
+    // 原生的 initBulrParams 给四类控件**分别**赋了亮度/饱和度/遮罩资源：
+    //   通知卡    brightness 0.08  saturation 1.2
+    //   控制中心瓦片 brightness 0.12  saturation 1.1
+    //   滑块      brightness 0.12  saturation 1.1
+    //   圆形按钮   brightness 0.08  saturation 1.1
+    // 而旧版只有一个 mask 乘数一把刷到所有控件上 —— 想单独压暗通知卡，滑块和
+    // 按钮会跟着一起变，这就是"一刀切"。
+    //
+    // 这里给每类控件一个 0-200 的强度百分比（100 = 保持原生配方），同时作用于
+    // 该类的遮罩 alpha、亮度、饱和度三项。默认全 100 时行为与旧版完全一致。
+    // v2.5.7: 分区域粗调（tune_*）已并入精细调节 —— 既然每个字段都能单独拖，
+    // 再留一层"整类缩放"只会让同一件事有两个旋钮，反而困惑。
+    public static final String[] TUNE_KEYS = {};
+
+    /**
+     * 分区域强度的**出厂默认值**（百分比，100 = 原厂）。
+     *
+     * <p>这是给"烧录"留的口子：用户把所有滑条调到满意之后，把想固化的值逐项写进
+     * 这里重新打包，装上去就是那套观感；用户仍然可以在设置页继续微调（滑条值存
+     * prefs，优先于这里的默认）。全部返回 100 表示跟随荣耀原厂。
+     */
+    public static int tuneDefPct(String key) {
+        return 100;   // 粗调层已移除，保留签名只为兼容旧调用点
+    }
+
+    /**
+     * 精细调节的**出厂默认值**（百分比，100 = 原厂）。
+     *
+     * <p>同 {@link #tuneDefPct(String)}，烧录时在这里逐项写死。
+     * 注意 {@link #F_HL_ANGLE} 是角度而不是百分比，它的出厂值单独写在下面。
+     */
+    public static int fnDefPct(String key) {
+        if (F_HL_ANGLE.equals(key)) {
+            return 250;   // 边缘光方向，原厂 250°
+        }
+        // 开关型：0 = 跟随原厂（原厂四类高光全开、窗口模糊关闭）
+        // ⚠ v3.0.0 修：F_FORCE_LIQUID 之前漏在这里，导致 fnDefPct 返回 100，
+        // TuneSwitch 的 `getInt(key, fnDefPct(key)) != 0` 判定成"默认开启"，
+        // 界面上显示"已开启"；可 hook 侧用的是 `getInt(key, 0) != 0`，
+        // 默认其实是关的 —— 两边对不上，用户看到的状态是假的。
+        if (F_HL_ON.equals(key) || F_HL_CC.equals(key) || F_HL_BTN.equals(key)
+                || F_HL_SL.equals(key) || F_FORCE_LIQUID.equals(key)) {
+            return 0;
+        }
+        return 100;
+    }
+
+    // ===== 精细调节（v2.5.2）=====
+    //
+    // 逐项对应 BlurParametersConfig 里的渲染字段。tune_* 是"整类粗调"，fn_* 是
+    // "单项细调"，两者相乘 —— 粗调把握整体观感，细调单独抠某一项。
+    // 百分比项默认 100（原厂值），0-200 可调；开关项默认 0（跟随原厂）。
+    public static final String F_NTF_MASK = "fn_ntf_mask";
+    public static final String F_NTF_OVL = "fn_ntf_ovl";
+    public static final String F_NTF_BRIGHT = "fn_ntf_bright";
+    public static final String F_NTF_SAT = "fn_ntf_sat";
+    public static final String F_NTF_CORNER = "fn_ntf_corner";
+    public static final String F_NTFB_MASK = "fn_ntfb_mask";
+    public static final String F_NTFB_OVL = "fn_ntfb_ovl";
+    public static final String F_NTFB_BRIGHT = "fn_ntfb_bright";
+    public static final String F_CC_MASK = "fn_cc_mask";
+    public static final String F_CC_OVL = "fn_cc_ovl";
+    public static final String F_CC_BRIGHT = "fn_cc_bright";
+    public static final String F_CC_SAT = "fn_cc_sat";
+    public static final String F_CC_CORNER = "fn_cc_corner";
+    public static final String F_BTN_MASK = "fn_btn_mask";
+    public static final String F_BTN_OVL = "fn_btn_ovl";
+    public static final String F_BTN_BRIGHT = "fn_btn_bright";
+    public static final String F_BTN_SAT = "fn_btn_sat";
+    public static final String F_BTN_CORNER = "fn_btn_corner";
+    public static final String F_SL_MASK = "fn_sl_mask";
+    public static final String F_SL_OVL = "fn_sl_ovl";
+    public static final String F_SL_BRIGHT = "fn_sl_bright";
+    public static final String F_SL_SAT = "fn_sl_sat";
+    public static final String F_SL_CORNER = "fn_sl_corner";
+    public static final String F_OPT_REFRACT = "fn_opt_refract";
+    public static final String F_OPT_DEPTH = "fn_opt_depth";
+    public static final String F_OPT_THICK = "fn_opt_thick";
+    public static final String F_OPT_DISP = "fn_opt_disp";
+    public static final String F_BLUR_CARD = "fn_blur_card";
+    public static final String F_BLUR_DYNAMIC = "fn_blur_dynamic";
+    public static final String F_BLUR_SCALE = "fn_blur_scale";
+    public static final String F_HL_THICK = "fn_hl_thick";
+    public static final String F_HL_ALPHA = "fn_hl_alpha";
+    public static final String F_HL_ANGLE = "fn_hl_angle";
+    public static final String F_HL_ON = "fn_hl_on";
+    public static final String F_HL_CC = "fn_hl_cc";
+    public static final String F_HL_BTN = "fn_hl_btn";
+    public static final String F_HL_SL = "fn_hl_sl";
+    // 注：原本还有一个 F_WINBLUR（强制 isWindowBlur=true），v2.6.3 删除。
+    // 原因：isWindowBlur 是 initBulrParams 内部的**分支标记**而不是可调参数 ——
+    // 原生给 case=1/2/4 赋 false、case=3/5 赋 true，强行改成 true 会让普通
+    // 通知卡也走整窗模糊（效果错乱 + 功耗上升）；而且 UI 上从来没暴露过这个
+    // 键，用户摸不到，属于只会在旧 prefs 残留时偷偷改变行为的死代码。
+
+    // 锁屏通知卡片（case=2 且 z=true）：和普通通知卡同名但值不同，必须分开调
+    public static final String F_KL_MASK = "fn_kl_mask";
+    public static final String F_KL_OVL = "fn_kl_ovl";
+    public static final String F_KL_BRIGHT = "fn_kl_bright";
+    public static final String F_KL_SAT = "fn_kl_sat";
+    public static final String F_KL_CORNER = "fn_kl_corner";
+    // ===== 锁屏元素透明度：**做不了，已放弃**（v2.6.10 实测）=====
+    //
+    // 本来按 BlurUtils 的 ElementType 拆了 8 个键（时钟/文字/图标/背板/状态栏/
+    // 总控/亮度/厚度），代码全写完了、钩子也挂上了（日志 `kg=on`），但**改了没有任何
+    // 效果**。两次开关对比截图完全一致。原因查清了，记在这里免得下一个人再试：
+    //
+    //   ① BlurUtils.getColorAlphaWithBlurState() —— 全仓 grep 只有定义、**零调用点**。
+    //      调用方是锁屏主题/时钟插件（另一个 apk），不在 SystemUI 进程里，
+    //      我们 hook 的这个类根本没人用。
+    //   ② BlurUtils.registerView() —— 同样零调用点，所以 View→ElementType 映射
+    //      永远是空的，View.setAlpha 那条路也走不通。
+    //   ③ ViewBlur.blurBackground() 里的 BlurParamEx / GlassParamEx —— 钩子挂上了
+    //      但没命中，锁屏壁纸的模糊配方只在首次生成时构造一次、之后走缓存。
+    //
+    // 真正的旋钮是系统设置 `Settings.System.transparency_value`（0-100）：
+    //   >80 → 元素 alpha 0.4；40~80 → 0.5；<=40 → 0.6；透明模式关 → 0.72
+    // 只三档、且是全局的，改完要重启 SystemUI 才生效。要调就走
+    // 系统设置 → 桌面和壁纸 → 通透度，模块不接管。
+
+    // 通知横幅（case=3，来通知时从顶部弹出的那条）
+    public static final String F_BN_MASK = "fn_bn_mask";
+    public static final String F_BN_OVL = "fn_bn_ovl";
+    public static final String F_BN_BRIGHT = "fn_bn_bright";
+    public static final String F_BN_SAT = "fn_bn_sat";
+    public static final String F_BN_BLUR = "fn_bn_blur";
+
+    // ===== 锁屏时钟的液态玻璃（v2.6.12）=====
+    //
+    // 溯源结论（之前一直以为锁屏时钟调不了，其实是找错了入口）：
+    //   锁屏大时钟的玻璃效果不在 BlurParametersConfig 里，走的是
+    //   `com.hihonor.keyguardengine.clockplugin.blur.ClockErodeTable.getErode(...)`
+    //   —— 按「时钟样式 + 字号 + 单条/双条 + 字体」四元组查表，返回一个腐蚀值
+    //   （0.45 ~ 2.49 之间），然后 `kge029.c` 直接把它塞进
+    //   `blurParamEx.setSigma(...)` 当腐蚀半径用。
+    //
+    //   也就是说：**时钟玻璃有多"厚"、边缘腐蚀多明显，全由这一个 float 决定**，
+    //   而它原本只跟字体和字号挂钩，用户完全没法调。
+    public static final String F_KG_ERODE = "fn_kg_erode";
+
+    // ===== 锁屏按钮 / 图标 / 文字（v2.6.14）=====
+    //
+    // 溯源结论：锁屏上这些元素的玻璃参数全部走同一条链 ——
+    //   IBlurStrategy.applyBlur(IViewDataProvider, State, kge028.b)
+    // 第三个参数 kge028.b 是**通用渲染参数包**：
+    //   f501a=blurRadius  b=saturation  f502c=brightness
+    //   h=glassType  k=depth  l=dispersion  m=thickness  n/o/p=边缘光角度·厚度·颜色
+    // 而 provider.getViewType() 是一对 (字符串, ElementType)，实测值：
+    //   bottom_tool / flashlight_tool / flashlight_tool_backplane / button_frame_backplane  -> 按钮组
+    //   lock_icon_view / festival_frame_layout                                              -> 图标组
+    //   indication_view / charging_status_view / magazine_simple_title_view                 -> 文字组
+    //   clock_view（时钟，另有一套腐蚀表，见 F_KG_ERODE）
+    //
+    // 注意：这里调的是"玻璃本身的浓度/亮度/饱和"，**不是图标颜色**。
+    // 图标颜色走 ViewRenderService.updateAppearance() 的取色体系，
+    // 那个实现类不在反编译范围内，拿不到。
+    public static final String F_KG_BTN = "fn_kg_btn";      // 按钮（图标 + 底板）
+    public static final String F_KG_ICON = "fn_kg_icon2";   // 锁形图标 / 节日图标
+    public static final String F_KG_TXT = "fn_kg_txt";      // 提示文字 / 充电状态 / 杂志标题
+
+    // 锁屏小组件（天气卡 / 闹钟 / 步数那种）。它**不走** applyBlur 那条链 ——
+    // 走的是 AppWidgetHelper.updateAppWidgetColorAndBlur()
+    //   -> KgAppWidgetHostView.setChildBlur(View, boolean)
+    //      -> HnVisualEffectable.setTransparentStatus(open, degree, liquidMode)
+    // 我们拦 setChildBlur 的出口，直接给那个 View 设最终 alpha。
+    // 代价：整块小组件（含里面的文字）一起变透，没法只调玻璃底。
+    public static final String F_KG_WIDGET = "fn_kg_widget";
+
+    // ===== 锁屏壁纸玻璃 / 指纹（v2.6.16）=====
+    //
+    // 溯源结论：锁屏壁纸那层模糊由 KeyguardBlurUtils.getHnBlurParametersEx() 构造，
+    // 原厂是纯算术写死的：
+    //   radiusX = radiusY = (通透度 × -23) / 100 + 32     ← 通透度 100 时只有 9，0 时 32
+    //   saturation = 1.3f                                  ← **固定值，跟通透度无关**
+    //   scaleX = scaleY = 0.1f                             ← 降采样
+    //   brightnessParams(0.05, 0.05, 0.05, 0.0)
+    //   maskColor = MASK_COLOR，multiMaskColors = {MASK_COLOR, OVERLAY_COLOR}
+    // 指纹另一套：getFPHnBlurParameters() → saturation = 通透度<40 ? 1.3 : 1.2，
+    //   brightnessParams(0.2, 0.2, 0.2, 0.0)；另有 getFpColor() 三档白。
+    //
+    // 这里 hook 两个方法的返回值，改 radiusX/Y 和 saturation（都是 public float 字段）。
+    // brightnessParams 是 HnBrightnessParams 对象，暂时不动。
+    public static final String F_KG_BG_RADIUS = "fn_kg_bg_radius";  // 锁屏壁纸模糊半径
+    public static final String F_KG_BG_SAT = "fn_kg_bg_sat";        // 锁屏壁纸饱和度
+    public static final String F_KG_FP_SAT = "fn_kg_fp_sat";        // 指纹饱和度
+
+    // ===== 锁屏元素的玻璃光学（v2.6.17）=====
+    //
+    // kge028.b 参数包里除了 blurRadius/saturation/brightness，还有：
+    //   k = depth（折射深度）  l = dispersion（色散）  m = thickness（厚度）
+    //   n = 边缘光角度  o = 边缘光厚度  p = 边缘光颜色
+    // kge029.c 会把这些原样塞进 GlassParamEx / EdgeLightParamEx。
+    //
+    // **按元素分组、各自独立**（用户明确要求）：
+    //   按钮组（bottom_tool / flashlight_tool / *_backplane / button_frame_backplane）
+    //   图标组（lock_icon_view / festival_frame_layout）
+    //   文字组（indication_view / charging_status_view / magazine_simple_title_view）
+    // 每组 4 项：深度 / 色散 / 厚度 / 边缘光强度，互不影响。
+    public static final String F_KG_BTN_DEP = "fn_kg_btn_dep";
+    public static final String F_KG_BTN_DIS = "fn_kg_btn_dis";
+    public static final String F_KG_BTN_THK = "fn_kg_btn_thk";
+    public static final String F_KG_BTN_EDGE = "fn_kg_btn_edge";
+    public static final String F_KG_ICON_DEP = "fn_kg_icon_dep";
+    public static final String F_KG_ICON_DIS = "fn_kg_icon_dis";
+    public static final String F_KG_ICON_THK = "fn_kg_icon_thk";
+    public static final String F_KG_ICON_EDGE = "fn_kg_icon_edge";
+    public static final String F_KG_TXT_DEP = "fn_kg_txt_dep";
+    public static final String F_KG_TXT_DIS = "fn_kg_txt_dis";
+    public static final String F_KG_TXT_THK = "fn_kg_txt_thk";
+    public static final String F_KG_TXT_EDGE = "fn_kg_txt_edge";
+
+    // ===== 强制液态玻璃（v2.6.19）=====
+    //
+    // BlurParametersConfig.glassType：1 = 磨砂玻璃，2 = 液态玻璃。
+    // 原生给它赋值的地方：
+    //   case=1（磨砂配方）      -> 1
+    //   case=2（液态面板）      -> 2
+    //   case=3（横幅）          -> isLiquidBlurType() ? 2 : 1   ← 看系统开关
+    //   case=4 / case=5         -> 1
+    // 也就是说：只要系统当前判定不是"液态"，横幅和另外两个分支就会渲染成磨砂。
+    // 打开这个开关后，我们在 initBulrParams 结束时把 glassType 一律改成 2，
+    // 让这些界面也走液态折射。
+    //
+    // ⚠ 风险：如果某个界面本来就不支持液态（没有可折射的实时背景），
+    // 强制成 2 可能渲染成一片糊或者纯色。开关默认关，出问题关掉即可。
+    public static final String F_FORCE_LIQUID = "fn_force_liquid";
+
+    // ===== 桌面（launcher）的卡片玻璃（v2.6.19）=====
+    //
+    // 桌面卡片走的是另一套类，和 SystemUI 完全不相干：
+    //   com.hihonor.android.launcher.cardstyle.utils.LiquidGlassUtils
+    //     .setLiquidGlassParams(View, TransparentBlurParams, Object shape)
+    //       -> HnLiquidGlassParamsEx$BlurParamEx.setRadius / setScale /
+    //          setSaturation / setBrightnessParams / setMultiMaskColors
+    //       -> setGlassParamEx(null)      ← **桌面卡片没有液态折射**
+    //       -> setHighLightParamEx(null)  ← 也没有高光
+    // 也就是说桌面的"液态玻璃"其实只是「模糊 + 形状 + 遮罩」，
+    // 调不出锁屏那种折射感，能调的只有模糊半径 / 饱和度 / 亮度。
+    //
+    // ⚠ 这三个在 launcher 进程生效，改完要重启桌面（不是重启系统界面）。
+    public static final String F_DESK_RADIUS = "fn_desk_radius";
+    public static final String F_DESK_SAT = "fn_desk_sat";
+    public static final String F_DESK_BRIGHT = "fn_desk_bright";
+
+    public static final String[] FN_KEYS = {
+            F_NTF_MASK, F_NTF_OVL, F_NTF_BRIGHT, F_NTF_SAT, F_NTF_CORNER,
+            F_NTFB_MASK, F_NTFB_OVL, F_NTFB_BRIGHT,
+            F_CC_MASK, F_CC_OVL, F_CC_BRIGHT, F_CC_SAT, F_CC_CORNER,
+            F_BTN_MASK, F_BTN_OVL, F_BTN_BRIGHT, F_BTN_SAT, F_BTN_CORNER,
+            F_SL_MASK, F_SL_OVL, F_SL_BRIGHT, F_SL_SAT, F_SL_CORNER,
+            F_OPT_REFRACT, F_OPT_DEPTH, F_OPT_THICK, F_OPT_DISP,
+            F_BLUR_CARD, F_BLUR_DYNAMIC, F_BLUR_SCALE,
+            F_HL_THICK, F_HL_ALPHA, F_HL_ANGLE,
+            F_HL_ON, F_HL_CC, F_HL_BTN, F_HL_SL,
+            F_KL_MASK, F_KL_OVL, F_KL_BRIGHT, F_KL_SAT, F_KL_CORNER,
+            F_BN_MASK, F_BN_OVL, F_BN_BRIGHT, F_BN_SAT, F_BN_BLUR,
+            F_KG_ERODE, F_KG_BTN, F_KG_ICON, F_KG_TXT, F_KG_WIDGET,
+            F_KG_BG_RADIUS, F_KG_BG_SAT, F_KG_FP_SAT,
+            F_KG_BTN_DEP, F_KG_BTN_DIS, F_KG_BTN_THK, F_KG_BTN_EDGE,
+            F_KG_ICON_DEP, F_KG_ICON_DIS, F_KG_ICON_THK, F_KG_ICON_EDGE,
+            F_KG_TXT_DEP, F_KG_TXT_DIS, F_KG_TXT_THK, F_KG_TXT_EDGE,
+            F_FORCE_LIQUID, F_DESK_RADIUS, F_DESK_SAT, F_DESK_BRIGHT,
     };
 
     /**
@@ -109,7 +354,12 @@ public final class Cfg {
     // once per second (a toggle therefore lands within ~1s, still "instant").
     private static volatile java.lang.reflect.Method sPropGet;
     private static volatile long sPropAt;
-    private static volatile boolean sPropVal = true;
+    // ⚠ v3.0.0 修正：这里原来是 `= true`，与上面注释"读不到 -> OFF"**正好相反**。
+    // 后果：万一反射失败（Class.forName 抛异常、或字段被 SELinux 拦），
+    // 代码会一路保持 true —— 也就是**高温旁路在没有用户授权的情况下一直开着**，
+    // 而这恰恰是注释里说"绝不能发生"的情况（root 级安全绕过）。
+    // 改成 false 后：首次成功读取前一律按关处理，最多延迟 1 秒（TTL）。
+    private static volatile boolean sPropVal = false;
 
     public static boolean hottempOn() {
         long now = android.os.SystemClock.uptimeMillis();
@@ -132,66 +382,6 @@ public final class Cfg {
         return sPropVal;
     }
 
-    /**
-     * DIY 滑条的出厂百分比 —— **必须与 GlassHook 的 DEFAULT_* 常量等价**。
-     *
-     * <p>历史教训（v2.3.12）：旧的默认值是 v1.x「EXTREME 极端玻璃」时代的遗留，
-     * 比后来的标准配方薄得多（tblur 10% vs 60%、mask 50% vs 65%、bmask 15% vs 40%）。
-     * 于是用户一打开 DIY 开关，玻璃立刻变亮、白底上看不清字，还以为是 bug ——
-     * 其实是"切到了另一套更弱的配方"。现在的语义：**打开 DIY 观感不变**，
-     * 用户再在标准配方的基础上逐项微调。
-     *
-     * <p>改这里之前先对一遍 {@code GlassHook.DEFAULT_*}：percent × max 必须等于常量。
-     * 对应关系写在每行注释里。
-     *
-     * <p>取值必须是 5 的倍数 —— 设置页的滑条按 5% 吸附（steps=19），不是 5 的倍数
-     * 一拖就跳档。旧的 KBBRIGHT 默认 0（33.3% 才精确等于 0.1）因此取 35，误差 5%
-     * 在亮度上看不出来。
-     */
-    public static int diyDefPct(String key) {
-        if (D_MASK.equals(key)) return 65;      // 0.65 × max 1.0  = DEFAULT_MASK
-        if (D_TBLUR.equals(key)) return 60;     // 0.60 × max 1.0  = DEFAULT_TBLUR
-        if (D_BMASK.equals(key)) return 40;     // 0.40 × max 1.0  = DEFAULT_NTF_MASK
-        if (D_BBLUR.equals(key)) return 50;     // 0.50 × max 1.0  = DEFAULT_BANNER_BLUR
-        if (D_KBLUR.equals(key)) return 100;    // 2.00 × max 2.0  = DEFAULT_KBBLUR
-        if (D_WMASK.equals(key)) return 20;     // 0.20 × max 1.0  = DEFAULT_KVEIL
-        if (D_RADIUS.equals(key)) return 50;    // 0.50 × max 1.0  = DEFAULT_RADIUS
-        if (D_SAT.equals(key)) return 60;       // 1.20 × max 2.0  = DEFAULT_SAT
-        if (D_EDGE.equals(key)) return 70;      // 1.40 × max 2.0  = DEFAULT_EDGE
-        if (D_REFRACT.equals(key)) return 50;   // 1.00 × max 2.0  = DEFAULT_REFRACT
-        if (D_RIM.equals(key)) return 50;       // 1.00 × max 2.0  = DEFAULT_RIM
-        if (D_THICK.equals(key)) return 70;     // 1.40 × max 2.0  = DEFAULT_THICK
-        if (D_DISP.equals(key)) return 50;      // 0.25 × max 0.5  = DEFAULT_DISP
-        if (D_KBBRIGHT.equals(key)) return 35;  // 0.105 × max 0.3 ≈ DEFAULT_KBBRIGHT(0.1)
-        return 50;
-    }
-
-    /**
-     * 旧的出厂百分比（v2.3.11 及以前）。只用于一次性迁移：老用户 prefs 里
-     * **仍等于旧默认**的键说明他没动过，可以安全升级到新默认；不等于旧默认的
-     * 说明是他自己拖过的，一律保留。
-     */
-    public static int diyLegacyPct(String key) {
-        if (D_MASK.equals(key)) return 50;
-        if (D_TBLUR.equals(key)) return 10;
-        if (D_BMASK.equals(key)) return 15;
-        if (D_BBLUR.equals(key)) return 10;
-        if (D_KBLUR.equals(key)) return 50;
-        if (D_WMASK.equals(key)) return 8;
-        if (D_RADIUS.equals(key)) return 50;
-        if (D_SAT.equals(key)) return 60;
-        if (D_EDGE.equals(key)) return 70;
-        if (D_REFRACT.equals(key)) return 50;
-        if (D_RIM.equals(key)) return 50;
-        if (D_THICK.equals(key)) return 70;
-        if (D_DISP.equals(key)) return 50;
-        if (D_KBBRIGHT.equals(key)) return 0;
-        return 50;
-    }
-
-    /** 迁移过「DIY 默认 = 标准配方」这一版的标记键。 */
-    public static final String K_DIY_ALIGNED = "diy_aligned";
-
     /** null = preload not landed yet (default ON); set once, then frozen
      *  for glass scopes / observer-refreshed for installer scopes.
      *  Values are stored as int: switches use 0/1, DIY sliders use 0-100. */
@@ -208,9 +398,9 @@ public final class Cfg {
      * 走上另一套完全不同的配方，而不是"更完整的功能"。
      *
      * GLASS_EXTREME 就是实例（v2.3.11 白玻璃事故）：它是 DIY 模式总闸，一旦误判为
-     * ON，refreshProps() 会去读 diy_* 滑条；而滑条在未就绪时只能返回 diyDefPct()
-     * 的出厂百分比，比 baked 标准配方弱得多（tblur 0.1 vs 0.6、nmask 0.15 vs 0.4），
-     * 玻璃直接退化成"几乎不糊、几乎不遮"的亮片 —— 白色背景下文字就看不清了。
+     * ON，refreshProps() 会去读另一套模式滑条；而滑条在未就绪时只能返回出厂百分比，
+     * 比 baked 标准配方弱得多（tblur 0.1 vs 0.6、nmask 0.15 vs 0.4），玻璃直接退化成
+     * "几乎不糊、几乎不遮"的亮片 —— 白色背景下文字就看不清了。
      * 这个误判只在 SystemUI 启动那一刻 Cfg 快照还没从 provider 落地时发生，所以
      * 表现为"开机后发亮，重启一两次 SystemUI 又自己好了"的偶发 bug。
      *
@@ -220,8 +410,8 @@ public final class Cfg {
      * "UI 显示关闭、hook 实际开启"的鬼故事 —— 别再拆开写。
      */
     public static boolean isOptIn(String key) {
-        return K_GLASS_EXTREME.equals(key) || K_NODUCK.equals(key)
-                || K_HOTTEMP.equals(key) || K_DIAG.equals(key);
+        return K_NODUCK.equals(key) || K_HOTTEMP.equals(key)
+                || K_DIAG.equals(key);
     }
 
     /** 快照是否已从 provider 落地。未落地时 hook 只能用 baked 默认值。 */
@@ -263,9 +453,22 @@ public final class Cfg {
             int[] v = m.get(k);
             sb.append(k).append('=').append(v == null ? "?" : v[0]).append(' ');
         }
-        for (String k : DIY_KEYS) {
+        // 精细参数只列"跟出厂值不一样"的项 —— 48 个 100 全打出来会把日志撑爆，
+        // 而排查时真正想知道的就是"用户到底动了哪几项"。
+        StringBuilder fn = new StringBuilder();
+        for (String k : FN_KEYS) {
             int[] v = m.get(k);
-            sb.append(k).append('=').append(v == null ? "?" : v[0]).append(' ');
+            int def = fnDefPct(k);
+            int val = v == null ? def : v[0];
+            if (val != def) {
+                if (fn.length() > 0) {
+                    fn.append(' ');
+                }
+                fn.append(k).append('=').append(val);
+            }
+        }
+        if (fn.length() > 0) {
+            sb.append(" | 改过: ").append(fn);
         }
         return sb.toString().trim();
     }
