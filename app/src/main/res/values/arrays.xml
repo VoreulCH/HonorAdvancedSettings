@@ -6,6 +6,8 @@
         <item>com.hihonor.desktop.systemui</item>
         <item>com.hihonor.photos</item>
         <item>com.android.packageinstaller</item>
+        <item>com.hihonor.powergenie</item>
+        <item>com.hihonor.iaware</item>
         <item>android</item>
     </string-array>
 </resources>
