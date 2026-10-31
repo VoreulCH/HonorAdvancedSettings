@@ -220,7 +220,7 @@ public final class GlassHook implements IXposedHookLoadPackage {
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         ClassLoader cl = lpparam.classLoader;
-        log("[HAS] glass v2.1.2 in process: " + lpparam.packageName);
+        log("[HAS] glass v2.2.9 in process: " + lpparam.packageName);
 
         hookTransparentMode(cl);
         hookBlurParams(cl);
