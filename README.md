@@ -21,15 +21,18 @@
 
 - **液态玻璃**：还原系统 OTA 更新阉割的控制中心 / 通知中心液态玻璃，覆盖系统、锁屏、相册三条线，每线独立开关；定稿配方烤入，装上即得调校后的观感；另有 DIY 模式提供 14 个 0~100 滑条实时调观感。
 - **安装器净化**：跳过安装器联网安全检测与指纹预装提示、禁止联网、隐藏推广卡片，支持降级安装；**钩子点自适应解析**（DexKit 字符串锚 + 参数签名扫描），荣耀安装器 OTA 混淆重排后大概率无需更新模块。
+- **高温限制解除**（需 ROOT）：高温时不弹「建议暂停使用」提示、不限制屏幕亮度、系统热状态按正常上报、压制 PowerGenie 温控（游戏限帧 / 后台清理）、高温自动关机不再触发；默认关闭、开启前二次确认，内核调度与降频不受影响。
 - **应用内开关**：所有功能在 miuix 风格界面以开关呈现，配置经 ContentProvider 桥跨进程同步，安装器线改开关无需重启，玻璃线一键重启作用域。
 
 An all-in-one LSPosed module for Honor MagicOS 11 that merges the previous
 **HonorLiquidGlassRestore** and **HonorInstallerPurify** modules: restores the
 liquid-glass effect gutted by the system update (system shade / lock screen /
-gallery, each independently switchable) and cleans up the package installer
+gallery, each independently switchable), cleans up the package installer
 (skip the online security check & preinstall fingerprint prompt, block
-networking, hide promo cards, allow downgrades) — all toggleable in-app, with
-cross-process config sync via a ContentProvider bridge.
+networking, hide promo cards, allow downgrades), and — with root — lifts the
+system's high-temperature restrictions (no popup, no brightness cap, thermal
+status reported normal, PowerGenie thermal policies suppressed) — all
+toggleable in-app, with cross-process config sync via a ContentProvider bridge.
 
 ## 功能一览 / Features
 
@@ -56,11 +59,18 @@ cross-process config sync via a ContentProvider bridge.
 | 匿名来源弹窗 / Anonymous source | 无来源包名（PC/文件管理器传入）时静默放行、零弹窗；任何失败都自动回退为可见可点的原厂弹窗，绝不吞触摸 Manual-free anonymous-source handling with a visible-dialog fallback on any failure |
 | 自适应钩子 / Adaptive hooks | 类经 DexKit 字符串锚定位、方法经参数签名扫描定位（锚=跨版本稳定的实体完整名）；放行结果双配方结构探测——安装器 OTA 混淆重排后大概率免更新 Classes located via DexKit string anchors, methods via parameter-signature scanning (anchored on stable entity full names); pass-result delivery tries two known recipes — installer OTA obfuscation reshuffles usually need no module update |
 
+### 系统综合 / System misc
+
+| 功能 Feature | 说明 Description |
+| --- | --- |
+| 屏蔽通知回避 / No audio ducking | 通知铃声响起时不再压低正在播放的音乐，两者同时发声；闹钟不受影响（默认关闭） Notification sounds stop ducking your music; alarms unaffected (opt-in) |
+| 屏蔽高温限制（ROOT）/ Thermal bypass | 高温时不弹「建议暂停使用」、不限屏幕亮度、系统热状态按正常上报、压制 PowerGenie 温控（游戏限帧 / 后台清理）、高温自动关机不再触发；开关格内实时显示系统层状态与属性值。**需 ROOT**（未授权时仅弹窗屏蔽生效），默认关闭、开启前二次确认；**内核调度与降频不受本开关影响** Disables the system's high-temperature restrictions with one switch (popup, brightness cap, thermal status reporting, PowerGenie policies, emergency shutdown); requires root, opt-in with a confirmation dialog; kernel-level throttling is untouched |
+
 ## 环境要求 / Requirements
 
 * 已 root 的荣耀 MagicOS 11（Android 17）设备：Magisk / KernelSU / ReSukkiSU + LSPosed（或 Vector 等第三方管理器）；模块要求 Android 13+（minSdk 33）。
   A rooted Honor MagicOS 11 (Android 17) device: Magisk / KernelSU / ReSukkiSU + LSPosed (or a third-party manager such as Vector); the module requires Android 13+ (minSdk 33).
-* 作用域：**系统界面**、**荣耀桌面**（`com.hihonor.android.launcher` / `com.hihonor.desktop.systemui`）、**相册**、**安装器**（安装包内已声明推荐作用域，管理器通常可一键应用）。
+* 作用域：**系统界面**、**荣耀桌面**（`com.hihonor.android.launcher` / `com.hihonor.desktop.systemui`）、**相册**、**安装器**、**系统框架**（降级安装）；**高温限制解除另需 `com.hihonor.powergenie` 与 `com.hihonor.iaware`**（安装包内已声明全部推荐作用域，管理器通常可一键应用）。
   Scopes: SystemUI, the Honor launcher, the gallery and the package installer (recommended scope declared in the APK manifest).
 * 仅在 MagicOS 11 上实测；其他版本类名可能变化，Hook 未命中时功能静默失效（不影响系统稳定）。
   Tested on MagicOS 11 only; on other versions the hooks may silently miss (nothing breaks).
@@ -136,6 +146,10 @@ gradle assembleRelease
 
 ## 版本历史 / Changelog
 
+> 版本号规则（2026-11-01 起）：**新功能进位到 2.x**（如 2.1 → 2.2），**修复用 2.x.xx**（第三段为该项功能的迭代次数）。
+
+* **2.2.9**（2026-10-31）：「屏蔽高温限制（ROOT）」默认值改为**关闭**——ROOT 级安全功能需用户显式开启（开启前二次确认）；已开启的安装不受影响，状态保留。
+* **2.2.8**（2026-11-01）：新增**高温不降级**——「系统综合 → 屏蔽高温限制（ROOT）」一个开关解除系统高温限制：不再弹「建议暂停使用」提示、不限制屏幕亮度、系统热状态按正常上报、压制 PowerGenie 温控（游戏限帧/后台清理）、高温自动关机不再触发；开关格内实时显示系统层状态与属性值。需 ROOT 写入系统属性（未授权时仅弹窗屏蔽生效）。**内核调度与降频不受本开关影响。**
 * **2.1.2**（2026-10-31，合并 2.0.3~2.1.2）：安装器净化新增第五版适配 **14.0.39.301**（现覆盖 38.301 / 32.303 / 22.326 / 22.327 / 39.301，多锚点合并定位）；新增**风险安装弹窗自动继续**与**匿名来源弹窗零弹出**——无来源包名（PC 工具 / 文件管理器传入）时静默放行，任何一步失败都自动回退为原厂可见弹窗，绝不出现吞触摸的隐形窗口；修复安装包信息卡误标「降级安装」（此前部分构建拿安装来源应用的版本做比较，全新应用也会被标红）；删除全部调试诊断代码，日志只保留安装与运行验证行；代码精简与零引用依赖清理（APK 4.20MB → 3.97MB）；关于页版本号改为动态读取。
 * **2.0.3**（2026-10-28）：代码审查精简版（零行为变化）。关于页版本号改为动态读取（此前硬编码停留在 2.0.0）；补上玻璃线诊断日志缺失的调试开关门控（此前默认向 Xposed 日志刷屏）；删除死代码（恒不生效的相册校准路径、无引用常量与 import 等，GlassHook 减 88 行）；移除零引用依赖 material-kolor / miuix-preference / miuix-icons，APK 缩小 245KB（4.2MB→3.97MB）。
 * **2.0.2**（2026-10-28，合并 2.0.1）：新增「杂项」页与**屏蔽通知回避**——通知铃声响起时不再压低正在播放的音乐（两者同时发声，闹钟不受影响，开关即时生效）；「DIY液态」文案修正为「DIY液态玻璃」；安装器净化适配 **14.0.32.303 与 14.0.22.327**（净化线现全覆盖 38.301 / 32.303 / 22.326 / 22.327 四版，自适应零开关）；安全检测放行改用安装器原生的安全默认结果构造；隐藏安装页「未发现风险」卡片（与渲染同帧隐藏，无闪现）；广告钩子签名形状扩展；液态玻璃通知卡片 / 工具栏按钮参数回迁 1.4.22 认可配方。
