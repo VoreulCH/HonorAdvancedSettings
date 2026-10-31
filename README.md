@@ -11,6 +11,12 @@
 
 基于MagicOS11开发 by VoreulCH@GitHub
 
+> **源码仓库 / Source repository**：https://github.com/VoreulCH/HonorAdvancedSettings
+> 本页面所在仓库是 LSPosed 官方发布镜像（用于 modules.lsposed.org 索引与分发），
+> 源码、issue、讨论请走上面的源码库。
+> This repository is the LSPosed distribution mirror; source code, issues and
+> discussions live in the source repository above.
+
 面向荣耀 MagicOS 11 的一站式 LSPosed 模块，整合了前作 **荣耀液态玻璃恢复（HonorLiquidGlassRestore）** 与 **荣耀安装器净化（HonorInstallerPurify）** 的全部功能，并重写了模块界面：
 
 - **液态玻璃**：还原系统 OTA 更新阉割的控制中心 / 通知中心液态玻璃，覆盖系统、锁屏、相册三条线，每线独立开关；定稿配方烤入，装上即得调校后的观感；另有 DIY 模式提供 14 个 0~100 滑条实时调观感。
@@ -120,6 +126,13 @@ gradle assembleRelease
 ├── build.ps1                              # 旧构建链（module/ 归档用）
 └── voreulch.keystore                      # 签名密钥（不入库）
 ```
+
+## 往期更新摘要 / Recent highlights
+
+- **2.1.2（58）**：适配荣耀安装器 **14.0.39.301** 新构建；修复部分渠道（如 MT 管理器）安装时匿名来源弹窗消失后「安装」按钮点不动的问题；修复安装全新应用被误标「降级安装」；移除历史调试代码、压缩冗余。
+- **2.0.2（48）**：新增「杂项」页与**屏蔽通知回避**（通知音响起时不再压低正在播放的音乐，闹钟不受影响）；安装器净化适配 **14.0.32.303 / 14.0.22.327**（累计覆盖 38.301 · 32.303 · 22.326 · 22.327 四版，自适应零开关）；隐藏安装页「未发现风险」残留卡片（与渲染同帧，无闪现）；液态玻璃通知卡片 / 工具栏按钮参数回迁 1.4.22 认可配方。
+- **2.0.0（46）**：大版本重构 —— DIY 模式（14 个 0~100 滑条实时调观感）、界面 miuix 化、安装器净化自适应钩子集（兼容模式开关取消）、安装提速。
+- 2.0.3 ~ 2.0.9 为内部迭代版本，未单独发布，改动已全部并入 2.1.2。
 
 ## 版本历史 / Changelog
 
