@@ -13,7 +13,6 @@ import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -23,7 +22,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
@@ -38,16 +36,13 @@ import top.yukonga.miuix.kmp.theme.darkColorScheme
 import top.yukonga.miuix.kmp.blur.layerBackdrop
 import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
 import top.yukonga.miuix.kmp.basic.Card
-import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.NavigationBar
 import top.yukonga.miuix.kmp.basic.NavigationBarItem
 import top.yukonga.miuix.kmp.basic.Scaffold
-import top.yukonga.miuix.kmp.basic.SmallTopAppBar
 import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Slider
 import top.yukonga.miuix.kmp.basic.Surface
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.basic.TopAppBar
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.foundation.layout.defaultMinSize
@@ -58,10 +53,9 @@ import io.github.voreulch.honoradvanced.ui.component.FloatingBottomBarItem
 
 /**
  * 药师 — module UI (miuix rebuild).
- * Functional parity with the prior hand-built SettingsActivity:
- * 9 switches, compat1/compat2 mutual exclusion, v1.0.x prefs migration,
- * root scope-restart, QR donate/QQ/privacy dialogs. Visual layer fully
- * rebuilt on the open-source miuix component library.
+ * 9 switches (glass 4-line + purify 3 + misc 1 + DIY master), v1.0.x prefs
+ * migration, root scope-restart, QR donate/QQ/privacy dialogs. Visual layer
+ * fully rebuilt on the open-source miuix component library.
  */
 class SettingsActivity : ComponentActivity() {
 
@@ -191,7 +185,6 @@ class SettingsActivity : ComponentActivity() {
             var page by remember { mutableStateOf(Page.Mine) }
             val uiBlur = remember { mutableStateOf(true) }          // locked on (磨砂)
             val uiFloatingBar = remember { mutableStateOf(true) }   // locked on (悬浮底栏)
-            val uiGlass = remember { mutableStateOf(true) }         // locked on (玻璃)
             // rootColor follows the theme (NOT black — the liquid-glass toggle
             // only gates the glass blur/lens effect, not the background color;
             // forcing black made the pill sample a dark backdrop = grey slab)
@@ -563,9 +556,9 @@ class SettingsActivity : ComponentActivity() {
 
     @Composable
     private fun SwitchCard(rows: List<SwRow>) {
-        // shared state map so the compat1/compat2 mutual exclusion instantly
-        // reflects on the other switch's UI (a per-row remember would go stale
-        // because writing the peer's prefs never recomposes its SwitchRow).
+        // shared state map so toggling one switch instantly reflects on the
+        // other rows' UI (a per-row remember would go stale because writing
+        // the peer's prefs never recomposes its SwitchRow).
         val state = remember(rows) {
             mutableStateMapOf<String, Boolean>().apply {
                 rows.forEach { put(it.key, prefsOn(it.key, it.def)) }
@@ -632,8 +625,25 @@ class SettingsActivity : ComponentActivity() {
 
     @Composable
     private fun VersionFooter() {
+        // read from PackageManager so this footer can never drift from
+        // build.gradle.kts again (it sat at v2.0.0 (46) through 2.0.2)
+        val ver = remember {
+            try {
+                val pi = packageManager.getPackageInfo(packageName, 0)
+                val code = if (android.os.Build.VERSION.SDK_INT >= 28) {
+                    pi.longVersionCode.toString()
+                } else {
+                    @Suppress("DEPRECATION") pi.versionCode.toString()
+                }
+                "v${pi.versionName ?: "?"} ($code)"
+            } catch (_: Throwable) { "" }
+        }
         Column(Modifier.fillMaxWidth().padding(top = 14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("v2.0.0 (46) · by VoreulCH@GitHub", fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            if (ver.isNotEmpty()) {
+                Text("$ver · by VoreulCH@GitHub", fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            } else {
+                Text("by VoreulCH@GitHub", fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            }
             Spacer(Modifier.height(2.dp))
             Text("AI-assisted · MIT", fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
         }
