@@ -63,7 +63,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  */
 public final class GlassHook implements IXposedHookLoadPackage {
 
-    private static final String TAG = "HAS-Glass";
+    // 注：以前这里有个 private static final String TAG = "HAS-Glass"，
+    // 从没被用过（所有日志都走 Diag.*，带进程 scope 前缀），v2.6.10 删掉。
 
     // SystemUI apk classes (present only in com.android.systemui process)
     private static final String TMM_CLASS =
@@ -72,6 +73,21 @@ public final class GlassHook implements IXposedHookLoadPackage {
             "com.hihonor.systemui.magic.blur.BlurParametersConfig";
     private static final String SHOTBLUR_CLASS =
             "com.android.magic.blur.ShotBlurView";
+    // 锁屏大时钟的玻璃腐蚀表（classes2.dex）。getErode 返回的 float 会被
+    // kge029.c 直接塞进 BlurParamEx.setSigma(...) 当腐蚀半径 —— 时钟玻璃
+    // 有多"厚"就靠这一个值。
+    private static final String KG_ERODE_CLASS =
+            "com.hihonor.keyguardengine.clockplugin.blur.ClockErodeTable";
+    // 锁屏小组件的宿主 View（classes2/classes4 都有引用）。
+    // setChildBlur(View, boolean) 里的 view 就是小组件本体。
+    private static final String KG_WIDGET_HOST_CLASS =
+            "com.hihonor.keyguard.view.widget.KgAppWidgetHostView";
+    // 锁屏壁纸/指纹的模糊参数构造器（返回 HnBlurParametersEx）
+    private static final String KG_BLUR_UTILS_CLASS =
+            "com.hihonor.keyguard.util.KeyguardBlurUtils";
+    // 桌面卡片的玻璃入口（launcher 自己的类，cl 一定找得到）
+    private static final String DESK_LIQUID_UTILS_CLASS =
+            "com.hihonor.android.launcher.cardstyle.utils.LiquidGlassUtils";
     // uikit transparency framework (SystemUI + launcher)
     private static final String CFG_CLASS =
             "com.hihonor.uikit.transparency.configuration.TransparencyFeatureConfig";
@@ -160,12 +176,100 @@ public final class GlassHook implements IXposedHookLoadPackage {
     private static boolean sFolderMode = false;
     private static int sFolderLogged = 0;
     private static boolean sBannerOn = false;
+    // 三条线各自的实时开关状态：精细调节必须跟着走，否则把系统玻璃关掉后
+    // 48 个滑条还在偷偷改参数 —— 那就不是"开关独立生效"了。
+    private static boolean sSysOn = false;
+    private static boolean sKgOn = false;
     private static int sBannerLogged = 0;
     private static float sTileBlurScale = DEFAULT_TBLUR;
     private static float sBannerBlur = DEFAULT_BANNER_BLUR;
-    private static ClassLoader sAppCl;
-    private static boolean sKgHooksInstalled;
-    private static boolean sGlassExtreme;
+    /**
+     * initBulrParams 钩子是否已挂上。
+     *
+     * <p>为什么需要它：Vector/LSPosed 的注入时机和 SystemUI 的类加载存在竞态 ——
+     * 本轮实测同一个 APK 连着重启两次 SystemUI，一次 `com.hihonor.systemui.
+     * magic.blur.BlurParametersConfig` 找得到（精细调节全部生效、日志里有
+     * `fine: scope=…`），另一次找不到（只剩 ShotBlurView 那条 panel 日志）。
+     * 表现就是用户说的"同样设置，有时生效有时不生效"。
+     *
+     * <p>所以：findClass 失败时**不置位**，留待后续在 setBlurParams 回调里
+     * （那里能拿到真实的 app ClassLoader）补挂一次。
+     *
+     * <p>⚠️ 必须严格保证只挂一次 —— hookAllMethods 挂两遍会让同一回调执行两次，
+     * 精细调节的乘法会被叠乘（0.6 变 0.36），比"没挂上"更难排查。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean sBpcHooked =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * ShotBlurView.setBlurParams 钩子是否已挂上（防止重复挂载导致参数叠乘）。
+     * 详见 {@link #hookPanelVeil} 里的说明。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean sPanelVeilHooked =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * TransparentModeManager 钩子是否已挂上。
+     * 危险点：{@code getTransparentBlurRadius} 是"读返回值再乘 sRadiusScale"，
+     * 挂几次就乘几次方。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean sTmmHooked =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * EdgeLightParamEx 钩子是否已挂上。
+     * 危险点：{@code setColor} 同样是"读原 alpha 再乘 rimK"，重复挂会让边缘光越拖越亮。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean sRimHooked =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** 锁屏时钟腐蚀钩子（ClockErodeTable.getErode）是否已挂上。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean sKgClockHooked =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static int sKgClockLogged = 0;
+    /** 锁屏元素玻璃参数接管（applyBlur 正式版）是否已挂上。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean sKgElemHooked =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static int sKgElemLogged = 0;
+    private static int sKgOpticsLogged = 0;
+    /** applyBlur 里 refreshProps 的节流时间戳（applyBlur 调用很密，不能每次都刷）。 */
+    private static long sKgLastRefresh = 0L;
+    /** 强制液态玻璃的日志计数。 */
+    private static int sForceLiquidLogged = 0;
+    /** 桌面卡片玻璃钩子是否已挂上。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean sDeskHooked =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static int sDeskLogged = 0;
+    /**
+     * 已处理过的 {@code kge028.b} 参数包实例。
+     *
+     * <p>**为什么必须有这个**：{@code applyBlur(provider, state, bVar)} 的第三个参数
+     * 是调用方传进来的。如果调用方**复用同一个实例**（先填值、再传给多个元素），
+     * 我们每收到一次就乘一次，同一个 thickness 会被乘成 2×2×2… 指数爆炸；
+     * 反过来如果每个元素都 new 一个，那每个都要处理。
+     *
+     * <p>用弱引用表兜住两种情况：同一个实例只处理一次；新实例照常处理，
+     * 且对象被回收后条目自动消失，不会泄漏。
+     */
+    private static final java.util.Map<Object, Boolean> sKgBVars =
+            java.util.Collections.synchronizedMap(
+                    new java.util.WeakHashMap<Object, Boolean>());
+    /** 锁屏小组件（KgAppWidgetHostView）是否已挂上。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean sKgWidgetHooked =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static int sKgWidgetLogged = 0;
+    /** 锁屏壁纸/指纹模糊参数（KeyguardBlurUtils）是否已挂上。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean sKgBlurParamsHooked =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static int sKgBlurLogged = 0;
+    /**
+     * keyguard 延迟钩子（bg bitmap / icon fallback / panel veil）是否已装。
+     * 用 AtomicBoolean 而不是 boolean：{@code initBulrParams} 的回调可能在
+     * 多个线程上跑（不同控件的构造线程不同），普通 boolean 的"先查后写"不是原子操作，
+     * 两条线程同时进来会重复挂 —— 而 bg/icon 那两个钩子会真的重复处理壁纸 bitmap。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean sKgHooksInstalled =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
     private static boolean sFrostGateWarned;
     private static int sRecipeLogged = 0;
     private static int sTextInvertLogged = 0;
@@ -196,7 +300,9 @@ public final class GlassHook implements IXposedHookLoadPackage {
     // the config here; turnOnViewBlur(view, config) then raises sKgCardNow for
     // the duration of the call so the EdgeLightParamEx constructor (built
     // synchronously inside turnOnViewBlur) can pick the keyguard-only scale.
-    private static boolean sKgCardNow = false;
+    // volatile：由 turnOnViewBlur 的钩子（通知背景 ViewModel 的线程）写，
+    // 由 EdgeLightParamEx 构造器的钩子（控件构造线程）读 —— 是真正的跨线程标志。
+    private static volatile boolean sKgCardNow = false;
     // WeakHashMap 本身不是线程安全的：initBulrParams 里 add、turnOnViewBlur 里
     // contains，两张卡片可能在不同线程构建。包一层同步视图（只做 add/contains）。
     private static final Set<Object> sKgConfigs = Collections.synchronizedSet(
@@ -223,16 +329,33 @@ public final class GlassHook implements IXposedHookLoadPackage {
     private static final java.util.List<IconTarget> sIconTargets =
             new java.util.concurrent.CopyOnWriteArrayList<IconTarget>();
     private static int sTileBlurLogged = 0;
+    // 精细调节的"实际改了什么"日志：每进程只打前 6 次，避免刷屏。
+    // 没有这条日志时，用户报"滑条拖了没反应"根本无法定位是
+    // ①值没读到 ②scope 判错 ③字段名不存在 ④开关把整条线关了。
+    private static int sFineLogged = 0;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         ClassLoader cl = lpparam.classLoader;
         // 进程横幅由 MainHook.enter() 统一打（带真实版本号）；这里早先硬编码了
         // "glass v2.2.9"，每次发版都会变成过期信息，删掉只留一处。
+        //
+        // v2.6.9: 但实测那个横幅**到不了 logcat**（走的是另一条通道），于是排查时
+        // 永远在猜"手机上跑的是哪一版代码、GlassHook 到底注入了没"。这里用 note
+        // （不受诊断开关控制）补一行，每进程固定一条，grep `glass v` 就能确认。
+        try {
+            Diag.note("glass v" + BuildConfig.VERSION_NAME
+                    + "(" + BuildConfig.VERSION_CODE + ") 注入 " + lpparam.packageName);
+        } catch (Throwable ignored) {
+        }
 
         hookTransparentMode(cl);
         hookBlurParams(cl);
         hookPanelVeil(cl);
+        hookKgClockBlur(cl);
+        hookKgElements(cl);
+        hookKgWidget(cl);
+        hookKgBlurParams(cl);
         hookEdgeRim(cl);
         hookDegreeAlgorithm(cl);
         hookConfigEx(cl);
@@ -244,9 +367,13 @@ public final class GlassHook implements IXposedHookLoadPackage {
             // keyguard app hooks are deferred to the BlurParametersConfig
             // initBulrParams callback: the OTA left lpparam.classLoader with
             // framework classes only, while that callback exposes the real
-            // app class loader (sAppCl / kg-deferred block).
+            // app class loader（kg-deferred 块里用局部变量接住后立刻用掉）。
             hookNtfCardGate(cl);
             hookTextColor();
+        }
+        if ("com.hihonor.android.launcher".equals(lpparam.packageName)) {
+            // 桌面是独立进程，只挂它自己那套玻璃参数
+            hookLauncherGlass(cl);
         }
         if ("com.hihonor.photos".equals(lpparam.packageName)) {
             hookGalleryScene(cl);
@@ -527,6 +654,460 @@ public final class GlassHook implements IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * 锁屏大时钟的玻璃腐蚀强度（v2.6.12）。
+     *
+     * <p>链路（溯源结论，之前一直以为锁屏时钟调不了是找错了入口）：
+     * <pre>
+     *   kge029.c:
+     *     blurParamEx.setSigma(new ClockErodeTable().getErode(
+     *         时钟样式, 字号, 单条/双条 ? 2 : 1, 字体));
+     * </pre>
+     * {@code getErode} 按「样式+字号+双条+字体」查表返回 0.45~2.49 的腐蚀半径，
+     * 用户完全没法调。这里改它的返回值。
+     *
+     * <p>为什么不是 hook {@code BlurParamEx.setSigma}：那个方法控制中心和桌面卡片
+     * 也在用，改了会连坐；getErode 只在时钟这条链上出现，精确得多。
+     */
+    private static void hookKgClockBlur(ClassLoader cl) {
+        if (sKgClockHooked.get()) return;
+        Class<?> et;
+        try {
+            et = XposedHelpers.findClass(KG_ERODE_CLASS, cl);
+        } catch (Throwable t) {
+            Diag.note("skip: ClockErodeTable missing (" + t.getClass().getSimpleName() + ")");
+            return;   // 不置位，留待 kg-deferred 用 app CL 重试
+        }
+        if (!sKgClockHooked.compareAndSet(false, true)) return;
+        try {
+            XposedBridge.hookAllMethods(et, "getErode", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (!sKgOn) return;
+                    Object r = param.getResult();
+                    if (!(r instanceof Float)) return;
+                    float k = fineF(Cfg.F_KG_ERODE);
+                    if (Math.abs(k - 1f) <= 0.001f) return;
+                    float v = (Float) r;
+                    // 这个值是 sigma（腐蚀半径，像素级）。乘过头画面会糊成一坨，
+                    // 所以留个 0.05 的地板（0 会让腐蚀消失、时钟变硬边）。
+                    float nv = Math.max(0.05f, v * k);
+                    param.setResult(Float.valueOf(nv));
+                    if (sKgClockLogged < 4) {
+                        sKgClockLogged++;
+                        log("kg-clock: 时钟腐蚀 " + v + " -> " + nv + " (x" + k + ")");
+                    }
+                }
+            });
+            Diag.note("ok: 锁屏时钟腐蚀钩子已挂上（ClockErodeTable.getErode）");
+        } catch (Throwable t) {
+            sKgClockHooked.set(false);   // 允许下次重试
+            Diag.note("skip: ClockErodeTable hook failed (" + t.getClass().getSimpleName() + ")");
+        }
+    }
+
+    /**
+     * 锁屏按钮 / 图标 / 文字的玻璃浓度（v2.6.14）。
+     *
+     * <p>链路：所有锁屏元素的玻璃参数都过
+     * {@code IBlurStrategy.applyBlur(IViewDataProvider, State, kge028.b)}，
+     * 第三个参数是通用渲染参数包。按 {@code provider.getViewType().getFirst()}
+     * 的字符串分三组，分别乘 blurRadius / saturation / brightness。
+     *
+     * <p>⚠️ 类名 {@code kge029.c} / {@code kge029.d} 是 R8 混淆名，OTA 后会变。
+     * 找不到就静默跳过 —— 宁可不生效，也不要因为硬编码类名把整个模块拖崩。
+     */
+    private static void hookKgElements(ClassLoader cl) {
+        if (!sKgElemHooked.compareAndSet(false, true)) return;
+        String[] targets = {"kge029.c", "kge029.d"};
+        int ok = 0;
+        for (String name : targets) {
+            try {
+                Class<?> k = XposedHelpers.findClass(name, cl);
+                XposedBridge.hookAllMethods(k, "applyBlur", new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        // ⚠ 必须自己 refreshProps：sKgOn 是在 refreshProps() 里赋值的，
+                        // 而锁屏底部按钮的 View 往往在别的钩子触发之前就构造完了。
+                        // v2.6.17 实测：不调这一句，按钮组永远不会被处理。
+                        // 但要节流 —— applyBlur 调用很密，每次都刷会把 Diag 的
+                        // 每秒 50 条配额吃光，连自己的 kg-opt 日志都打不出来。
+                        if (!Cfg.isOn(Cfg.K_GLASS)) return;
+                        long now = android.os.SystemClock.uptimeMillis();
+                        if (now - sKgLastRefresh > 1000L) {
+                            sKgLastRefresh = now;
+                            refreshProps();
+                        }
+                        if (!sKgOn) return;
+                        if (param.args.length < 3) return;
+                        try {
+                            Object provider = param.args[0];
+                            Object pair = XposedHelpers.callMethod(provider, "getViewType");
+                            Object first = XposedHelpers.callMethod(pair, "getFirst");
+                            String vt = first == null ? null : first.toString();
+                            Object bVar = param.args[2];
+                            String[] row = kgRowFor(vt);
+                            if (row == null) return;
+
+                            // 同一个参数包实例只处理一次 —— 否则调用方复用实例时
+                            // 会被我们反复乘成指数（见 sKgBVars 的注释）。
+                            if (sKgBVars.put(bVar, Boolean.TRUE) != null) return;
+
+                            // ① 本组的玻璃浓度（模糊半径 / 饱和 / 亮度）
+                            float k = fineF(row[1]);
+                            if (Math.abs(k - 1f) > 0.001f) {
+                                scaleKgField(bVar, "f501a", k);
+                                scaleKgField(bVar, "b", k);
+                                scaleKgField(bVar, "f502c", k);
+                                if (sKgElemLogged < 12) {
+                                    sKgElemLogged++;
+                                    log("kg-elem: " + vt + " 浓度 x" + k);
+                                }
+                            }
+
+                            // ② 本组独立的光学四项（深度 / 色散 / 厚度 / 边缘光）
+                            applyKgOptics(bVar, row, vt);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                ok++;
+                Diag.note("ok: 锁屏元素玻璃参数已接管 " + name);
+            } catch (Throwable t) {
+                Diag.note("skip: " + name + " missing (" + t.getClass().getSimpleName() + ")");
+            }
+        }
+        if (ok == 0) sKgElemHooked.set(false);   // 一个都没挂上，允许下次重试
+    }
+
+    /** 参数包里的字段是 Float 对象，乘完写回。字段不存在就静默跳过。 */
+    private static void scaleKgField(Object bVar, String field, float k) {
+        try {
+            Object cur = XposedHelpers.getObjectField(bVar, field);
+            if (!(cur instanceof Float)) return;
+            XposedHelpers.setObjectField(bVar, field,
+                    Float.valueOf(((Float) cur) * k));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 本组的玻璃光学四项（v2.6.17）：深度 / 色散 / 厚度 / 边缘光强度。
+     *
+     * <p>对应 {@code kge028.b} 的 {@code k / l / m / p}，会被 {@code kge029.c}
+     * 原样塞进 {@code GlassParamEx} 和 {@code EdgeLightParamEx}。
+     * **三组各自独立** —— 按钮组调厚度不会影响图标和文字。
+     */
+    private static void applyKgOptics(Object bVar, String[] row, String vt) {
+        float kd = fineF(row[2]);
+        float ki = fineF(row[3]);
+        float kt = fineF(row[4]);
+        float ke = fineF(row[5]);
+        boolean d = Math.abs(kd - 1f) > 0.001f;
+        boolean i = Math.abs(ki - 1f) > 0.001f;
+        boolean t = Math.abs(kt - 1f) > 0.001f;
+        boolean e = Math.abs(ke - 1f) > 0.001f;
+        if (!d && !i && !t && !e) return;
+        if (d) scaleKgField(bVar, "k", kd);       // depth
+        if (i) scaleKgField(bVar, "l", ki);       // dispersion
+        // 厚度特殊处理：把改前改后都记下来，用来确认"没有反复乘"
+        // （0.62 -> 1.24 是对的；如果下一次变成 2.48 就说明实例被复用了）
+        Object thkBefore = null;
+        if (t) {
+            try {
+                thkBefore = XposedHelpers.getObjectField(bVar, "m");
+            } catch (Throwable ignored) {
+            }
+            scaleKgField(bVar, "m", kt);
+        }
+        if (e) scaleKgEdgeColor(bVar, "p", ke);   // 边缘光 alpha
+        if (sKgOpticsLogged < 10) {
+            sKgOpticsLogged++;
+            String thk = "";
+            if (t && thkBefore instanceof Float) {
+                Object after = null;
+                try {
+                    after = XposedHelpers.getObjectField(bVar, "m");
+                } catch (Throwable ignored) {
+                }
+                thk = " thickness " + thkBefore + "->" + after;
+            }
+            log("kg-opt: " + vt + " depth x" + kd + " disp x" + ki
+                    + " thick x" + kt + " edge x" + ke + thk);
+        }
+    }
+
+    /** 边缘光颜色是 int（ARGB），只缩放 alpha 通道，颜色本身不动。 */
+    private static void scaleKgEdgeColor(Object bVar, String field, float k) {
+        try {
+            int c = XposedHelpers.getIntField(bVar, field);
+            int a = (c >>> 24) & 0xFF;
+            if (a == 0) return;   // 原厂就是全透明，乘多少还是 0
+            int na = Math.max(0, Math.min(255, Math.round(a * k)));
+            XposedHelpers.setIntField(bVar, field, (na << 24) | (c & 0xFFFFFF));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 锁屏小组件（天气卡 / 闹钟 / 步数那种）的透明度（v2.6.15）。
+     *
+     * <p>它**不走** applyBlur 那条链，走的是：
+     * <pre>
+     *   AppWidgetHelper.updateAppWidgetColorAndBlur(list, color, blur)
+     *     -> KgAppWidgetHostView.setChildBlur(View view, boolean z)
+     *        -> HnVisualEffectable.setTransparentStatus(open, degree, liquidMode)
+     * </pre>
+     * {@code degree} 是真正的透明度，但它在 {@code HnVisualEffectable} 接口上
+     * （实现类不在反编译范围），只能退一步：拦 {@code setChildBlur} 的出口，
+     * 系统把参数都设完之后，给那个 View 直接设最终 alpha。
+     *
+     * <p>代价写清楚：**整块小组件（含里面的文字）一起变透**，没法只调玻璃底。
+     * 语义是"相对系统默认" —— 100% 完全不动，50% 半透，200% 不透明。
+     */
+    private static void hookKgWidget(ClassLoader cl) {
+        if (!sKgWidgetHooked.compareAndSet(false, true)) return;
+        try {
+            Class<?> k = XposedHelpers.findClass(KG_WIDGET_HOST_CLASS, cl);
+            XposedBridge.hookAllMethods(k, "setChildBlur", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (!sKgOn) return;
+                    if (param.args.length < 1 || !(param.args[0] instanceof android.view.View)) {
+                        return;
+                    }
+                    float kk = fineF(Cfg.F_KG_WIDGET);
+                    if (Math.abs(kk - 1f) <= 0.001f) return;
+                    android.view.View v = (android.view.View) param.args[0];
+                    v.setAlpha(Math.max(0f, Math.min(1f, kk)));
+                    if (sKgWidgetLogged < 8) {
+                        sKgWidgetLogged++;
+                        log("kg-widget: alpha " + Math.max(0f, Math.min(1f, kk))
+                                + " -> " + v.getClass().getSimpleName());
+                    }
+                }
+            });
+            Diag.note("ok: 锁屏小组件钩子已挂上（KgAppWidgetHostView.setChildBlur）");
+        } catch (Throwable t) {
+            sKgWidgetHooked.set(false);   // 允许下次重试
+            Diag.note("skip: KgAppWidgetHostView missing (" + t.getClass().getSimpleName() + ")");
+        }
+    }
+
+    /**
+     * 锁屏壁纸玻璃 / 指纹（v2.6.16）。
+     *
+     * <p>两个方法都返回 {@code HnBlurParametersEx}，字段是 public 的：
+     * {@code radiusX / radiusY / saturation / scaleX / scaleY / maskColor /
+     * brightnessParams / multiMaskColors / edgeTreatment / gradientFactor}。
+     * 我们只动 radiusX/Y 和 saturation（纯 float，改起来最安全）。
+     *
+     * <p>原厂公式（都是写死的算术）：
+     * <pre>
+     *   getHnBlurParametersEx:  radius = (通透度 × -23)/100 + 32 ; saturation = 1.3 固定
+     *   getFPHnBlurParameters:  saturation = 通透度&lt;40 ? 1.3 : 1.2
+     * </pre>
+     * 也就是说「锁屏壁纸糊多厉害」跟通透度绑死、「饱和」干脆是常数 —— 用户没法调。
+     */
+    private static void hookKgBlurParams(ClassLoader cl) {
+        if (!sKgBlurParamsHooked.compareAndSet(false, true)) return;
+        try {
+            Class<?> k = XposedHelpers.findClass(KG_BLUR_UTILS_CLASS, cl);
+            int ok = 0;
+
+            try {
+                XposedBridge.hookAllMethods(k, "getHnBlurParametersEx", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        if (!sKgOn) return;
+                        Object p = param.getResult();
+                        if (p == null) return;
+                        float kr = fineF(Cfg.F_KG_BG_RADIUS);
+                        float ks = fineF(Cfg.F_KG_BG_SAT);
+                        boolean dr = Math.abs(kr - 1f) > 0.001f;
+                        boolean ds = Math.abs(ks - 1f) > 0.001f;
+                        if (!dr && !ds) return;
+                        try {
+                            if (dr) {
+                                float r = XposedHelpers.getFloatField(p, "radiusX");
+                                // 半径是像素级，太低会没有模糊，给个 0.5 地板
+                                float nr = Math.max(0.5f, r * kr);
+                                XposedHelpers.setFloatField(p, "radiusX", nr);
+                                XposedHelpers.setFloatField(p, "radiusY", nr);
+                            }
+                            if (ds) {
+                                float s = XposedHelpers.getFloatField(p, "saturation");
+                                XposedHelpers.setFloatField(p, "saturation", Math.max(0f, s * ks));
+                            }
+                            if (sKgBlurLogged < 6) {
+                                sKgBlurLogged++;
+                                log("kg-bg: 锁屏壁纸 blur x" + kr + " sat x" + ks);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                ok++;
+            } catch (Throwable t) {
+                Diag.note("skip: getHnBlurParametersEx (" + t.getClass().getSimpleName() + ")");
+            }
+
+            try {
+                XposedBridge.hookAllMethods(k, "getFPHnBlurParameters", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        if (!sKgOn) return;
+                        Object p = param.getResult();
+                        if (p == null) return;
+                        float ks = fineF(Cfg.F_KG_FP_SAT);
+                        if (Math.abs(ks - 1f) <= 0.001f) return;
+                        try {
+                            float s = XposedHelpers.getFloatField(p, "saturation");
+                            XposedHelpers.setFloatField(p, "saturation", Math.max(0f, s * ks));
+                            if (sKgBlurLogged < 8) {
+                                sKgBlurLogged++;
+                                log("kg-bg: 指纹 sat x" + ks);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                ok++;
+            } catch (Throwable t) {
+                Diag.note("skip: getFPHnBlurParameters (" + t.getClass().getSimpleName() + ")");
+            }
+
+            if (ok > 0) {
+                Diag.note("ok: 锁屏壁纸/指纹模糊参数已接管（" + ok + " 个）");
+            } else {
+                sKgBlurParamsHooked.set(false);
+            }
+        } catch (Throwable t) {
+            sKgBlurParamsHooked.set(false);
+            Diag.note("skip: KeyguardBlurUtils missing (" + t.getClass().getSimpleName() + ")");
+        }
+    }
+
+    /**
+     * 三组的分组表：{组名, 浓度键, 深度, 色散, 厚度, 边缘光}。
+     * viewType 的实测值见 Cfg 里 F_KG_* 的注释。
+     */
+    private static final String[][] KG_ROWS = {
+            {"btn", Cfg.F_KG_BTN, Cfg.F_KG_BTN_DEP, Cfg.F_KG_BTN_DIS,
+                    Cfg.F_KG_BTN_THK, Cfg.F_KG_BTN_EDGE},
+            {"icon", Cfg.F_KG_ICON, Cfg.F_KG_ICON_DEP, Cfg.F_KG_ICON_DIS,
+                    Cfg.F_KG_ICON_THK, Cfg.F_KG_ICON_EDGE},
+            {"txt", Cfg.F_KG_TXT, Cfg.F_KG_TXT_DEP, Cfg.F_KG_TXT_DIS,
+                    Cfg.F_KG_TXT_THK, Cfg.F_KG_TXT_EDGE},
+    };
+
+    /**
+     * 桌面（launcher）的卡片玻璃（v2.6.19）。
+     *
+     * <p>踩过的坑：一开始想 hook framework 里的
+     * {@code HnLiquidGlassParamsEx$BlurParamEx.setRadius}，结果在 launcher 进程里
+     * **findClass 直接失败**（`HnLiquidGlassParamsEx missing`）——那是个 framework 类，
+     * launcher 的 PathClassLoader 拿不到。
+     *
+     * <p>改成 hook launcher 自己的入口：
+     * <pre>
+     *   LiquidGlassUtils.setLiquidGlassParams(View, TransparentBlurParams, Object shape)
+     * </pre>
+     * 第二个参数是 {@code TransparentConfigurator$TransparentBlurParams}（Kotlin data class，
+     * 有 getter/setter）：{@code blurRadius(int) / saturation(float) / brightness(float) /
+     * maskColor(int)}。在 before 里改它，后面 {@code setRadius(p.getBlurRadius())} 读到的
+     * 就是我们的值。
+     *
+     * <p>注意桌面这条链 {@code setGlassParamEx(null)}、{@code setHighLightParamEx(null)} ——
+     * 系统根本没给桌面卡片配折射和高光，所以只能调模糊/饱和/亮度。
+     */
+    private static void hookLauncherGlass(ClassLoader cl) {
+        if (!sDeskHooked.compareAndSet(false, true)) return;
+        try {
+            Class<?> lg = XposedHelpers.findClass(DESK_LIQUID_UTILS_CLASS, cl);
+            XposedBridge.hookAllMethods(lg, "setLiquidGlassParams", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    // 开关门控：总开关 + 桌面开关，两个都开才动
+                    if (!Cfg.isOn(Cfg.K_GLASS) || !Cfg.isOn(Cfg.K_DESK)) return;
+                    if (param.args.length < 2 || param.args[1] == null) return;
+                    Object bp = param.args[1];
+                    try {
+                        float kr = fineF(Cfg.F_DESK_RADIUS);
+                        if (Math.abs(kr - 1f) > 0.001f) {
+                            Object cur = XposedHelpers.callMethod(bp, "getBlurRadius");
+                            if (cur instanceof Integer) {
+                                int nv = Math.max(1, Math.round(((Integer) cur) * kr));
+                                XposedHelpers.callMethod(bp, "setBlurRadius", nv);
+                                if (sDeskLogged < 8) {
+                                    sDeskLogged++;
+                                    log("desk: 卡片模糊 " + cur + " -> " + nv + " (x" + kr + ")");
+                                }
+                            }
+                        }
+                        float ks = fineF(Cfg.F_DESK_SAT);
+                        if (Math.abs(ks - 1f) > 0.001f) {
+                            Object cur = XposedHelpers.callMethod(bp, "getSaturation");
+                            if (cur instanceof Float) {
+                                XposedHelpers.callMethod(bp, "setSaturation",
+                                        Math.max(0f, ((Float) cur) * ks));
+                                if (sDeskLogged < 10) {
+                                    sDeskLogged++;
+                                    log("desk: 卡片饱和 x" + ks);
+                                }
+                            }
+                        }
+                        float kb = fineF(Cfg.F_DESK_BRIGHT);
+                        if (Math.abs(kb - 1f) > 0.001f) {
+                            Object cur = XposedHelpers.callMethod(bp, "getBrightness");
+                            if (cur instanceof Float) {
+                                XposedHelpers.callMethod(bp, "setBrightness", ((Float) cur) * kb);
+                                if (sDeskLogged < 12) {
+                                    sDeskLogged++;
+                                    log("desk: 卡片亮度 x" + kb);
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            Diag.note("ok: 桌面卡片玻璃已接管（setLiquidGlassParams）");
+        } catch (Throwable t) {
+            sDeskHooked.set(false);
+            Diag.note("skip: LiquidGlassUtils missing (" + t.getClass().getSimpleName() + ")");
+        }
+    }
+
+    /** viewType 字符串 → 本组那一行参数键；不认识就返回 null（完全不动它）。 */
+    private static String[] kgRowFor(String vt) {
+        if (vt == null) return null;
+        String group;
+        switch (vt) {
+            case "bottom_tool":
+            case "flashlight_tool":
+            case "flashlight_tool_backplane":
+            case "button_frame_backplane":
+                group = "btn";
+                break;
+            case "lock_icon_view":
+            case "festival_frame_layout":
+                group = "icon";
+                break;
+            case "indication_view":
+            case "charging_status_view":
+            case "magazine_simple_title_view":
+                group = "txt";
+                break;
+            default:
+                return null;
+        }
+        for (String[] row : KG_ROWS) {
+            if (group.equals(row[0])) return row;
+        }
+        return null;
+    }
+
     private static void logBtnSwap(String funnel, int from) {
         if (sBtnSceneLogged < 10) {
             sBtnSceneLogged++;
@@ -586,64 +1167,156 @@ public final class GlassHook implements IXposedHookLoadPackage {
         return Cfg.isOn(Cfg.K_GLASS) && Cfg.isOn(Cfg.K_GALLERY);
     }
 
-    /** DIY slider read: percent (0-100) -> value scaled by the per-key max. */
-    private static float diyF(String key, float max) {
-        int pct = Cfg.getInt(key, Cfg.diyDefPct(key));
-        return pct * max / 100f;
+    /** 某个 scope 对应的线是否开着（a=系统 k=锁屏 b=横幅）。 */
+    private static boolean lineOn(String scope) {
+        if ("k".equals(scope)) return sKgOn;
+        if ("b".equals(scope)) return sBannerOn;
+        return sSysOn;
+    }
+
+    /** 精细调节：百分比(0-200, 默认 100) -> 乘数。 */
+    private static float fineF(String key) {
+        return Cfg.getInt(key, Cfg.fnDefPct(key)) / 100f;
+    }
+
+    // 精细调节映射表：{BlurParametersConfig 字段名, Cfg 键, 适用范围}
+    //
+    // 适用范围 n/k/b/a —— 这三个 case 复用同一批字段名，原生在 initBulrParams 里
+    // 给它们赋了完全不同的值（通知卡亮 0.08、横幅 0.0；通知卡饱和 1.2、横幅 1.5~1.8），
+    // 所以要分开调，不能一个乘数刷到底：
+    //   n = 普通通知卡（case=2, z=false）
+    //   k = 锁屏通知卡（case=2, z=true）
+    //   b = 通知横幅（case=3，来通知时顶部弹出的那条）
+    //   a = 全部（瓦片/滑块/按钮/光学/模糊这些不和别人共用字段的）
+    private static final String[][] FN_ALPHA = {
+            {"liauidGlassMaskColor", Cfg.F_NTF_MASK, "n"},
+            {"liauidGlassMaskColor", Cfg.F_KL_MASK, "k"},
+            {"liauidGlassMaskColor", Cfg.F_BN_MASK, "b"},
+            {"liauidGlassNtfOverlayColor", Cfg.F_NTF_OVL, "n"},
+            {"liauidGlassNtfOverlayColor", Cfg.F_KL_OVL, "k"},
+            {"liauidGlassNtfOverlayColor", Cfg.F_BN_OVL, "b"},
+            {"controlNtfMaskColor", Cfg.F_NTFB_MASK, "n"},
+            {"controlNtfverlayColor", Cfg.F_NTFB_OVL, "n"},
+            {"controlMaskColor", Cfg.F_CC_MASK, "a"},
+            {"controlOverlayColor", Cfg.F_CC_OVL, "a"},
+            {"buttonMaskColor", Cfg.F_BTN_MASK, "a"},
+            {"buttonOverlayColor", Cfg.F_BTN_OVL, "a"},
+            {"sliderMaskColor", Cfg.F_SL_MASK, "a"},
+            {"sliderOverlayColor", Cfg.F_SL_OVL, "a"},
+    };
+
+    private static final String[][] FN_FLOAT = {
+            {"liauidGlassNtfbrightness", Cfg.F_NTF_BRIGHT, "n"},
+            {"liauidGlassNtfbrightness", Cfg.F_KL_BRIGHT, "k"},
+            {"liauidGlassNtfbrightness", Cfg.F_BN_BRIGHT, "b"},
+            {"liauidGlassNtfSaturation", Cfg.F_NTF_SAT, "n"},
+            {"liauidGlassNtfSaturation", Cfg.F_KL_SAT, "k"},
+            {"liauidGlassNtfSaturation", Cfg.F_BN_SAT, "b"},
+            {"controlNtfbrightness", Cfg.F_NTFB_BRIGHT, "a"},
+            {"controlbrightness", Cfg.F_CC_BRIGHT, "a"},
+            {"controlSaturation", Cfg.F_CC_SAT, "a"},
+            {"buttonbrightness", Cfg.F_BTN_BRIGHT, "a"},
+            {"buttonSaturation", Cfg.F_BTN_SAT, "a"},
+            {"sliderbrightness", Cfg.F_SL_BRIGHT, "a"},
+            {"sliderSaturation", Cfg.F_SL_SAT, "a"},
+            {"notificationCornerRadius", Cfg.F_NTF_CORNER, "n"},
+            {"notificationCornerRadius", Cfg.F_KL_CORNER, "k"},
+            {"controlCornerRadius", Cfg.F_CC_CORNER, "a"},
+            {"buttonCornerRadius", Cfg.F_BTN_CORNER, "a"},
+            {"sliderCornerRadius", Cfg.F_SL_CORNER, "a"},
+            {"refraction", Cfg.F_OPT_REFRACT, "a"},
+            {"depth", Cfg.F_OPT_DEPTH, "a"},
+            {"thickness", Cfg.F_OPT_THICK, "a"},
+            {"dispersion", Cfg.F_OPT_DISP, "a"},
+            // 注意：blurRadius / dynamicCardBlurRadius 这里**不能**写 "a"。
+            // case=3（横幅）也有这两个字段，而横幅段（下面 1100 行附近）已经
+            // 用 sBannerBlur 和 F_BN_BLUR 各乘过一次 —— 再叠一个 "a" 的
+            // F_BLUR_CARD 就是三重大小相乘，用户拖"卡片模糊"会连带横幅一起变，
+            // 而且成倍放大。所以卡片这两项只对 n/k 生效，横幅归横幅页独占。
+            {"blurRadius", Cfg.F_BLUR_CARD, "n"},
+            {"blurRadius", Cfg.F_BLUR_CARD, "k"},
+            {"blurRadius", Cfg.F_BN_BLUR, "b"},
+            {"dynamicCardBlurRadius", Cfg.F_BLUR_DYNAMIC, "n"},
+            {"dynamicCardBlurRadius", Cfg.F_BLUR_DYNAMIC, "k"},
+            {"scale", Cfg.F_BLUR_SCALE, "a"},
+    };
+
+    /** 精细调节是否有任何一项不是出厂值（用于跳过整块，零开销）。 */
+    private static boolean fineAny() {
+        // 三条线全关时没人会读这些值，直接跳过 —— 跟下面逐项 lineOn() 门控
+        // 等价，只是省掉一轮 48 次查表。
+        if (!sSysOn && !sKgOn && !sBannerOn) return false;
+        for (String k : Cfg.FN_KEYS) {
+            // 三种键（百分比项、开关项、角度）判定方式其实完全一样：
+            // 当前值 != 出厂默认值。以前这里按类型写了三个分支，但三个分支
+            // 的表达式一字不差，纯属历史遗留的复制粘贴，合成一行。
+            if (Cfg.getInt(k, Cfg.fnDefPct(k)) != Cfg.fnDefPct(k)) return true;
+        }
+        return false;
     }
 
     private static void refreshProps() {
-        // system line: neutral values (x1.0 / no-override) when switched off.
-        // In DIY mode (glass_extreme on) every knob reads its slider instead
-        // of the fixed baked-in constant. DIY is a GLOBAL switch — the
-        // keyguard line must not be gated on the system line being on.
+        // 系统线关掉时全部回中性值（x1.0 / 不覆盖）。
+        // v2.5.3: DIY（glass_extreme + 14 根滑条）已整体移除 —— 它想解决的问题
+        // 现在由「分区域强度」（tune_*，按控件分类粗调）和「精细调节」（fn_*，
+        // 逐字段微调）两层完全覆盖，而且粒度更细。这里只剩 baked 标准配方 +
+        // 各线开关的门控；两层滑条都在 hookBlurParams 里对字段做乘法。
         boolean sys = sysOn();
-        boolean diy = Cfg.isOn(Cfg.K_GLASS_EXTREME);
-        boolean ext = sys && diy;
-        sGlassExtreme = ext;
-        sRadiusScale = sys ? (diy ? diyF(Cfg.D_RADIUS, 1.0f) : DEFAULT_RADIUS) : 1.0f;
-        sMaskScale = sys ? (diy ? diyF(Cfg.D_MASK, 1.0f) : DEFAULT_MASK) : 1.0f;
-        sSatScale = sys ? (diy ? diyF(Cfg.D_SAT, 2.0f) : DEFAULT_SAT) : 1.0f;
-        sNtfMask = sys ? (diy ? diyF(Cfg.D_BMASK, 1.0f) : DEFAULT_NTF_MASK) : 0.0f;
-        sRefractScale = sys ? (diy ? diyF(Cfg.D_REFRACT, 2.0f) : DEFAULT_REFRACT) : 1.0f;
-        sEdgeScale = sys ? (diy ? diyF(Cfg.D_EDGE, 2.0f) : DEFAULT_EDGE) : 1.0f;
-        sThickScale = sys ? (diy ? diyF(Cfg.D_THICK, 2.0f) : DEFAULT_THICK) : 1.0f;
-        sDispScale = sys ? (diy ? diyF(Cfg.D_DISP, 0.5f) : DEFAULT_DISP) : 1.0f;
-        sRimScale = sys ? (diy ? diyF(Cfg.D_RIM, 2.0f) : DEFAULT_RIM) : 1.0f;
+        sRadiusScale = sys ? DEFAULT_RADIUS : 1.0f;
+        sMaskScale = sys ? DEFAULT_MASK : 1.0f;
+        sSatScale = sys ? DEFAULT_SAT : 1.0f;
+        sNtfMask = sys ? DEFAULT_NTF_MASK : 0.0f;
+        sRefractScale = sys ? DEFAULT_REFRACT : 1.0f;
+        sEdgeScale = sys ? DEFAULT_EDGE : 1.0f;
+        sThickScale = sys ? DEFAULT_THICK : 1.0f;
+        sDispScale = sys ? DEFAULT_DISP : 1.0f;
+        sRimScale = sys ? DEFAULT_RIM : 1.0f;
         sFolderMode = sys;
-        sTileBlurScale = sys ? (diy ? diyF(Cfg.D_TBLUR, 1.0f) : DEFAULT_TBLUR) : 1.0f;
-        sBannerBlur = sys ? (diy ? diyF(Cfg.D_BBLUR, 1.0f) : DEFAULT_BANNER_BLUR) : 1.0f;
-        sBannerOn = sys;
+        sTileBlurScale = sys ? DEFAULT_TBLUR : 1.0f;
+        sBannerBlur = sys ? DEFAULT_BANNER_BLUR : 1.0f;
+        sBannerOn = sys && Cfg.isOn(Cfg.K_BANNER);
+        sSysOn = sys;
         // keyguard line: buttons (kbg/keng/kicon) + cards (kbblur/kveil/
         // kbbright/kedge) merged under one switch; off = neutral.
         boolean kg = kgOn();
+        sKgOn = kg;
         sKeyguardBg = kg && DEFAULT_KBG > 0.5f;
         sKgEngineNotify = kg && DEFAULT_KENG > 0.5f;
         sKgIconFallback = kg && DEFAULT_KICON > 0.5f;
-        sKgBlurRadius = kg ? (diy ? diyF(Cfg.D_KBLUR, 2.0f) : DEFAULT_KBBLUR) : 0.0f;
-        sKgVeilScale = kg ? (diy ? diyF(Cfg.D_WMASK, 1.0f) : DEFAULT_KVEIL) : 0.0f;
-        sKgBrightness = kg ? (diy ? diyF(Cfg.D_KBBRIGHT, 0.3f) : DEFAULT_KBBRIGHT) : 0.0f;
+        sKgBlurRadius = kg ? DEFAULT_KBBLUR : 0.0f;
+        sKgVeilScale = kg ? DEFAULT_KVEIL : 0.0f;
+        sKgBrightness = kg ? DEFAULT_KBBRIGHT : 0.0f;
         sKgEdgeScale = kg ? DEFAULT_KEDGE : 1.0f;
         // gallery line: scene 0 = stock path everywhere
         boolean gal = galOn();
         sGalleryScene = gal ? DEFAULT_GSCENE : 0;
         sGalleryBar = gal;
 
+
         // 配方来源：排查"玻璃发亮/发灰"先看这一行。
-        // standard = baked 标准配方；diy = 14 根滑条；off = 系统综合关闭走原生玻璃。
-        // 用 note()（不受诊断开关控制）：Cfg 未就绪那一刻诊断本身也是关的，可偏偏
-        // 那正是"用户设置没生效"的窗口，这一行必须留下来。每进程最多两行。
-        if (sRecipeLogged < 2) {
+        // standard = baked 标准配方 + 两层滑条；off = 系统综合关闭走原生玻璃。
+        //
+        // ⚠ v2.6.9：以前这里用 Diag.note()，但实测 **note 的输出进不了 logcat**
+        // （Vector 的日志桥在模块 handleLoadPackage 早期还没就绪，XposedBridge.log
+        // 那一刻的输出全丢）。结果就是：启动期的版本横幅、hook 挂载结果、这一行
+        // recipe 全都看不到，排查时只能靠猜"跑的是哪一版、钩子挂上没有"。
+        // 现在改成 log()（运行时通道，实测能进 logcat），并把版本号和两个关键
+        // 钩子的挂载状态直接写进这一行。
+        if (sRecipeLogged < 3) {
             sRecipeLogged++;
-            String line = "recipe: " + (ext ? "diy" : (sys ? "standard" : "off"))
+            String line = "recipe: v" + BuildConfig.VERSION_NAME
+                    + "(" + BuildConfig.VERSION_CODE + ")"
+                    + " bpc=" + (sBpcHooked.get() ? "on" : "OFF")
+                    + " veil=" + (sPanelVeilHooked.get() ? "on" : "OFF")
+                    + " " + (sys ? "standard" : "off")
                     + " mask=" + sMaskScale + " nmask=" + sNtfMask
                     + " tblur=" + sTileBlurScale + " sat=" + sSatScale
                     + " radius=" + sRadiusScale;
             if (Cfg.ready()) {
-                Diag.note(line);
+                log(line);
             } else {
-                Diag.note(line + "  [Cfg 未就绪！本次按 baked 标准配方，"
-                        + "用户开关/DIY 滑条这一轮不生效]");
+                log(line + "  [Cfg 未就绪！本次按 baked 标准配方，"
+                        + "用户的开关/滑条这一轮不生效]");
             }
         }
     }
@@ -656,8 +1329,19 @@ public final class GlassHook implements IXposedHookLoadPackage {
      * (inlined or not) read the field and see liquid.
      */
     private static void hookTransparentMode(ClassLoader cl) {
+        // 幂等：getTransparentBlurRadius 的钩子是**读结果再乘**，
+        // 重复挂 N 次就是 sRadiusScale 的 N 次方。Vector 实测会对同一进程
+        // 多次回调 handleLoadPackage，所以这里必须挡一道。
+        if (sTmmHooked.get()) return;
+        Class<?> tmm;
         try {
-            Class<?> tmm = XposedHelpers.findClass(TMM_CLASS, cl);
+            tmm = XposedHelpers.findClass(TMM_CLASS, cl);
+        } catch (Throwable t) {
+            Diag.note("skip: TransparentModeManager missing (" + t.getClass().getSimpleName() + ")");
+            return;
+        }
+        if (!sTmmHooked.compareAndSet(false, true)) return;
+        try {
 
             XposedBridge.hookAllMethods(tmm, "getTransparentModeState", new XC_MethodHook() {
                 @Override
@@ -746,7 +1430,8 @@ public final class GlassHook implements IXposedHookLoadPackage {
 
             log("ok: TransparentModeManager LIQUID state fix installed");
         } catch (Throwable t) {
-            log("skip: TransparentModeManager missing (" + t.getClass().getSimpleName() + ")");
+            sTmmHooked.set(false);   // 挂到一半失败，允许下次重试
+            Diag.note("skip: TransparentModeManager hook failed (" + t.getClass().getSimpleName() + ")");
         }
     }
 
@@ -825,8 +1510,24 @@ public final class GlassHook implements IXposedHookLoadPackage {
 
     /** Scale the alpha of every mask/overlay color the glass renderer uses. */
     private static void hookBlurParams(ClassLoader cl) {
+        // 已挂上就别再挂 —— 重复挂载会让回调执行两次、所有乘法叠乘。
+        if (sBpcHooked.get()) return;
+        Class<?> bpc;
         try {
-            Class<?> bpc = XposedHelpers.findClass(BPC_CLASS, cl);
+            bpc = XposedHelpers.findClass(BPC_CLASS, cl);
+        } catch (Throwable t) {
+            // 注入竞态：这次 classLoader 里还没有 app dex 类。**不置位**，
+            // 留待 setBlurParams 回调里用真实 app CL 再补一次。
+            // 用 note（不受诊断开关控制）—— 挂载结果发生在 Cfg 落地之前，
+            // 那一刻 diag 开关还读不到，用 log() 会被整条吞掉，
+            // 于是"hook 到底挂上没有"永远是个谜。
+            Diag.note("skip: BlurParametersConfig missing (" + t.getClass().getSimpleName()
+                    + ")，将在 setBlurParams 回调里补挂");
+            return;
+        }
+        // findClass 成功后才抢占；CAS 失败说明别的线程已经挂上了。
+        if (!sBpcHooked.compareAndSet(false, true)) return;
+        try {
 
             XposedBridge.hookAllMethods(bpc, "initBulrParams", new XC_MethodHook() {
                 @Override
@@ -837,13 +1538,24 @@ public final class GlassHook implements IXposedHookLoadPackage {
                     // deferred keyguard hooks: lpparam.classLoader is empty
                     // (DexPathList[[]]); the BlurParams config object's CL is
                     // the real app CL (KeyguardWallpaper/ViewBlur/... hooks).
-                    if (!sKgHooksInstalled) {
-                        sKgHooksInstalled = true;
-                        sAppCl = o.getClass().getClassLoader();
-                        log("kg-deferred: app CL via obj = " + sAppCl.getClass().getName());
-                        try { hookKeyguardBgBitmap(sAppCl); } catch (Throwable t) { log("kg-deferred bg fail: " + t); }
-                        try { hookKeyguardIconFallback(sAppCl); } catch (Throwable t) { log("kg-deferred icon fail: " + t); }
-                        try { hookPanelVeil(sAppCl); } catch (Throwable t) { log("kg-deferred panelveil fail: " + t); }
+                    //
+                    // ⚠ 必须先拿到 CL 再置位：早先写成 `if (CAS) { sAppCl = ...;
+                    // log(sAppCl.getClass()...) }`，万一 getClassLoader() 返回 null，
+                    // 那一行 NPE 会冒到外层 catch，而标志**已经置成 true** ——
+                    // 三个 keyguard 钩子（bg / icon / panelVeil）就永远不会再试了。
+                    if (!sKgHooksInstalled.get()) {
+                        ClassLoader acl = null;
+                        try {
+                            acl = o.getClass().getClassLoader();
+                        } catch (Throwable ignored) {
+                        }
+                        if (acl != null && sKgHooksInstalled.compareAndSet(false, true)) {
+                            log("kg-deferred: app CL via obj = " + acl.getClass().getName());
+                            try { hookKeyguardBgBitmap(acl); } catch (Throwable t) { log("kg-deferred bg fail: " + t); }
+                            try { hookKeyguardIconFallback(acl); } catch (Throwable t) { log("kg-deferred icon fail: " + t); }
+                            try { hookPanelVeil(acl); } catch (Throwable t) { log("kg-deferred panelveil fail: " + t); }
+                            try { hookKgClockBlur(acl); } catch (Throwable t) { log("kg-deferred clock fail: " + t); }
+                        }
                     }
                     if (sKgBlurRadius > 0.01f && param.args.length >= 3
                             && Boolean.TRUE.equals(param.args[2])
@@ -900,24 +1612,36 @@ public final class GlassHook implements IXposedHookLoadPackage {
                             log("kbshade failed: " + t);
                         }
                     }
+                    // ---- 按控件类型分别缩放（v2.5.0）----
+                    // 原生 initBulrParams 给四类控件赋了不同的亮度/饱和度/遮罩资源，
+                    // 旧版只有一个 sMaskScale 一把刷到全部控件上；现在每类还有自己的
+                    // 强度权重，想单独压暗通知卡不会连带滑块和按钮一起变。
                     if (sMaskScale < 0.999f) {
                         try {
-                            scaleAlphaField(o, "liauidGlassMaskColor", sMaskScale);
-                            scaleAlphaField(o, "liauidGlassNtfOverlayColor", sMaskScale);
-                            scaleAlphaField(o, "controlMaskColor", sMaskScale);
-                            scaleAlphaField(o, "controlOverlayColor", sMaskScale);
-                            scaleAlphaField(o, "controlNtfMaskColor", sMaskScale);
-                            scaleAlphaField(o, "controlNtfverlayColor", sMaskScale);
-                            scaleAlphaField(o, "sliderMaskColor", sMaskScale);
-                            scaleAlphaField(o, "sliderOverlayColor", sMaskScale);
-                            scaleAlphaField(o, "buttonMaskColor", sMaskScale);
-                            scaleAlphaField(o, "buttonOverlayColor", sMaskScale);
-                            scaleAlphaArray(o, "multiMaskColors", sMaskScale);
-                            scaleAlphaArray(o, "multiControlMaskColors", sMaskScale);
-                            scaleAlphaArray(o, "multiSliderMaskColors", sMaskScale);
-                            scaleAlphaArray(o, "multiButtonMaskColors", sMaskScale);
-                            scaleAlphaArray(o, "dynamicCardGradientMaskColor", sMaskScale);
-                            scaleAlphaArray(o, "dynamicCardGradientMaskColorOther", sMaskScale);
+                            // 通知卡（含瓦片内的通知卡、动态卡片渐变）
+                            float ntf = sMaskScale;
+                            scaleAlphaField(o, "liauidGlassMaskColor", ntf);
+                            scaleAlphaField(o, "liauidGlassNtfOverlayColor", ntf);
+                            scaleAlphaField(o, "controlNtfMaskColor", ntf);
+                            scaleAlphaField(o, "controlNtfverlayColor", ntf);
+                            scaleAlphaArray(o, "multiMaskColors", ntf);
+                            scaleAlphaArray(o, "dynamicCardGradientMaskColor", ntf);
+                            scaleAlphaArray(o, "dynamicCardGradientMaskColorOther", ntf);
+                            // 控制中心瓦片
+                            float cc = sMaskScale;
+                            scaleAlphaField(o, "controlMaskColor", cc);
+                            scaleAlphaField(o, "controlOverlayColor", cc);
+                            scaleAlphaArray(o, "multiControlMaskColors", cc);
+                            // 滑块
+                            float sl = sMaskScale;
+                            scaleAlphaField(o, "sliderMaskColor", sl);
+                            scaleAlphaField(o, "sliderOverlayColor", sl);
+                            scaleAlphaArray(o, "multiSliderMaskColors", sl);
+                            // 圆形按钮
+                            float bt = sMaskScale;
+                            scaleAlphaField(o, "buttonMaskColor", bt);
+                            scaleAlphaField(o, "buttonOverlayColor", bt);
+                            scaleAlphaArray(o, "multiButtonMaskColors", bt);
                             if (sMaskCount < 3) {
                                 sMaskCount++;
                                 log("mask: initBulrParams case="
@@ -928,12 +1652,29 @@ public final class GlassHook implements IXposedHookLoadPackage {
                             log("mask scale failed: " + t);
                         }
                     }
-                    if (sNtfMask > 0.001f) {
+                    // ⚠ v2.6.10：这个块以前**不分 case** 一把刷 —— 它把 controlNtfMaskColor /
+                    // controlNtfverlayColor 绝对覆盖成 0x66 灰，连磨砂模式（case=1）和
+                    // 横幅（case=3）都被改。而这两个字段在原生里每个 case 的底色都不一样
+                    // （case=1 用 no_transparent 不透明色、case=2 用 transparent、
+                    //   case=3 用 headsup 那套），一刀切成 0x66 等于把别人的配方毁了。
+                    // 现在只对「普通通知卡」(case=2 且 z=false) 生效 —— 锁屏卡走 kbshade
+                    // 自己的配方，横幅走 banner 块，都各有各的写法。
+                    boolean plainNtfCard = param.args.length > 2
+                            && param.args[0] instanceof Integer
+                            && (Integer) param.args[0] == 2
+                            && !Boolean.TRUE.equals(param.args[2]);
+                    if (sNtfMask > 0.001f && plainNtfCard) {
                         // absolute override AFTER the generic scale so the
                         // card tint is exactly nmask, independent of mask prop
                         try {
-                            int tint = ((int) (sNtfMask * 255.0f + 0.5f)) << 24 | 0x2E2E2E;
-                            int overlay = ((int) (sNtfMask * 0.5f * 255.0f + 0.5f)) << 24 | 0x2E2E2E;
+                            // nmask 是「精确指定通知卡 tint」，同样要受 tune_ntf 影响，
+                            // 否则用户把通知卡强度调到 50% 后 nmask 会把它顶回去。
+                            // 乘完必须 clamp：0.4×2.0=0.8 还好，1.0×2.0 就溢出。
+                            float nm = sNtfMask;
+                            int a1 = Math.min(255, Math.round(nm * 255.0f));
+                            int a2 = Math.min(255, Math.round(nm * 0.5f * 255.0f));
+                            int tint = (a1 << 24) | 0x2E2E2E;
+                            int overlay = (a2 << 24) | 0x2E2E2E;
                             XposedHelpers.setIntField(o, "controlNtfMaskColor", tint);
                             XposedHelpers.setIntField(o, "controlNtfverlayColor", overlay);
                             if (sNtfCount < 3) {
@@ -944,6 +1685,96 @@ public final class GlassHook implements IXposedHookLoadPackage {
                             }
                         } catch (Throwable t) {
                             log("ntf tint failed: " + t);
+                        }
+                    }
+                    // ---- 精细调节（v2.5.2）----
+                    // 放在 nmask 绝对覆盖之后：nmask 决定卡片底色，这里再按单项微调，
+                    // 两者相乘。全部为 100%/默认值时整块跳过，零开销。
+                    if (fineAny()) {
+                        try {
+                            // 本次调用落在哪一套原生配方上：
+                            //   case=2 且 z=false -> n  普通通知卡 / 控制中心瓦片
+                            //   case=2 且 z=true  -> k  锁屏通知卡
+                            //   case=3            -> b  通知横幅
+                            //   case=1/4/5        -> null 一律不碰
+                            //
+                            // 以前这里默认 scope="n"，等于把 case=1/4/5 也当成
+                            // 普通通知卡处理。但原生给它们赋的是完全不同的数值
+                            // （case=1 磨砂：controlSaturation=2.8、controlbrightness=0.0；
+                            //   case=2 液态：1.1 / 0.12；case=5 的 blurRadius 直接 130），
+                            // 把"通知卡遮罩 60%"这类微调套上去是改错了对象 ——
+                            // 症状就是"我只调了通知卡，磨砂模式跟着一起变"。
+                            String scope = null;
+                            if (param.args.length > 2 && param.args[0] instanceof Integer) {
+                                int cs = (Integer) param.args[0];
+                                if (cs == 3) {
+                                    scope = "b";
+                                } else if (cs == 2) {
+                                    scope = Boolean.TRUE.equals(param.args[2]) ? "k" : "n";
+                                }
+                            }
+                            // scope == null 时整块跳过，连 "a" 全局项也不作用 ——
+                            // 那些字段在 case=1/4/5 里是另一套数值体系，乘上去
+                            // 只会跑偏（磨砂模式的饱和度基数 2.8，×2 直接爆色）。
+                            if (scope != null) {
+                                // 记录本轮回调实际动了哪些字段（限流 6 次），
+                                // 排查"滑条没反应"时一眼看出卡在哪一步。
+                                StringBuilder applied = sFineLogged < 6
+                                        ? new StringBuilder() : null;
+                                // 按线门控：全局项跟系统线，锁屏项跟锁屏线，
+                                // 横幅项跟横幅开关。某一线的开关关掉时，它那几项
+                                // 必须原样不动。
+                                for (String[] m : FN_ALPHA) {
+                                    if (!"a".equals(m[2]) && !scope.equals(m[2])) continue;
+                                    if (!lineOn(m[2])) continue;
+                                    float k = fineF(m[1]);
+                                    if (Math.abs(k - 1f) > 0.001f) {
+                                        scaleAlphaField(o, m[0], k);
+                                        if (applied != null) {
+                                            applied.append(' ').append(m[1]).append('x').append(k);
+                                        }
+                                    }
+                                }
+                                for (String[] m : FN_FLOAT) {
+                                    if (!"a".equals(m[2]) && !scope.equals(m[2])) continue;
+                                    if (!lineOn(m[2])) continue;
+                                    float k = fineF(m[1]);
+                                    if (Math.abs(k - 1f) > 0.001f) {
+                                        scaleFloatField(o, m[0], k);
+                                        if (applied != null) {
+                                            applied.append(' ').append(m[1]).append('x').append(k);
+                                        }
+                                    }
+                                }
+                                // 高光开关都属系统线：系统线关掉时必须原样不动。
+                                // 用 if 包裹而不是 return —— return 会跳出整个
+                                // 精细块，将来若把横幅/锁屏逻辑挪到后面会被误伤。
+                                if (sSysOn) {
+                                    if (Cfg.getInt(Cfg.F_HL_ON, Cfg.fnDefPct(Cfg.F_HL_ON)) != 0) {
+                                        XposedHelpers.setBooleanField(o, "isNeedHighLight", false);
+                                        if (applied != null) applied.append(" hl=off");
+                                    }
+                                    if (Cfg.getInt(Cfg.F_HL_CC, Cfg.fnDefPct(Cfg.F_HL_CC)) != 0) {
+                                        XposedHelpers.setBooleanField(o, "isControlNeedHighLight", false);
+                                        if (applied != null) applied.append(" hlcc=off");
+                                    }
+                                    if (Cfg.getInt(Cfg.F_HL_BTN, Cfg.fnDefPct(Cfg.F_HL_BTN)) != 0) {
+                                        XposedHelpers.setBooleanField(o, "isButtonNeedHighLight", false);
+                                        if (applied != null) applied.append(" hlbtn=off");
+                                    }
+                                    if (Cfg.getInt(Cfg.F_HL_SL, Cfg.fnDefPct(Cfg.F_HL_SL)) != 0) {
+                                        XposedHelpers.setBooleanField(o, "sliderNeedHighLight", false);
+                                        if (applied != null) applied.append(" hlsl=off");
+                                    }
+                                }
+                                // 统一在所有改动做完之后打一条，别漏掉高光那几项。
+                                if (applied != null && applied.length() > 0) {
+                                    sFineLogged++;
+                                    log("fine: scope=" + scope + applied);
+                                }
+                            }
+                        } catch (Throwable t) {
+                            log("fine tune failed: " + t);
                         }
                     }
                     if (sBannerOn && param.args.length > 0
@@ -1010,11 +1841,22 @@ public final class GlassHook implements IXposedHookLoadPackage {
                         // thickness honors the thick prop as a multiplier on
                         // the folder base (0.62) — widens the edge refraction
                         // band without touching refraction/dispersion.
+                        //
+                        // ⚠ v2.6.7：这里是**绝对值覆盖**，会把上面精细调节
+                        // 给 refraction/depth/thickness/dispersion 乘的系数
+                        // 直接抹掉 —— 而 sFolderMode = sys 默认是开的，等于
+                        // 「折射率 / 深度 / 厚度 / 色散」四根滑条一直 100% 失效。
+                        // 修法：folder 基准值自己也乘一次精细系数（跟下面
+                        // sThickScale 的处理方式保持一致）。
                         try {
-                            XposedHelpers.setFloatField(o, "refraction", 0.3f);
-                            XposedHelpers.setFloatField(o, "depth", 0.54f);
-                            XposedHelpers.setFloatField(o, "thickness", 0.62f * sThickScale);
-                            XposedHelpers.setFloatField(o, "dispersion", 0.2f);
+                            XposedHelpers.setFloatField(o, "refraction",
+                                    0.3f * fineF(Cfg.F_OPT_REFRACT));
+                            XposedHelpers.setFloatField(o, "depth",
+                                    0.54f * fineF(Cfg.F_OPT_DEPTH));
+                            XposedHelpers.setFloatField(o, "thickness",
+                                    0.62f * sThickScale * fineF(Cfg.F_OPT_THICK));
+                            XposedHelpers.setFloatField(o, "dispersion",
+                                    0.2f * fineF(Cfg.F_OPT_DISP));
                             if (sFolderLogged < 3) {
                                 sFolderLogged++;
                                 log("folder: liquid optics -> 0.3/0.54/"
@@ -1052,12 +1894,34 @@ public final class GlassHook implements IXposedHookLoadPackage {
                             log("tblur scale failed: " + t);
                         }
                     }
+                    // ---- 强制液态玻璃（v2.6.19）----
+                    // 必须放在**最后**：前面 kbshade / folder / banner 那些块
+                    // 都会重写 glassType，放前面等于白改。
+                    if (sSysOn) {
+                        try {
+                            if (Cfg.getInt(Cfg.F_FORCE_LIQUID, 0) != 0) {
+                                int gt = XposedHelpers.getIntField(o, "glassType");
+                                if (gt != 2) {
+                                    XposedHelpers.setIntField(o, "glassType", 2);
+                                    if (sForceLiquidLogged < 8) {
+                                        sForceLiquidLogged++;
+                                        log("force-liquid: glassType " + gt + " -> 2 (case="
+                                                + (param.args.length > 0 ? param.args[0] : "?") + ")");
+                                    }
+                                }
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
                 }
             });
 
-            log("ok: BlurParametersConfig mask-scale installed");
+            Diag.note("ok: BlurParametersConfig 精细调节钩子已挂上");
         } catch (Throwable t) {
-            log("skip: BlurParametersConfig missing (" + t.getClass().getSimpleName() + ")");
+            // 挂到一半失败：回滚标志，让 setBlurParams 回调还能再试一次。
+            // （hookAllMethods 要么全成要么抛异常，不会留下半个钩子。）
+            sBpcHooked.set(false);
+            log("skip: BlurParametersConfig hook failed (" + t.getClass().getSimpleName() + ")");
         }
     }
 
@@ -1106,7 +1970,9 @@ public final class GlassHook implements IXposedHookLoadPackage {
             XposedBridge.hookAllMethods(android.widget.TextView.class, "setTextColor", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
-                    if (!sGlassExtreme) return;
+                    // v2.5.3: 原来这里门控 DIY 模式，DIY 移除后改跟系统线 ——
+                    // 精细调节同样能把玻璃调得很透，深色文字仍需反白兜底。
+                    if (!sysOn()) return;
                     if (!(param.args[0] instanceof Integer)) return;
                     int c = (Integer) param.args[0];
                     double lum = (0.299 * ((c >> 16) & 0xFF)
@@ -1390,14 +2256,40 @@ public final class GlassHook implements IXposedHookLoadPackage {
      * so live tuning applies on the next pull-down.
      */
     private static void hookPanelVeil(ClassLoader cl) {
+        // 幂等：这个函数会被调用两次 —— handleLoadPackage 一次、
+        // initBulrParams 首次回调（kg-deferred 分支）再一次，而 LSPosed/Vector
+        // 还可能对同一进程多次回调 handleLoadPackage。
+        // 没这道门时的实测症状：日志里同时出现 `sat=1.44` 和 `sat=1.728`
+        // （DEFAULT_SAT=1.2，1.2² 和 1.2³）—— 同一个 setBlurParams 被挂了
+        // 两三次，饱和度和遮罩 alpha 被叠乘，画面比设定值透/艳得多，而且
+        // 用户调滑条时变化量是非线性的（拖 10% 实际变 20%）。
+        if (sPanelVeilHooked.get()) return;
+        Class<?> sbv;
         try {
-            Class<?> sbv = XposedHelpers.findClass(SHOTBLUR_CLASS, cl);
+            sbv = XposedHelpers.findClass(SHOTBLUR_CLASS, cl);
+        } catch (Throwable t) {
+            Diag.note("skip: ShotBlurView missing (" + t.getClass().getSimpleName() + ")");
+            return;   // 不置位，留待下一次（可能是 app CL）重试
+        }
+        if (!sPanelVeilHooked.compareAndSet(false, true)) return;
+        try {
 
             XposedBridge.hookAllMethods(sbv, "setBlurParams", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (param.args.length < 2 || !(param.args[1] instanceof Integer)) {
                         return;
+                    }
+                    // 补挂 initBulrParams（见 hookBlurParams 里的注入竞态说明）。
+                    // ⚠ 必须放在 `if (!sysOn()) return;` **之前**：钩子挂载是基础设施，
+                    // 不该被功能开关挡住 —— 否则用户关着系统线时这个补挂永远不会发生，
+                    // 等他重新打开（需重启 SystemUI）新进程里照样挂不上，形成死循环。
+                    if (!sBpcHooked.get()) {
+                        try {
+                            ClassLoader acl = param.thisObject.getClass().getClassLoader();
+                            if (acl != null) hookBlurParams(acl);
+                        } catch (Throwable ignored) {
+                        }
                     }
                     if (!sysOn()) return;
                     refreshProps();
@@ -1408,7 +2300,15 @@ public final class GlassHook implements IXposedHookLoadPackage {
                     int orig = (Integer) param.args[1];
                     if (sPanelCount < 4) {
                         sPanelCount++;
-                        log("panel: setBlurParams sat=" + param.args[0]
+                        // 这是全模块唯一稳定可见的日志点（下拉时才打，避开启动期
+                        // 的日志洪峰和每秒 50 条限流），所以把版本号和 initBulrParams
+                        // 钩子的挂载状态都挂在这一行上 —— 排查时第一眼就能确认
+                        // "手机上跑的是哪一版、精细调节的入口挂上没有"。
+                        log("panel: v" + BuildConfig.VERSION_NAME
+                                + "(" + BuildConfig.VERSION_CODE + ")"
+                                + " bpc=" + (sBpcHooked.get() ? "on" : "OFF")
+                                + " clock=" + (sKgClockHooked.get() ? "on" : "OFF")
+                                + " sat=" + param.args[0]
                                 + " mask=0x" + Integer.toHexString(orig)
                                 + " x" + sMaskScale);
                     }
@@ -1419,9 +2319,10 @@ public final class GlassHook implements IXposedHookLoadPackage {
                 }
             });
 
-            log("ok: ShotBlurView panel-veil mask-scale installed");
+            Diag.note("ok: ShotBlurView 面板遮罩钩子已挂上");
         } catch (Throwable t) {
-            log("skip: ShotBlurView missing (" + t.getClass().getSimpleName() + ")");
+            sPanelVeilHooked.set(false);
+            log("skip: ShotBlurView hook failed (" + t.getClass().getSimpleName() + ")");
         }
     }
 
@@ -1434,9 +2335,20 @@ public final class GlassHook implements IXposedHookLoadPackage {
      * all of them. Color is already opaque white, width is the only lever.
      */
     private static void hookEdgeRim(ClassLoader cl) {
+        // 幂等：setColor 的钩子是**读原 alpha 再乘 rimK**，重复挂两次就是乘两次
+        // （0x4D=77 → 77×1.4=108 → 108×1.4=151，边缘光越拖越亮）。
+        // 构造器那个钩子有"只缩放原厂 6.0"的保护，天然幂等；真正危险的是 setColor。
+        if (sRimHooked.get()) return;
+        Class<?> el;
         try {
-            Class<?> el = XposedHelpers.findClass(
+            el = XposedHelpers.findClass(
                     "com.hihonor.android.graphics.material.atomiceffect.EdgeLightParamEx", cl);
+        } catch (Throwable t) {
+            Diag.note("skip: EdgeLightParamEx missing (" + t.getClass().getSimpleName() + ")");
+            return;
+        }
+        if (!sRimHooked.compareAndSet(false, true)) return;
+        try {
 
             XposedBridge.hookAllConstructors(el, new XC_MethodHook() {
                 @Override
@@ -1446,12 +2358,33 @@ public final class GlassHook implements IXposedHookLoadPackage {
                     }
                     if (!Cfg.isOn(Cfg.K_GLASS)) return;
                     refreshProps();
+                    // v2.6.10：这条线上有三项可调（角度 / 厚度 / 亮度），以前只挡了
+                    // 总开关 —— 用户把「系统液态玻璃」关掉之后，边缘光的角度和精细
+                    // 权重**照样在改**，跟"关掉=恢复系统默认"的承诺不符。
+                    // 锁屏卡（sKgCardNow）归锁屏线管，其余归系统线管。
+                    boolean lineOk = sKgCardNow ? sKgOn : sSysOn;
+                    if (!lineOk) return;
+                    // v2.5.2 边缘光角度（原厂固定 250，光永远从同一方向来）。
+                    // 放在厚度逻辑之前：厚度那边有"scale≈1 就 return"的早退，
+                    // 否则只调角度会被直接跳过。
+                    try {
+                        // 默认值必须走 fnDefPct（烧录入口），不能硬编码 250 ——
+                        // 否则烧录把默认角度改成别的值时，这里永远取到 250。
+                        int defAngle = Cfg.fnDefPct(Cfg.F_HL_ANGLE);
+                        int wantAngle = Cfg.getInt(Cfg.F_HL_ANGLE, defAngle);
+                        if (wantAngle != defAngle && param.args[0] instanceof Integer) {
+                            param.args[0] = wantAngle;
+                        }
+                    } catch (Throwable ignored) {
+                    }
                     // v2.5.16: kedge (keyguard-only multiplier). The wide
                     // refraction band the lock screen needs (x1.4) washed out
                     // the shade cards when applied globally — the user reads
                     // the shade as "a bit too bright". sKgCardNow is raised by
                     // the turnOnViewBlur gate around keyguard-card recipes.
-                    float scale = sKgCardNow ? sKgEdgeScale : sEdgeScale;
+                    // v2.5.2: 再乘一项精细权重（边缘光宽度）。
+                    float scale = (sKgCardNow ? sKgEdgeScale : sEdgeScale)
+                            * fineF(Cfg.F_HL_THICK);
                     if (Math.abs(scale - 1.0f) <= 0.001f) {
                         return;
                     }
@@ -1484,6 +2417,9 @@ public final class GlassHook implements IXposedHookLoadPackage {
                     }
                     if (!Cfg.isOn(Cfg.K_GLASS)) return;
                     refreshProps();
+                    // 跟构造器那边同一个道理：系统线/锁屏线关掉时边缘光亮度必须原样。
+                    boolean lineOk = sKgCardNow ? sKgOn : sSysOn;
+                    if (!lineOk) return;
                     int c = (Integer) param.args[0];
                     int alpha = (c >>> 24) & 0xFF;
                     if (sRimCount < 4) {
@@ -1494,19 +2430,22 @@ public final class GlassHook implements IXposedHookLoadPackage {
                     // 注意这里是 abs 而不是 >=：sRimScale 的 DIY 上限是 2.0，
                     // 用 >=0.999 会把「放大」整段跳过（滑条拖过 50% 就没反应）。
                     // 同一个方法上面 5 行的 sEdgeScale 用的就是 abs，这里早先是笔误。
-                    if (Math.abs(sRimScale - 1.0f) <= 0.001f || alpha == 0) {
+                    // v2.5.2：边缘光亮度再叠一层精细权重。
+                    float rimK = sRimScale * fineF(Cfg.F_HL_ALPHA);
+                    if (Math.abs(rimK - 1.0f) <= 0.001f || alpha == 0) {
                         return;
                     }
                     // 配合上面的 abs：现在 scale 可以 >1，alpha*scale 会超过 255，
                     // 不钳制会让 <<24 溢出到颜色位（边框反而变透明）。
-                    int na = Math.max(0, Math.min(255, Math.round(alpha * sRimScale)));
+                    int na = Math.max(0, Math.min(255, Math.round(alpha * rimK)));
                     param.args[0] = (na << 24) | (c & 0xFFFFFF);
                 }
             });
 
             log("ok: EdgeLightParamEx rim-width installed");
         } catch (Throwable t) {
-            log("skip: EdgeLightParamEx missing (" + t.getClass().getSimpleName() + ")");
+            sRimHooked.set(false);   // 允许下次重试
+            Diag.note("skip: EdgeLightParamEx hook failed (" + t.getClass().getSimpleName() + ")");
         }
     }
 
