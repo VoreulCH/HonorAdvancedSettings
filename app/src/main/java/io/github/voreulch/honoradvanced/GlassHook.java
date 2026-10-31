@@ -2,7 +2,6 @@ package io.github.voreulch.honoradvanced;
 
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Array;
-import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.Set;
 import java.util.WeakHashMap;
@@ -37,38 +36,20 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * hook big methods that cannot be inlined (getTransparentModeState /
  * initBulrParams / constructors) and rewrite the FIELDS the renderers read.
  *
- * All levers are live system properties (2s TTL cache) — setprop takes effect
- * without restart and OVERRIDES the built-in default; clear a prop (setprop X
- * "") to return to the baked value. The baked defaults ARE the final
- * calibrated recipe (2026-10-09): radius .7 / mask .7 / sat 1.2 / nmask .4 /
- * folder on / tblur .6 / thick 1.4 / edge 1.4 / disp .25, keyguard chain on
- * with kbblur 4 / kveil .7 / kbbright .1 / kedge 1.4 — a fresh install
- * reproduces the approved look with zero setprop. kdiag stays default-off
- * (pure logging). Full history & pipeline analysis: lg/HANDOFF.md.
+ * Tuning since v2.0.0: switches + DIY sliders come through Cfg (written by
+ * SettingsActivity over CfgProvider; glass scopes freeze the snapshot for the
+ * process lifetime). The baked DEFAULT_* constants ARE the approved recipe
+ * (2026-10-09 calibrated, 2026-10-28 defaults re-tuned): radius .5 / mask
+ * .65 / sat 1.2 / nmask .4 / refract 1.0 / edge 1.4 / rim 1.0 / tblur .6 /
+ * thick 1.4 / disp .25; keyguard chain kbblur 2.0 / kveil .2 / kbbright .1 /
+ * kedge 1.4; banner blur .5. NO system properties are read: the old
+ * persist.sys.lgr.* tuning/debug namespace is retired. Full history:
+ * lg/HANDOFF.md.
  *
- * Panel / global look (persist.sys.lgr.*):
- *   radius  panel-background blur radius scale
- *   mask    mask alpha scale (panel veil + card masks)
- *   sat     panel bitmap saturation
- *   nmask   notification-card readability tint (absolute alpha)
- *   refract / thick / disp / rim  glass optics (lens bending, band width,
- *                                  chromatic fringe, rim-light alpha)
- *   edge    edge-light band width (all surfaces)
- *   tblur   per-surface re-blur (tiles / notification cards)
- *   folder  launcher-folder-style refraction constants
- *   degree  uikit degree algorithm transparency
- *
- * Keyguard (lock screen) — default OFF, enable with setprop 1:
- *   kbg      retain/serve the keyguard blur bitmap (getCurrentBlurBitmapForBg)
- *   kbblur   >0: serve a light bitmap synthesized from the SHARP wallpaper
- *            with this quarter-res blur radius (the approved look; 0 = stock
- *            bokeh)
- *   kveil    keyguard-only multiplier on the baked #1A1A1A veil
- *   kbbright keyguard card face brightness (stock shade value +0.08)
- *   kedge    keyguard-only edge-light width multiplier
- *   keng     push captured bitmaps through the engine onWallpaperChanged
- *   kicon    toolbox buttons: redirect to the ViewEx blurIcon route
- *   kdiag    pure-observation logging of the keyguard glass chain
+ * Line gating: the glass master switch (glass) owns the system-level base
+ * render (HIGH tier, LIQUID bits, texture/degree forcing); the system /
+ * keyguard / gallery lines each add their own switch on top; glass_extreme
+ * (DIY mode) swaps the fixed constants for the 14 percent sliders.
  *
  * Safety rules (learned the hard way):
  *   - No Class.forName(initialize=true) in handleLoadPackage — it ran the
@@ -116,15 +97,11 @@ public final class GlassHook implements IXposedHookLoadPackage {
     private static final int BLUR_TYPE_FROSTED = 0x10000;
     private static final int BLUR_TYPE_LIQUID = 0x20000;
 
-    private static final String KDIAG_PROP = "persist.sys.lgr.kdiag";
     private static final String NBVM_CLASS =
             "com.android.magic.blur.NotificationBackgroundViewModel";
     // Baked-in values = the final calibrated recipe (2026-10-09/10, user
-    // approved). persist.sys.lgr.* tuning props are deliberately NOT read:
-    // that namespace is shared with debug shell scripts and got zeroed by a
-    // mangled one-liner twice (kveil/kbblur card color shock). Tuning now =
-    // edit the constant + rebuild; the only live prop left is kdiag (debug
-    // logging flag — harmless if polluted).
+    // approved). No system properties are read: tuning = edit the constant
+    // + rebuild.
     private static final int DEFAULT_DEGREE = 85;
     private static final float DEFAULT_RADIUS = 0.5f;
     private static final float DEFAULT_MASK = 0.65f;
@@ -135,9 +112,6 @@ public final class GlassHook implements IXposedHookLoadPackage {
     private static final float DEFAULT_RIM = 1.0f;
     private static final float DEFAULT_TBLUR = 0.6f;
 
-    // extreme liquid mode: mask/tblur/nmask all 0.1 — near-transparent glass,
-    // very low readability. Opt-in (K_GLASS_EXTREME).
-    private static final float DEFAULT_KMASK = 0.6f;
     private static final float DEFAULT_THICK = 1.4f;
     private static final float DEFAULT_DISP = 0.25f;
     private static final int DEFAULT_GSCENE = 16;
@@ -150,20 +124,18 @@ public final class GlassHook implements IXposedHookLoadPackage {
     private static final float DEFAULT_KEDGE = 1.4f;
     // heads-up banner (initBulrParams case=3): stock brightness is 0.0
     // with fully transparent ntf colors — the banner floats on the sharp
-    // desktop and reads washed-out. Darken via brightness only (dark-but-
-    // clear, the kbbright lesson: veil/tint dims turn to fog) and give the
-    // banner its own blur scale — slightly softer than the tile pass so
-    // the banner doesn't feel thin, without touching the finalized
-    // panel/tile look.
-    private static final float DEFAULT_BANNER_BRIGHT = -0.15f;
+    // desktop and reads washed-out. Brightness is deliberately left to the
+    // system (the stock value follows day/night mode and the heads-up text
+    // auto-inverts against it; forcing a dark value made the banner dark and
+    // the still-black text unreadable). Give the banner its own blur scale —
+    // slightly softer than the tile pass so the banner doesn't feel thin,
+    // without touching the finalized panel/tile look.
     private static final float DEFAULT_BANNER_BLUR = 0.5f;
 
     private static boolean sFlipLogged = false;
     private static boolean sTextureLogged = false;
     private static boolean sDegreeLogged = false;
     private static boolean sConfigLogged = false;
-    private static int sConfigDiagCount = 0;
-    private static int sTextureDiagCount = 0;
     private static int sStateCount = 0;
     private static int sRadiusCount = 0;
     private static int sMaskCount = 0;
@@ -194,17 +166,13 @@ public final class GlassHook implements IXposedHookLoadPackage {
     private static ClassLoader sAppCl;
     private static boolean sKgHooksInstalled;
     private static boolean sGlassExtreme;
-    private static int sDiagKg = 0;
-    private static int sDiagBg = 0;
-    private static ClassLoader sLpCl;
-    private static boolean sClProbed;
-    private static boolean sKeyguardDiag = false;
+    private static int sTextInvertLogged = 0;
     private static boolean sKeyguardBg = false;
     private static boolean sKgEngineNotify = false;
     private static boolean sKgIconFallback = false;
     private static float sKgBlurRadius = 0.0f;
     private static float sKgVeilScale = 1.0f;
-    private static float sKgBrightness = 0.12f;
+    private static float sKgBrightness = 0.1f;
     private static float sKgEdgeScale = 1.0f;
     // gscene = scene bitmask replacing the photo page toolbar's stock MATTE
     // (16384) scene, e.g. 16 Immersive (main-page look), 80 Immersive|
@@ -212,11 +180,6 @@ public final class GlassHook implements IXposedHookLoadPackage {
     private static int sGalleryScene = 0;
     // gbar = clear photo-page top/bottom bar backgrounds (the black strips).
     private static boolean sGalleryBar = false;
-    // gblur/gveil = optional calibration multipliers for the photo toolbar's
-    // stock LiquidSmall repo (on top of the global radius/mask scales).
-    // 1.0 = neutral, i.e. the pure stock liquid glass.
-    private static float sGalBlurScale = 1.0f;
-    private static float sGalVeilScale = 1.0f;
     private static int sGalSceneLogged = 0;
     // toolbars already planted with clearBg=true (WeakHashMap dedup) — plant
     // once per toolbar instance; later style passes only need the scene swap
@@ -246,7 +209,6 @@ public final class GlassHook implements IXposedHookLoadPackage {
     private static int sKgBgAppliedGen = -1;
     private static int sKgBgLogged = 0;
     private static int sKgBgServed = 0;
-    private static int sDiagPwc = 0;
     private static final java.util.HashMap<String, Integer> sMissCounts =
             new java.util.HashMap<String, Integer>();
     private static int sKgIconLogged = 0;
@@ -254,21 +216,11 @@ public final class GlassHook implements IXposedHookLoadPackage {
     private static final java.util.ArrayList<IconTarget> sIconTargets =
             new java.util.ArrayList<IconTarget>();
     private static int sTileBlurLogged = 0;
-    private static int sDiagIcon = 0;
-    private static int sDiagIconBg = 0;
-    private static int sDiagBmp = 0;
-    private static int sDiagReinit = 0;
-    private static int sDiagPstate = 0;
-    private static int sDiagStp = 0;
-    private static int sDiagGlass = 0;
-    private static int sDiagMat = 0;
-    private static int sDiagTbv = 0;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         ClassLoader cl = lpparam.classLoader;
-        sLpCl = cl;
-        log("[HAS] glass v2.0.2 in process: " + lpparam.packageName);
+        log("[HAS] glass v2.1.2 in process: " + lpparam.packageName);
 
         hookTransparentMode(cl);
         hookBlurParams(cl);
@@ -281,9 +233,10 @@ public final class GlassHook implements IXposedHookLoadPackage {
         hookMachineConfig(cl);
         hookStyleType(cl);
         if ("com.android.systemui".equals(lpparam.packageName)) {
-            // keyguard hooks deferred to the first setHnMaterial callback —
-            // the OTA emptied lpparam.classLoader (framework classes only),
-            // so loading app-dex classes here always fails.
+            // keyguard app hooks are deferred to the BlurParametersConfig
+            // initBulrParams callback: the OTA left lpparam.classLoader with
+            // framework classes only, while that callback exposes the real
+            // app class loader (sAppCl / kg-deferred block).
             hookNtfCardGate(cl);
             hookTextColor();
         }
@@ -307,7 +260,7 @@ public final class GlassHook implements IXposedHookLoadPackage {
      * the freshly-opened browser kept its white XML/stock backgrounds — the
      * album-path white-bars bug. Walk the whole tree and null them all.
      */
-    private static void clearGalleryBars(View bottomBar, View topBar, View root) {
+    private static void clearGalleryBars(View root) {
         if (root == null) {
             return;
         }
@@ -402,7 +355,7 @@ public final class GlassHook implements IXposedHookLoadPackage {
                         // clear them here, before the stock styling and the
                         // first frame
                         if (sGalleryBar) {
-                            clearGalleryBars(null, null, (View) tb0.getRootView());
+                            clearGalleryBars((View) tb0.getRootView());
                         }
                         if (sGalSceneLogged < 6) {
                             sGalSceneLogged++;
@@ -653,7 +606,6 @@ public final class GlassHook implements IXposedHookLoadPackage {
         sTileBlurScale = sys ? (diy ? diyF(Cfg.D_TBLUR, 1.0f) : DEFAULT_TBLUR) : 1.0f;
         sBannerBlur = sys ? (diy ? diyF(Cfg.D_BBLUR, 1.0f) : DEFAULT_BANNER_BLUR) : 1.0f;
         sBannerOn = sys;
-        sKeyguardDiag = readDiagFlag();
         // keyguard line: buttons (kbg/keng/kicon) + cards (kbblur/kveil/
         // kbbright/kedge) merged under one switch; off = neutral.
         boolean kg = kgOn();
@@ -668,8 +620,6 @@ public final class GlassHook implements IXposedHookLoadPackage {
         boolean gal = galOn();
         sGalleryScene = gal ? DEFAULT_GSCENE : 0;
         sGalleryBar = gal;
-        sGalBlurScale = 1.0f;
-        sGalVeilScale = 1.0f;
     }
 
     /**
@@ -772,9 +722,7 @@ public final class GlassHook implements IXposedHookLoadPackage {
                 protected void afterHookedMethod(MethodHookParam param) {
                     if (!sysOn() || galOn()) return;
                     refreshProps();
-                    if (sRadiusScale >= 0.999f && sMaskScale >= 0.999f
-                            && Math.abs(sGalBlurScale - 1.0f) <= 0.001f
-                            && Math.abs(sGalVeilScale - 1.0f) <= 0.001f) {
+                    if (sRadiusScale >= 0.999f && sMaskScale >= 0.999f) {
                         return;
                     }
                     try {
@@ -785,7 +733,6 @@ public final class GlassHook implements IXposedHookLoadPackage {
                         }
                         scaleBlurParam(repo, "lightBlurParam", colorHelper);
                         scaleBlurParam(repo, "darkBlurParam", colorHelper);
-                        applyGalCalib(repo, colorHelper);
                         if (sUikitCount < 6) {
                             sUikitCount++;
                             log("uikit: repo=" + repo.getClass().getSimpleName()
@@ -800,66 +747,6 @@ public final class GlassHook implements IXposedHookLoadPackage {
             log("ok: uikit degree algorithm scaling installed");
         } catch (Throwable t) {
             log("skip: uikit degree algorithm missing (" + t.getClass().getSimpleName() + ")");
-        }
-    }
-
-    /**
-     * v2.5.28 photo-page calibration. The photo toolbar's stock repo
-     * (LiquidSmallOnHighImmersive) renders the stock liquid glass the user
-     * approved; gblur/gveil are optional multipliers (default 1.0 = no-op)
-     * on top of the global radius/mask scales. Applied to LiquidSmall repos
-     * only — the photo toolbar and main-page top bar share that repo class.
-     */
-    private static void applyGalCalib(Object repo, Class<?> colorHelper) {
-        if (Math.abs(sGalBlurScale - 1.0f) <= 0.001f
-                && Math.abs(sGalVeilScale - 1.0f) <= 0.001f) {
-            return;
-        }
-        try {
-            if (!repo.getClass().getSimpleName().startsWith("LiquidSmall")) {
-                return;
-            }
-            for (String f : new String[]{"lightBlurParam", "darkBlurParam"}) {
-                Object p = XposedHelpers.getObjectField(repo, f);
-                if (p == null) {
-                    continue;
-                }
-                if (Math.abs(sGalBlurScale - 1.0f) > 0.001f) {
-                    float r = XposedHelpers.getFloatField(p, "radius");
-                    XposedHelpers.setFloatField(p, "radius",
-                            Math.max(0.5f, r * sGalBlurScale));
-                }
-                if (Math.abs(sGalVeilScale - 1.0f) > 0.001f) {
-                    int[] alphas = (int[]) XposedHelpers.getObjectField(p, "alphas");
-                    int[] rgbs = (int[]) XposedHelpers.getObjectField(p, "RGBs");
-                    if (alphas != null && rgbs != null && alphas.length == rgbs.length) {
-                        int[] na = new int[alphas.length];
-                        for (int i = 0; i < alphas.length; i++) {
-                            na[i] = Math.max(0, Math.min(255,
-                                    Math.round(alphas[i] * sGalVeilScale)));
-                        }
-                        XposedHelpers.setObjectField(p, "alphas", na);
-                        Object mask = XposedHelpers.callStaticMethod(
-                                colorHelper, "composeColors", rgbs, na);
-                        XposedHelpers.setObjectField(p, "maskColors", mask);
-                    }
-                }
-            }
-            if (Math.abs(sGalVeilScale - 1.0f) > 0.001f) {
-                for (String f : new String[]{"lightGlassParam", "darkGlassParam"}) {
-                    Object p = XposedHelpers.getObjectField(repo, f);
-                    if (p == null) {
-                        continue;
-                    }
-                    int mc = XposedHelpers.getIntField(p, "maskColor");
-                    int a = Math.max(0, Math.min(255,
-                            Math.round(((mc >>> 24) & 0xFF) * sGalVeilScale)));
-                    XposedHelpers.setIntField(p, "maskColor",
-                            (mc & 0x00FFFFFF) | (a << 24));
-                }
-            }
-        } catch (Throwable t) {
-            log("gal calib failed: " + t);
         }
     }
 
@@ -902,60 +789,16 @@ public final class GlassHook implements IXposedHookLoadPackage {
                     if (!Cfg.isOn(Cfg.K_GLASS)) return;
                     refreshProps();
                     Object o = param.thisObject;
-                    // one-shot CL probe: find which ClassLoader can load the
-                    // keyguard app classes (lpparam.classLoader is empty after
-                    // the OTA — this finds the real app CL).
-                    if (!sClProbed) {
-                        sClProbed = true;
-                        String tgt = "com.hihonor.keyguard.wallpaper.KeyguardWallpaper";
-                        ClassLoader ocl = o.getClass().getClassLoader();
-                        ClassLoader[] cls = {sLpCl,
-                                Thread.currentThread().getContextClassLoader(),
-                                ocl, ocl == null ? null : ocl.getParent(), null};
-                        String[] nm = {"lpparam", "thread-ctx", "obj", "obj-parent", "app"};
-                        try {
-                            Class<?> at = Class.forName("android.app.ActivityThread");
-                            Object cat = at.getMethod("currentActivityThread").invoke(null);
-                            Object app = at.getMethod("getApplication").invoke(cat);
-                            if (app != null) cls[4] = app.getClass().getClassLoader();
-                        } catch (Throwable ignored) {}
-                        for (int i = 0; i < cls.length; i++) {
-                            ClassLoader c = cls[i];
-                            String tag = c == null ? "null" : c.getClass().getName();
-                            String r;
-                            if (c == null) r = "null CL";
-                            else try { c.loadClass(tgt); r = "FOUND"; }
-                                catch (Throwable t) { r = "miss"; }
-                            log("probe[" + nm[i] + "] " + tag + " -> " + r);
-                        }
-                    }
                     // deferred keyguard hooks: lpparam.classLoader is empty
-                    // (DexPathList[[]]) but probe[obj] FOUND the app CL via the
-                    // BlurParams config object — use it for the keyguard app
-                    // hooks (KeyguardWallpaper/ViewBlur/ToolBoxView/...).
+                    // (DexPathList[[]]); the BlurParams config object's CL is
+                    // the real app CL (KeyguardWallpaper/ViewBlur/... hooks).
                     if (!sKgHooksInstalled) {
                         sKgHooksInstalled = true;
                         sAppCl = o.getClass().getClassLoader();
                         log("kg-deferred: app CL via obj = " + sAppCl.getClass().getName());
                         try { hookKeyguardBgBitmap(sAppCl); } catch (Throwable t) { log("kg-deferred bg fail: " + t); }
                         try { hookKeyguardIconFallback(sAppCl); } catch (Throwable t) { log("kg-deferred icon fail: " + t); }
-                        try { hookKeyguardDiagnostics(sAppCl); } catch (Throwable t) { log("kg-deferred diag fail: " + t); }
                         try { hookPanelVeil(sAppCl); } catch (Throwable t) { log("kg-deferred panelveil fail: " + t); }
-                    }
-                    // diag: dump every type==2 glass config (z branch + mask
-                    // color) to see which recipe the keyguard widgets/buttons
-                    // actually render with.
-                    if (param.args.length >= 1 && param.args[0] instanceof Integer
-                            && (Integer) param.args[0] == 2 && sDiagBg < 60) {
-                        sDiagBg++;
-                        try {
-                            Object m = XposedHelpers.getObjectField(o, "liauidGlassMaskColor");
-                            String z = param.args.length >= 3 ? String.valueOf(param.args[2]) : "?";
-                            float b = XposedHelpers.getFloatField(o, "liauidGlassNtfbrightness");
-                            log("diag-bp type2 z=" + z + " mask=0x" + Integer.toHexString(
-                                    m instanceof Integer ? (Integer) m : 0) + " bright=" + b);
-                        } catch (Throwable ignored) {
-                        }
                     }
                     if (sKgBlurRadius > 0.01f && param.args.length >= 3
                             && Boolean.TRUE.equals(param.args[2])
@@ -1240,8 +1083,8 @@ public final class GlassHook implements IXposedHookLoadPackage {
                     if (v instanceof android.widget.TextView) {
                         if (isWallpaperDark(((android.widget.TextView) v).getContext())) {
                             param.args[0] = 0xFFF0F0F0;
-                            if (sDiagKg < 10) {
-                                sDiagKg++;
+                            if (sTextInvertLogged < 10) {
+                                sTextInvertLogged++;
                                 log("text-invert dark->light on " + v.getClass().getSimpleName());
                             }
                         }
@@ -1313,10 +1156,6 @@ public final class GlassHook implements IXposedHookLoadPackage {
                         return;
                     }
                     int orig = (Integer) r;
-                    if (sConfigDiagCount < 5) {
-                        sConfigDiagCount++;
-                        log("diag: getTransparentMode raw=0x" + Integer.toHexString(orig));
-                    }
                     if ((orig & BLUR_TYPE_MASK) == BLUR_TYPE_FROSTED) {
                         param.setResult((orig & ~BLUR_TYPE_MASK) | BLUR_TYPE_LIQUID);
                         if (!sConfigLogged) {
@@ -1346,10 +1185,6 @@ public final class GlassHook implements IXposedHookLoadPackage {
                 protected void afterHookedMethod(MethodHookParam param) {
                     if (!glassOn()) return;
                     int orig = (Integer) param.getResult();
-                    if (sTextureDiagCount < 5) {
-                        sTextureDiagCount++;
-                        log("diag: getTransparentTexture raw=" + orig);
-                    }
                     if (orig != 2) {
                         param.setResult(2);
                         if (!sTextureLogged) {
@@ -1379,23 +1214,6 @@ public final class GlassHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             log("skip: framework UiModeManagerEx missing ("
                     + t.getClass().getSimpleName() + ")");
-        }
-    }
-
-    /** kdiag is the one live prop: a debug-logging flag, read through a
-     *  cached reflective handle (SystemProperties.get is not public API). */
-    private static Method sSysPropGet;
-
-    private static boolean readDiagFlag() {
-        try {
-            if (sSysPropGet == null) {
-                sSysPropGet = Class.forName("android.os.SystemProperties")
-                        .getMethod("get", String.class, String.class);
-            }
-            String v = (String) sSysPropGet.invoke(null, KDIAG_PROP, "0");
-            return Float.parseFloat(v) > 0.5f;
-        } catch (Throwable t) {
-            return false;
         }
     }
 
@@ -1658,8 +1476,8 @@ public final class GlassHook implements IXposedHookLoadPackage {
      * Cached against the drawable identity + screen size; regenerated only
      * when the wallpaper actually changes.
      *
-     * Safety: default OFF via persist.sys.lgr.kbg. Pure addition — when
-     * stock returns a bitmap (dynamic wallpaper) this hook does nothing.
+     * Gated by the keyguard glass switch. Pure addition — when stock
+     * returns a bitmap (dynamic wallpaper) this hook does nothing.
      * No early init: fires only while the keyguard is already laid out.
      */
     private static void hookKeyguardBgBitmap(ClassLoader cl) {
@@ -1747,24 +1565,12 @@ public final class GlassHook implements IXposedHookLoadPackage {
         // hook 2: wallpaper-ready fallback. If the stock BokehDrawable path
         // never produces a bitmap, build one via src-based synthesis when
         // processWallpaperChange finishes assigning the wallpaper, then push
-        // it through the stock re-apply sequence. Also pure-observation
-        // logging (kdiag) so we can see when pwc actually fires.
+        // it through the stock re-apply sequence.
         XposedBridge.hookAllMethods(kgw, "processWallpaperChange", new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam param) {
                 if (!kgOn()) return;
                 refreshProps();
-                if (sKeyguardDiag && sDiagPwc < 10) {
-                    sDiagPwc++;
-                    Object src = null;
-                    try {
-                        src = XposedHelpers.getObjectField(
-                                param.thisObject, "mCurrentBackgroundWallpaper");
-                    } catch (Throwable ignored) {
-                    }
-                    log("diag pwc fired: src=" + (src == null
-                            ? "null" : src.getClass().getSimpleName()));
-                }
                 if (!sKeyguardBg) {
                     return;
                 }
@@ -1807,9 +1613,9 @@ public final class GlassHook implements IXposedHookLoadPackage {
      * for light backgrounds). Pure stock code paths; if the reflective call
      * throws we leave the original 3-arg invocation untouched.
      *
-     * Safety: default OFF via persist.sys.lgr.kicon. No field writes, no
-     * extra class init (ViewBlur is only touched when the keyguard is
-     * already laying out icons).
+     * Gated by the keyguard glass switch. No field writes, no extra class
+     * init (ViewBlur is only touched when the keyguard is already laying out
+     * icons).
      */
     private static void hookKeyguardIconFallback(ClassLoader cl) {
         final Class<?> vb;
@@ -2285,309 +2091,4 @@ public final class GlassHook implements IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * v2.4.2: pure-observation hooks for the lockscreen glass chain. ZERO
-     * behavior change — every hook only logs, and only while
-     * persist.sys.lgr.kdiag=1 (2s TTL, default off). SystemUI process only.
-     *
-     * One lock/unlock cycle with kdiag=1 answers:
-     *   - blurIcon: are the toolbox shortcut buttons blurred, with z
-     *     (transparent-mode flag) true, and what do isLiquidGlassType /
-     *     isTransparentModeOpen return LIVE (settings say material=2 /
-     *     switch=1 — verify at runtime, not just via adb settings);
-     *   - blurIconBackground: same for the circle buttons that take the
-     *     8-arg path (z3 && z gates the material branch);
-     *   - getCurrentBlurBitmapForBg: is the sampling bitmap alive — NULL
-     *     means the color-pick wallpaper drawable is NOT a BokehDrawable
-     *     (static system wallpaper) and every glass surface has nothing to
-     *     refract, which would explain flat buttons AND flat cards at once;
-     *   - reInitBlurTextBitmap: static re-init vs realtime-engine feed;
-     *   - processState / shouldTakeProvider: what glassType / isWindowBlur /
-     *     blurBitmap the keyguard card provider actually produces;
-     *   - GlassParamEx ctor + HnMaterialManager.setHnMaterial: which views
-     *     actually end up carrying a liquid material.
-     */
-    private static void hookKeyguardDiagnostics(ClassLoader cl) {
-        final Class<?> kbu;
-        try {
-            kbu = cl.loadClass("com.hihonor.keyguard.util.KeyguardBlurUtils");
-        } catch (Throwable t) {
-            log("skip: diag KeyguardBlurUtils missing: " + t);
-            return;
-        }
-
-        try {
-            Class<?> vb = XposedHelpers.findClass("com.hihonor.keyguard.support.ViewBlur", cl);
-            XposedBridge.hookAllMethods(vb, "blurIcon", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    if (param.args.length != 3 || !(param.args[0] instanceof View)) {
-                        return;
-                    }
-                    if (!kgOn()) return;
-                    refreshProps();
-                    if (!sKeyguardDiag || sDiagIcon >= 80) {
-                        return;
-                    }
-                    sDiagIcon++;
-                    try {
-                        View v = (View) param.args[0];
-                        boolean liquid = false;
-                        boolean open = false;
-                        try {
-                            liquid = (Boolean) XposedHelpers.callStaticMethod(kbu, "isLiquidGlassType",
-                                    new Class[]{Context.class}, v.getContext());
-                        } catch (Throwable ignored) {
-                        }
-                        try {
-                            open = (Boolean) XposedHelpers.callStaticMethod(kbu, "isTransparentModeOpen");
-                        } catch (Throwable ignored) {
-                        }
-                        log("diag blurIcon: " + v.getClass().getSimpleName()
-                                + " z=" + param.args[2]
-                                + " liquid=" + liquid + " open=" + open);
-                    } catch (Throwable t) {
-                        log("diag blurIcon failed: " + t);
-                    }
-                }
-            });
-            XposedBridge.hookAllMethods(vb, "blurIconBackground", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    if (param.args.length != 8 || !(param.args[1] instanceof View)) {
-                        return;
-                    }
-                    if (!kgOn()) return;
-                    refreshProps();
-                    if (!sKeyguardDiag || sDiagIconBg >= 40) {
-                        return;
-                    }
-                    sDiagIconBg++;
-                    log("diag blurIconBg: " + ((View) param.args[1]).getClass().getSimpleName()
-                            + " bmp=" + (param.args[0] == null ? "null" : "set")
-                            + " z=" + param.args[4] + " z2=" + param.args[5] + " z3=" + param.args[6]);
-                }
-            });
-            log("ok: diag ViewBlur installed");
-        } catch (Throwable t) {
-            log("skip: diag ViewBlur missing (" + t.getClass().getSimpleName() + ")");
-        }
-
-        try {
-            Class<?> kgw = cl.loadClass("com.hihonor.keyguard.wallpaper.KeyguardWallpaper");
-            XposedBridge.hookAllMethods(kgw, "getCurrentBlurBitmapForBg", new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    if (!kgOn()) return;
-                    refreshProps();
-                    if (!sKeyguardDiag || sDiagBmp >= 400) {
-                        return;
-                    }
-                    sDiagBmp++;
-                    Object r = param.getResult();
-                    if (r instanceof Bitmap) {
-                        Bitmap b = (Bitmap) r;
-                        log("diag blurBmpForBg: " + b.getWidth() + "x" + b.getHeight()
-                                + (b.isRecycled() ? " RECYCLED" : ""));
-                    } else {
-                        log("diag blurBmpForBg: NULL");
-                    }
-                }
-            });
-            log("ok: diag KeyguardWallpaper installed");
-        } catch (Throwable t) {
-            log("skip: diag KeyguardWallpaper missing (" + t.getClass().getSimpleName() + ")");
-        }
-
-        try {
-            Class<?> bokeh = XposedHelpers.findClass(
-                    "com.hihonor.keyguard.view.effect.bokeh.BokehDrawable", cl);
-            XposedBridge.hookAllMethods(bokeh, "reInitBlurTextBitmap", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    if (!kgOn()) return;
-                    refreshProps();
-                    if (!sKeyguardDiag || sDiagReinit >= 6) {
-                        return;
-                    }
-                    sDiagReinit++;
-                    log("diag reInitBlurText: arg="
-                            + (param.args.length > 0 && param.args[0] == null
-                            ? "null(static-path)" : "bitmap(realtime)"));
-                }
-            });
-            log("ok: diag BokehDrawable installed");
-        } catch (Throwable t) {
-            log("skip: diag BokehDrawable missing (" + t.getClass().getSimpleName() + ")");
-        }
-
-        try {
-            Class<?> kgp = XposedHelpers.findClass(
-                    "com.android.magic.blur.KeyguardBusinessDataProvider", cl);
-            XposedBridge.hookAllMethods(kgp, "processState", new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    if (!kgOn()) return;
-                    refreshProps();
-                    if (!sKeyguardDiag || sDiagPstate >= 80) {
-                        return;
-                    }
-                    sDiagPstate++;
-                    try {
-                        Object cfg = param.args[0];
-                        Object bmp = XposedHelpers.getObjectField(cfg, "blurBitmap");
-                        boolean tmmOn = false;
-                        boolean tmmLiquid = false;
-                        try {
-                            Class<?> tmm = XposedHelpers.findClass(TMM_CLASS, cl);
-                            Object inst = XposedHelpers.callStaticMethod(tmm, "getInstance");
-                            tmmOn = (Boolean) XposedHelpers.callMethod(inst, "isTransparentModeOn");
-                            tmmLiquid = (Boolean) XposedHelpers.callMethod(inst, "isLiquidBlurType");
-                        } catch (Throwable ignored) {
-                        }
-                        log("diag kg-processState: glassType=" + XposedHelpers.getIntField(cfg, "glassType")
-                                + " windowBlur=" + XposedHelpers.getBooleanField(cfg, "isWindowBlur")
-                                + " noProvider=" + XposedHelpers.getBooleanField(cfg, "isNotSelectProvider")
-                                + " ccExpand=" + XposedHelpers.getBooleanField(cfg, "isKerguardContrlCenterExpand")
-                                + " blurBmp=" + (bmp == null ? "null" : "set")
-                                + " tmmOn=" + tmmOn + " tmmLiquid=" + tmmLiquid);
-                    } catch (Throwable t) {
-                        log("diag processState failed: " + t);
-                    }
-                }
-            });
-            XposedBridge.hookAllMethods(kgp, "shouldTakeProvider", new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    if (!kgOn()) return;
-                    refreshProps();
-                    if (!sKeyguardDiag || sDiagStp >= 80) {
-                        return;
-                    }
-                    sDiagStp++;
-                    log("diag kg-shouldTakeProvider -> " + param.getResult());
-                }
-            });
-            log("ok: diag KeyguardBusinessDataProvider installed");
-        } catch (Throwable t) {
-            log("skip: diag KeyguardBusinessDataProvider missing (" + t.getClass().getSimpleName() + ")");
-        }
-
-        try {
-            Class<?> tbv = XposedHelpers.findClass(
-                    "com.hihonor.keyguard.view.widget.ToolBoxView", cl);
-            XposedBridge.hookAllMethods(tbv, "improveVisibility", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    if (!kgOn()) return;
-                    refreshProps();
-                    if (!sKeyguardDiag || sDiagTbv >= 12) {
-                        return;
-                    }
-                    sDiagTbv++;
-                    log("diag toolbox improveVisibility");
-                }
-            });
-            log("ok: diag ToolBoxView installed");
-        } catch (Throwable t) {
-            log("skip: diag ToolBoxView missing (" + t.getClass().getSimpleName() + ")");
-        }
-
-        try {
-            Class<?> glass = XposedHelpers.findClass(
-                    "com.hihonor.android.graphics.material.atomiceffect.GlassParamEx", cl);
-            XposedBridge.hookAllConstructors(glass, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    if (!kgOn()) return;
-                    refreshProps();
-                    if (!sKeyguardDiag || sDiagGlass >= 200) {
-                        return;
-                    }
-                    sDiagGlass++;
-                    StringBuilder sb = new StringBuilder("diag GlassParamEx(");
-                    for (int i = 0; i < param.args.length; i++) {
-                        if (i > 0) {
-                            sb.append(",");
-                        }
-                        sb.append(param.args[i]);
-                    }
-                    log(sb.append(")").toString());
-                }
-            });
-            log("ok: diag GlassParamEx installed");
-        } catch (Throwable t) {
-            log("skip: diag GlassParamEx missing (" + t.getClass().getSimpleName() + ")");
-        }
-
-        try {
-            Class<?> hmm = XposedHelpers.findClass(
-                    "com.hihonor.android.graphics.material.HnMaterialManager", cl);
-            XposedBridge.hookAllMethods(hmm, "setHnMaterial", new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    if (!kgOn()) return;
-                    refreshProps();
-                    // deferred keyguard hooks: the OTA emptied lpparam.classLoader
-                    // (DexPathList[[]] — framework classes only). Grab the runtime
-                    // app CL from a real systemui view and install once.
-                    if (!sKgHooksInstalled && param.args.length > 0 && param.args[0] != null) {
-                        sKgHooksInstalled = true;
-                        sAppCl = param.args[0].getClass().getClassLoader();
-                        log("kg-deferred: app CL = " + sAppCl.getClass().getName());
-                        try { hookKeyguardBgBitmap(sAppCl); } catch (Throwable t) { log("kg-deferred bg fail: " + t); }
-                        try { hookKeyguardIconFallback(sAppCl); } catch (Throwable t) { log("kg-deferred icon fail: " + t); }
-                        try { hookKeyguardDiagnostics(sAppCl); } catch (Throwable t) { log("kg-deferred diag fail: " + t); }
-                    }
-                    // per-view diag: what material and mask each lockscreen
-                    // surface carries — find the lever for the dark backdrop.
-                    Object tg = param.args.length > 0 ? param.args[0] : null;
-                    Object mm = param.args.length > 1 ? param.args[1] : null;
-                    if (tg instanceof View) {
-                        String nm = ((View) tg).getClass().getName().toLowerCase();
-                        if ((nm.contains("keyguard") || nm.contains("toolbox") || nm.contains("widget")
-                                || nm.contains("notification") || nm.contains("shade") || nm.contains("panel")
-                                || nm.contains("swipe") || nm.contains("container") || nm.contains("menu"))
-                                && sDiagKg < 60) {
-                            sDiagKg++;
-                            String maskInfo = "null";
-                            if (mm != null) {
-                                try {
-                                    Object mc = XposedHelpers.getObjectField(mm, "liauidGlassMaskColor");
-                                    if (mc instanceof Integer) {
-                                        int c = (Integer) mc;
-                                        maskInfo = "mask=0x" + Integer.toHexString(c) + " a=" + (c >>> 24);
-                                    } else {
-                                        maskInfo = mm.getClass().getSimpleName();
-                                    }
-                                } catch (Throwable ignored) {
-                                    maskInfo = mm.getClass().getSimpleName();
-                                }
-                            }
-                            log("diag-kg " + ((View) tg).getClass().getSimpleName()
-                                    + " mat=" + (mm == null ? "null" : maskInfo));
-                        }
-                    }
-                    if (!sKeyguardDiag || sDiagMat >= 400) {
-                        return;
-                    }
-                    Object target = param.args.length > 0 ? param.args[0] : null;
-                    Object mat = param.args.length > 1 ? param.args[1] : null;
-                    if (target instanceof View) {
-                        sDiagMat++;
-                        log("diag setHnMaterial(view=" + ((View) target).getClass().getSimpleName()
-                                + " mat=" + (mat == null ? "null" : mat.getClass().getSimpleName()) + ")");
-                    } else if (target != null
-                            && "android.view.ViewRootImpl".equals(target.getClass().getName())) {
-                        sDiagMat++;
-                        log("diag setHnMaterial(ViewRootImpl mat="
-                                + (mat == null ? "null" : mat.getClass().getSimpleName()) + ")");
-                    }
-                }
-            });
-            log("ok: diag HnMaterialManager installed");
-        } catch (Throwable t) {
-            log("skip: diag HnMaterialManager missing (" + t.getClass().getSimpleName() + ")");
-        }
-    }
 }
