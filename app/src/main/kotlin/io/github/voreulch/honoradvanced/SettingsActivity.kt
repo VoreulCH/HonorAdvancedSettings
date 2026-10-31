@@ -6,6 +6,8 @@ import android.graphics.BitmapFactory
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -13,10 +15,13 @@ import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -24,6 +29,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -70,12 +76,36 @@ class SettingsActivity : ComponentActivity() {
         "&data=h-QBqjNfq-nswTwFBF3Mk1rluWMYzC2NCoB1da80tL95oHZq0z4yVEul" +
         "GV45rm0ntVXbG4hbek3pB84TX2seGA&svctype=4&tempid=h5_group_info"
 
-    private val scopeNames = arrayOf("系统界面", "相册", "安装器")
-    private val scopeCmds = arrayOf(
-        "killall com.android.systemui",
-        "am force-stop com.hihonor.photos",
-        "am force-stop com.android.packageinstaller"
+    /** 可重启的作用域。命令只认这里写死的包名，不拼接任何外部输入。 */
+    private data class ScopeTarget(val pkg: String, val label: String, val cmd: String)
+
+    /**
+     * 常驻/system 进程必须用 killall —— `am force-stop` 对它们**静默无效**
+     * （v2.3.0 实测：对 com.hihonor.iaware 执行后 PID 一字不变，界面却提示"已重启"，
+     * 用户于是反复看到"温控未生效"）。普通 app 仍用 force-stop，能连后台状态一起清。
+     *
+     * <p>每条都跟 {@code || true}：目标本来就没在跑时 killall 会返回非 0，一条失败就把
+     * 整批命令的退出码带成非 0，界面会谎报"重启失败"。真失败（su 被拒）仍由 su 自身的
+     * 退出码反映，兜底不影响。
+     */
+    private val scopeTargets = listOf(
+        ScopeTarget("com.android.systemui", "系统界面", "killall com.android.systemui || true"),
+        ScopeTarget("com.hihonor.photos", "相册", "am force-stop com.hihonor.photos || true"),
+        ScopeTarget("com.android.packageinstaller", "安装器",
+            "am force-stop com.android.packageinstaller || true"),
+        ScopeTarget("com.hihonor.android.launcher", "桌面",
+            "killall com.hihonor.android.launcher || true"),
+        ScopeTarget("com.hihonor.desktop.systemui", "桌面模式",
+            "killall com.hihonor.desktop.systemui || true"),
+        ScopeTarget("com.hihonor.iaware", "温控服务", "killall com.hihonor.iaware || true")
     )
+
+    // 各开关依赖的作用域（用于"作用域状态"提示）。system_server（android）读不到
+    // 模块 provider、也没法自证，所以不列进来 —— 它在开机时随进程加载。
+    private val S_SYSTEMUI = listOf("com.android.systemui")
+    private val S_PHOTOS = listOf("com.hihonor.photos")
+    private val S_INSTALLER = listOf("com.android.packageinstaller")
+    private val S_THERMAL = listOf("com.android.systemui", "com.hihonor.iaware")
 
     // switch write target shared with hooks via CfgProvider
     private fun prefs() = getSharedPreferences(Cfg.PREFS_FILE, MODE_PRIVATE)
@@ -93,7 +123,19 @@ class SettingsActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         resumeTick.intValue++
+        // 每次回到前台重读一次作用域自证（重启作用域后切回来就能看到新状态）。
+        // 再补一次 2.5s 后的强制读：用户很可能刚在 LSPosed 里重启完进程，
+        // 那时 Application 还没上报，第一次读拿到的还是旧记录。
+        try { FrameworkProbe.refresh(this) } catch (_: Throwable) {}
+        resumeProbeShot?.let { mainHandler.removeCallbacks(it) }
+        val shot = Runnable {
+            try { FrameworkProbe.refresh(this, true) } catch (_: Throwable) {}
+        }
+        resumeProbeShot = shot
+        mainHandler.postDelayed(shot, 2500L)
     }
+
+    private var resumeProbeShot: Runnable? = null
 
     private fun applyBinding(key: String, on: Boolean, restart: Boolean, onResult: ((Boolean) -> Unit)? = null) {
         try { window.decorView.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK) } catch (_: Throwable) {}
@@ -233,7 +275,8 @@ class SettingsActivity : ComponentActivity() {
                 // here would silently flip upgraders onto the extreme sliders
                 // (v1.4.20 compat incident) or enable the system_server-side
                 // notification-ducking hook unasked. Both must stay opt-in.
-                ed.putBoolean(k, k != Cfg.K_GLASS_EXTREME && k != Cfg.K_NODUCK && k != Cfg.K_HOTTEMP)
+                ed.putBoolean(k, k != Cfg.K_GLASS_EXTREME && k != Cfg.K_NODUCK &&
+                        k != Cfg.K_HOTTEMP && k != Cfg.K_DIAG)
                 dirty = true
             }
         }
@@ -249,6 +292,9 @@ class SettingsActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 主线程先触碰一次：Compose 的 mutableStateOf 建在工作线程的过期 snapshot
+        // 上会在组合阶段抛 IllegalStateException（HonorHook 踩过同样的坑）
+        FrameworkProbe.warmUp()
         migratePrefs()
         // keep the system-property bridge in sync with the stored switch
         // (first run after install, or after the pref was changed elsewhere)
@@ -381,32 +427,93 @@ class SettingsActivity : ComponentActivity() {
 
     @Composable
     private fun MinePage(go: (Page) -> Unit) {
+        val probeCtx = LocalContext.current
+        LaunchedEffect(Unit) { FrameworkProbe.refresh(probeCtx, true) }
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp)) {
             item { PageTitle("荣耀高级设置") }
             item { Subtitle("基于MagicOS11开发") }
+            item { FrameworkCard() }
             item { ActionCard("液态玻璃", "系统 / 锁屏 / 相册三线玻璃效果与总开关") { go(Page.Glass) } }
             item { ActionCard("安装器净化", "跳过安全检测、禁止联网、信息卡与降级安装") { go(Page.Installer) } }
             item { ActionCard("系统综合", "通知音量、高温限制与系统级行为的总开关集合") { go(Page.Misc) } }
             item {
-                ActionCard("重启作用域（需ROOT）", "点击申请ROOT授权，可重启系统界面 / 相册 / 安装器") { requestRootThenPickScope() }
+                ActionCard("重启作用域（需ROOT）", "可多选一次重启：系统界面 / 相册 / 安装器 / 桌面 / 温控服务") { requestRootThenPickScope() }
             }
         }
+    }
+
+    /** 首页顶部：模块在各作用域里的实际运行状态（无 root，靠进程自证上报）。 */
+    @Composable
+    private fun FrameworkCard() {
+        val st = FrameworkProbe.state
+        val ok = st.running
+        val title = when {
+            !st.probed -> "正在检测模块状态…"
+            ok -> "模块已生效"
+            else -> "模块未生效"
+        }
+        val sub = when {
+            !st.probed -> "读取作用域运行记录"
+            ok -> {
+                // powergenie 与 iaware 是同一个进程的两个包名，列表里只留一个
+                val names = st.reports.keys
+                    .filter { it != "com.hihonor.powergenie" }
+                    .joinToString(" / ") { scopeLabel(it) }
+                val at = st.reports.values.maxOfOrNull { it.at } ?: 0L
+                "已加载 $names · ${FrameworkProbe.ago(at)}上报"
+            }
+            else -> "请在 LSPosed 中启用本模块、勾选作用域，然后重启作用域或手机"
+        }
+        val accent = when {
+            !st.probed -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+            ok -> Color(0xFF2FBF6B)
+            else -> Color(0xFFE5484D)
+        }
+        Card(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp), cornerRadius = 16.dp) {
+            Row(Modifier.padding(horizontal = 18.dp, vertical = 16.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(10.dp).clip(CircleShape).background(accent))
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(title, fontSize = 17.sp, fontWeight = FontWeight.Bold,
+                        color = MiuixTheme.colorScheme.onSurface)
+                    Text(sub, fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = 3.dp))
+                }
+                Text(when { !st.probed -> "…"; ok -> "正常"; else -> "异常" },
+                    fontSize = 13.sp, color = accent)
+            }
+        }
+    }
+
+    private fun scopeLabel(pkg: String): String = when (pkg) {
+        "com.android.systemui" -> "系统界面"
+        "com.hihonor.photos" -> "相册"
+        "com.android.packageinstaller" -> "安装器"
+        "com.hihonor.android.launcher" -> "桌面"
+        "com.hihonor.desktop.systemui" -> "桌面模式"
+        "com.hihonor.powergenie" -> "PowerGenie"
+        "com.hihonor.iaware" -> "温控服务"
+        "android" -> "系统框架"
+        else -> pkg
     }
 
     // ================= Glass =================
 
     @Composable
     private fun GlassPage(back: () -> Unit) {
+        val probeCtx = LocalContext.current
+        LaunchedEffect(Unit) { FrameworkProbe.refresh(probeCtx, true) }
         var diyOn by remember { mutableStateOf(prefs().getBoolean(Cfg.K_GLASS_EXTREME, false)) }
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp)) {
             item { BackHeader("液态玻璃", back) }
             item { TipText("系统 / 锁屏 / 相册三线玻璃效果与总开关。开关改动后需重启系统界面（或重启手机）生效。") }
             item {
                 SwitchCard(listOf(
-                    SwRow("总开关", "液态玻璃总闸，含 HIGH 强制渲染、LIQUID 材质判定等系统级底层，关闭后全部回退原厂", Cfg.K_GLASS, true),
-                    SwRow("系统液态玻璃", "状态栏通知与控制中心的观感（模糊半径、遮罩、饱和度等参数）", Cfg.K_SYSTEM, true),
-                    SwRow("锁屏液态玻璃", "锁屏按钮与通知卡片的玻璃效果", Cfg.K_KEYGUARD, true),
-                    SwRow("相册液态玻璃", "相册照片页工具栏的玻璃效果", Cfg.K_GALLERY, true)
+                    SwRow("总开关", "液态玻璃总闸，含 HIGH 强制渲染、LIQUID 材质判定等系统级底层，关闭后全部回退原厂", Cfg.K_GLASS, true, scopes = S_SYSTEMUI),
+                    SwRow("系统液态玻璃", "状态栏通知与控制中心的观感（模糊半径、遮罩、饱和度等参数）", Cfg.K_SYSTEM, true, scopes = S_SYSTEMUI),
+                    SwRow("锁屏液态玻璃", "锁屏按钮与通知卡片的玻璃效果", Cfg.K_KEYGUARD, true, scopes = S_SYSTEMUI),
+                    SwRow("相册液态玻璃", "相册照片页工具栏的玻璃效果", Cfg.K_GALLERY, true, scopes = S_PHOTOS)
                 ))
             }
             item {
@@ -506,14 +613,16 @@ class SettingsActivity : ComponentActivity() {
 
     @Composable
     private fun InstallerPage(back: () -> Unit) {
+        val probeCtx = LocalContext.current
+        LaunchedEffect(Unit) { FrameworkProbe.refresh(probeCtx, true) }
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp)) {
             item { BackHeader("安装器净化", back) }
             item { TipText("跳过安全检测、禁止联网、信息卡与降级安装。开关后需重启安装器生效，降级安装需重启手机生效。") }
             item {
                 SwitchCard(listOf(
-                    SwRow("总开关", "跳过安全检测与指纹验证、禁止联网、隐藏推广及多余卡片，关闭后全部回退原厂", Cfg.K_PURIFY, false),
-                    SwRow("安装包信息卡", "展示版本 / 大小 / SDK / 架构信息卡；关闭时同时隐藏安全模式提醒", Cfg.K_INFOCARD, false),
-                    SwRow("允许降级安装", "允许安装低于当前版本号的 APK", Cfg.K_DOWNGRADE, false)
+                    SwRow("总开关", "跳过安全检测与指纹验证、禁止联网、隐藏推广及多余卡片，关闭后全部回退原厂", Cfg.K_PURIFY, false, scopes = S_INSTALLER),
+                    SwRow("安装包信息卡", "展示版本 / 大小 / SDK / 架构信息卡；关闭时同时隐藏安全模式提醒", Cfg.K_INFOCARD, false, scopes = S_INSTALLER),
+                    SwRow("允许降级安装", "允许安装低于当前版本号的 APK", Cfg.K_DOWNGRADE, false, scopes = S_INSTALLER)
                 ))
             }
             item { Footnote("开关后需重启安装器生效，降级开关需重启手机生效") }
@@ -524,6 +633,8 @@ class SettingsActivity : ComponentActivity() {
 
     @Composable
     private fun MiscPage(back: () -> Unit) {
+        val probeCtx = LocalContext.current
+        LaunchedEffect(Unit) { FrameworkProbe.refresh(probeCtx, true) }
         // bumped on every toggle so the system-layer status line re-reads the
         // property (it lives inside the switch cell, not as a separate row)
         var statusTick by remember { mutableIntStateOf(0) }
@@ -536,10 +647,11 @@ class SettingsActivity : ComponentActivity() {
                         "　属性=" + (if (prop.isNullOrEmpty()) "未写入" else prop)
                 SwitchCard(
                     rows = listOf(
-                        SwRow("屏蔽通知回避", "播放音乐时来消息通知不再压低音乐音量，通知音与音乐同时播放；闹钟不受影响", Cfg.K_NODUCK, true, false),
+                        SwRow("屏蔽通知回避", "播放音乐时来消息通知不再压低音乐音量，通知音与音乐同时播放；闹钟不受影响", Cfg.K_NODUCK, true, false, scopes = S_SYSTEMUI),
                         SwRow("屏蔽高温限制（ROOT）",
                             "系统高温时不弹提示、不限亮度、热状态按正常上报，压制 PowerGenie 温控（游戏限帧/后台清理），高温自动关机也不再触发；内核调度与降频仍由硬件层控制，本开关不干预",
-                            Cfg.K_HOTTEMP, true, false, confirmOnEnable = true, statusText = status)
+                            Cfg.K_HOTTEMP, true, false, confirmOnEnable = true,
+                            statusText = status, statusOk = prop == "1", scopes = S_THERMAL)
                     ),
                     onAfterChange = { statusTick++ }
                 )
@@ -550,9 +662,20 @@ class SettingsActivity : ComponentActivity() {
 
     // ================= About =================
 
+    /** 特别鸣谢名单。以后加人只需在这里加一行；[avatar] 指向 assets 里的图片，
+     *  找不到就显示白色圆形占位（用户后续会补图）。 */
+    private data class Credit(val name: String, val role: String, val avatar: String?)
+
+    private val credits = listOf(
+        Credit("VoreulCH · 阿影", "药师(honoradvanced) · 开发者", "img/credits/voreulch.png")
+    )
+
     @Composable
     private fun AboutPage() {
-        var donateDialog by remember { mutableStateOf(-1) } // -1 none, 0 alipay, 1 wechat, 2 qq, 3 privacy
+        // -1 none, 0 alipay, 1 wechat, 2 qq, 3 privacy, 4 credits
+        var donateDialog by remember { mutableStateOf(-1) }
+        var checking by remember { mutableStateOf(false) }
+        var diagOn by remember { mutableStateOf(prefs().getBoolean(Cfg.K_DIAG, false)) }
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp)) {
             item { PageTitle("关于") }
             item { SectionLabel("捐赠（给AI喂点Token）") }
@@ -569,8 +692,41 @@ class SettingsActivity : ComponentActivity() {
                         try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/VoreulCH/HonorAdvancedSettings"))) } catch (_: Throwable) {}
                     },
                     LinkRow("联系我们") { donateDialog = 2 },
+                    LinkRow(if (checking) "正在检查更新…" else "检查更新") {
+                        if (!checking) {
+                            checking = true
+                            checkUpdate { checking = false }
+                        }
+                    },
+                    LinkRow("特别鸣谢") { donateDialog = 4 },
                     LinkRow("隐私政策") { donateDialog = 3 }
                 ))
+            }
+            item {
+                CardShell {
+                    Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("诊断日志", fontSize = 16.sp, color = MiuixTheme.colorScheme.onSurface)
+                            Spacer(Modifier.height(3.dp))
+                            Text("向 LSPosed 模块日志输出模块所有功能运行状态，用于排查问题；日常建议关闭，反馈 bug 时使用。开启即时生效。",
+                                fontSize = 12.5.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                            Text("（系统框架进程读不到模块配置，那部分日志随开机输出）",
+                                fontSize = 11.5.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                modifier = Modifier.padding(top = 3.dp))
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Switch(checked = diagOn, onCheckedChange = { v ->
+                            try { window.decorView.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK) } catch (_: Throwable) {}
+                            prefs().edit().putBoolean(Cfg.K_DIAG, v).commit()
+                            notifyCfgChanged()
+                            diagOn = v
+                            Toast.makeText(this@SettingsActivity,
+                                if (v) "诊断日志已开启，复现问题后到 LSPosed 日志里搜 HAS-Diag"
+                                else "诊断日志已关闭",
+                                Toast.LENGTH_LONG).show()
+                        })
+                    }
+                }
             }
             item { SectionLabel("免责声明") }
             item { DisclaimerCard() }
@@ -582,6 +738,84 @@ class SettingsActivity : ComponentActivity() {
                 1 -> QrDialog("微信赞赏", "img/donate_wechat.png", true, "微信赞赏", "打开微信扫一扫", onJump = { openWechatScan() }) { donateDialog = -1 }
                 2 -> QrDialog("联系我们", "img/qq_group.jpg", false, "QQ群二维码", "打开加群链接（跳转浏览器）", onJump = { openQqJoinLink() }) { donateDialog = -1 }
                 3 -> PrivacyDialog { donateDialog = -1 }
+                4 -> CreditsDialog { donateDialog = -1 }
+            }
+        }
+    }
+
+    /** 检查更新：只连 GitHub 公开接口；超时/失败都给出具体原因。 */
+    private fun checkUpdate(onDone: () -> Unit) {
+        Toast.makeText(this, "正在检查更新…", Toast.LENGTH_SHORT).show()
+        val localCode = try {
+            val pi = packageManager.getPackageInfo(packageName, 0)
+            if (android.os.Build.VERSION.SDK_INT >= 28) pi.longVersionCode.toInt()
+            else { @Suppress("DEPRECATION") pi.versionCode }
+        } catch (_: Throwable) { BuildConfig.VERSION_CODE }
+        UpdateChecker.check(localCode) { r ->
+            onDone()
+            when (r) {
+                is UpdateResult.Newer -> {
+                    val url = if (r.info.apkUrl.isNotEmpty()) r.info.apkUrl else r.info.pageUrl
+                    Toast.makeText(this, "发现新版本 v${r.info.versionName}，正在打开下载页", Toast.LENGTH_LONG).show()
+                    try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+                    catch (_: Throwable) { Toast.makeText(this, "没有可用的浏览器", Toast.LENGTH_SHORT).show() }
+                }
+                is UpdateResult.Latest ->
+                    Toast.makeText(this, "已是最新版本 v${BuildConfig.VERSION_NAME}", Toast.LENGTH_SHORT).show()
+                is UpdateResult.Failed ->
+                    Toast.makeText(this, "检查更新失败：${r.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    /** 特别鸣谢：左头像、右两行（名字 / 身份）。名单可以一直往下加。 */
+    @Composable
+    private fun CreditsDialog(onDismiss: () -> Unit) {
+        Dialog(onDismissRequest = onDismiss) {
+            Surface(shape = RoundedCornerShape(24.dp), color = MiuixTheme.colorScheme.surface) {
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 16.dp)) {
+                    Text("特别鸣谢", fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                        color = MiuixTheme.colorScheme.onSurface)
+                    Text("感谢每一位参与测试、反馈与贡献的人", fontSize = 12.sp,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = 3.dp, bottom = 8.dp))
+                    Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                        credits.forEachIndexed { i, c ->
+                            Row(Modifier.fillMaxWidth().padding(vertical = 9.dp),
+                                verticalAlignment = Alignment.CenterVertically) {
+                                Avatar(c.avatar)
+                                Spacer(Modifier.width(14.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(c.name, fontSize = 15.5.sp,
+                                        color = MiuixTheme.colorScheme.onSurface)
+                                    Text(c.role, fontSize = 12.5.sp,
+                                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                        modifier = Modifier.padding(top = 2.dp))
+                                }
+                            }
+                            if (i < credits.size - 1) {
+                                Box(Modifier.fillMaxWidth().height(1.dp)
+                                    .background(MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.08f)))
+                            }
+                        }
+                    }
+                    Text("关闭", fontSize = 14.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().clickable { onDismiss() }.padding(top = 12.dp))
+                }
+            }
+        }
+    }
+
+    /** 圆形头像；assets 里没有对应图片时就是一块白色圆（占位）。 */
+    @Composable
+    private fun Avatar(path: String?) {
+        val bmp = remember(path) { if (path == null) null else loadAssetBitmap(path, 256) }
+        Box(Modifier.size(48.dp).clip(CircleShape).background(Color.White),
+            contentAlignment = Alignment.Center) {
+            if (bmp != null) {
+                Image(bmp.asImageBitmap(), contentDescription = null,
+                    modifier = Modifier.fillMaxSize().clip(CircleShape))
             }
         }
     }
@@ -668,11 +902,16 @@ class SettingsActivity : ComponentActivity() {
         /** ask for an explicit second tap before enabling (safety-relevant rows) */
         val confirmOnEnable: Boolean = false,
         /** optional second line under the title (live system-level state) */
-        val statusText: String? = null
+        val statusText: String? = null,
+        /** statusText 是否代表"正常"（决定文字颜色；"未生效"三个字里也含"已生效"，不能靠 contains 判断） */
+        val statusOk: Boolean = true,
+        /** 这个开关依赖哪些作用域 —— 未生效时在标题下面直接点出来 */
+        val scopes: List<String> = emptyList()
     )
 
     @Composable
     private fun SwitchCard(rows: List<SwRow>, onAfterChange: (() -> Unit)? = null) {
+        val ctx = LocalContext.current
         // shared state map so toggling one switch instantly reflects on the
         // other rows' UI (a per-row remember would go stale because writing
         // the peer's prefs never recomposes its SwitchRow).
@@ -695,6 +934,7 @@ class SettingsActivity : ComponentActivity() {
                             if (!ok && !v) state[r.key] = true
                             onAfterChange?.invoke()
                         }
+                        if (v) warnMissingScopes(ctx, r.scopes)
                     }
                 }
                 if (i < rows.size - 1) {
@@ -708,6 +948,7 @@ class SettingsActivity : ComponentActivity() {
                 onConfirm = {
                     state[r.key] = true
                     applyBinding(r.key, true, r.restart) { onAfterChange?.invoke() }
+                    warnMissingScopes(ctx, r.scopes)
                     confirmRow = null
                 },
                 onDismiss = { confirmRow = null }
@@ -748,14 +989,75 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
+    private val WarnColor = Color(0xFFE5484D)
+
+    /**
+     * 作用域状态行。只在**读到了运行记录**之后才下结论：
+     * 读不到（probed=false）时不显示，避免把"还没检测"画成"没运行"。
+     */
+    private fun scopeStatusOf(required: List<String>): Pair<String, Boolean>? {
+        if (required.isEmpty()) return null
+        val st = FrameworkProbe.state
+        if (!st.probed) return null
+        if (!st.running) {
+            return "作用域状态：未检测到模块运行（在 LSPosed 启用模块并勾选作用域后重启生效）" to false
+        }
+        val miss = st.missing(required)
+        if (miss.isNotEmpty()) {
+            val names = miss.joinToString("、") { scopeLabel(it) + "(" + it + ")" }
+            return "作用域状态：${names} 作用域未生效（勾选并重启作用域生效）" to false
+        }
+        // 全部生效 → 默认隐藏，不打扰；只有"跑着旧版本、需要手动重启"才提一句
+        if (required.any { st.stale(it) }) {
+            return "作用域状态：进程跑的是旧版本模块（重启作用域后更新）" to false
+        }
+        return null
+    }
+
+    /** 上一次挂起的作用域警告（连点开关时只保留最后一条，避免 Toast 排队）。 */
+    private var scopeWarnShot: Runnable? = null
+
+    /**
+     * 打开开关时如果依赖的作用域没生效，提醒一句 —— 避免用户以为已经用上了。
+     *
+     * 延迟 2.2s：applyBinding 自己会先弹一条"已开启…"，两条立刻叠加只会让
+     * 后一条盖掉前一条。用 applicationContext 是因为这条提示可能在页面销毁后
+     * 才到点。
+     */
+    private fun warnMissingScopes(ctx: android.content.Context, scopes: List<String>) {
+        if (scopes.isEmpty()) return
+        val st = FrameworkProbe.state
+        if (!st.probed) {
+            FrameworkProbe.refresh(ctx, true)
+            return
+        }
+        val msg: String = if (!st.running) {
+            "模块还没在任何作用域生效：请在 LSPosed 勾选后重启作用域"
+        } else {
+            val miss = st.missing(scopes)
+            if (miss.isEmpty()) return
+            miss.joinToString("、") { scopeLabel(it) } + " 作用域未生效：请在 LSPosed 勾选后重启作用域"
+        }
+        val appCtx = ctx.applicationContext ?: ctx
+        scopeWarnShot?.let { mainHandler.removeCallbacks(it) }
+        val shot = Runnable { Toast.makeText(appCtx, msg, Toast.LENGTH_LONG).show() }
+        scopeWarnShot = shot
+        mainHandler.postDelayed(shot, 2200L)
+    }
+
     @Composable
     private fun SwitchRow(r: SwRow, checked: Boolean, onChange: (Boolean) -> Unit) {
         Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(r.title, fontSize = 16.sp, color = MiuixTheme.colorScheme.onSurface)
+                scopeStatusOf(r.scopes)?.let { (text, ok) ->
+                    Text(text, fontSize = 12.sp,
+                        color = if (ok) MiuixTheme.colorScheme.primary else WarnColor,
+                        modifier = Modifier.padding(top = 2.dp))
+                }
                 r.statusText?.let { s ->
                     Text(s, fontSize = 12.sp,
-                        color = if (s.contains("已生效")) MiuixTheme.colorScheme.primary
+                        color = if (r.statusOk) MiuixTheme.colorScheme.primary
                                 else MiuixTheme.colorScheme.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 2.dp))
                 }
@@ -861,10 +1163,11 @@ class SettingsActivity : ComponentActivity() {
                 Column(Modifier.padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     Text("隐私政策", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MiuixTheme.colorScheme.onSurface)
                     Text(
-                        "本模块完全运行于本机，不申请网络权限：\n\n" +
-                        "· 不联网、不上传、不收集任何数据\n" +
+                        "本模块完全运行于本机，不会上传任何数据：\n\n" +
+                        "· 只有您点击「检查更新」时才会访问 GitHub 公开接口查询版本号，其余时间不联网\n" +
                         "· 开关状态仅保存在本机应用私有目录\n" +
-                        "· 仅在所声明的作用域进程内运行钩子逻辑",
+                        "· 仅在所声明的作用域进程内运行钩子逻辑\n" +
+                        "· 诊断日志只写入 LSPosed 的本地模块日志，不会外发",
                         fontSize = 13.5.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 10.dp, bottom = 6.dp))
                     Text("关闭", fontSize = 14.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
@@ -874,46 +1177,109 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
-    private fun loadAssetBitmap(file: String): Bitmap? = try {
-        val ins = assets.open(file)
-        val b = BitmapFactory.decodeStream(ins)
-        ins.close()
-        b
+    /**
+     * 按显示尺寸采样解码。
+     *
+     * 头像位置只有 48dp、二维码约 220dp，而用户后续会往 assets 里塞真实头像
+     * （可能是 2000×2000 的原图）。原样 decodeStream 等于把整张图展开成
+     * 16MB 的 Bitmap，两张就够低端机 OOM —— 这里先读尺寸再按 2 的幂采样。
+     */
+    private fun loadAssetBitmap(file: String, targetPx: Int = 1024): Bitmap? = try {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        assets.open(file).use { BitmapFactory.decodeStream(it, null, bounds) }
+        var sample = 1
+        val longest = maxOf(bounds.outWidth, bounds.outHeight)
+        while (longest / sample > targetPx && sample < 16) sample *= 2
+        assets.open(file).use {
+            BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+        }
     } catch (_: Throwable) { null }
 
     // ---- scope-restart dialog ----
 
+    /** 单选方块（不引第三方 Checkbox：miuix 0.9.4 的开关组件签名不稳，自绘更省心）。 */
+    @Composable
+    private fun CheckMark(on: Boolean) {
+        val primary = MiuixTheme.colorScheme.primary
+        Box(
+            Modifier.size(20.dp).clip(RoundedCornerShape(6.dp))
+                .background(if (on) primary else Color.Transparent)
+                .border(1.5.dp,
+                    if (on) primary else MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.45f),
+                    RoundedCornerShape(6.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            if (on) Text("✓", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.Bold)
+        }
+    }
+
+    /** 重启作用域：可多选，一次 su 会话全部执行（v2.3.0）。 */
     @Composable
     private fun ScopeRestartDialog(onDismiss: () -> Unit) {
+        val picked = remember {
+            mutableStateMapOf<String, Boolean>().apply { scopeTargets.forEach { put(it.pkg, true) } }
+        }
+        val count = scopeTargets.count { picked[it.pkg] == true }
         Dialog(onDismissRequest = onDismiss) {
             Surface(shape = RoundedCornerShape(24.dp), color = MiuixTheme.colorScheme.surface) {
                 Column(Modifier.padding(horizontal = 14.dp, vertical = 16.dp)) {
                     Text("重启作用域", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MiuixTheme.colorScheme.onSurface, modifier = Modifier.padding(vertical = 4.dp))
-                    Text("选择要重启的应用", fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary, modifier = Modifier.padding(bottom = 10.dp))
-                    scopeNames.forEachIndexed { i, name ->
-                        Text(name, fontSize = 16.sp, color = MiuixTheme.colorScheme.onSurface,
-                            modifier = Modifier.fillMaxWidth().clickable { onDismiss(); restartScope(i) }.padding(vertical = 13.dp))
-                        if (i < scopeNames.size - 1) {
+                    Text("勾选要重启的应用，改动后的开关随之生效", fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary, modifier = Modifier.padding(bottom = 6.dp))
+                    scopeTargets.forEachIndexed { i, t ->
+                        val on = picked[t.pkg] == true
+                        val probed = FrameworkProbe.state.probed
+                        val running = FrameworkProbe.state.has(t.pkg)
+                        Row(Modifier.fillMaxWidth().clickable { picked[t.pkg] = !on }.padding(vertical = 11.dp),
+                            verticalAlignment = Alignment.CenterVertically) {
+                            CheckMark(on)
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(t.label, fontSize = 15.5.sp, color = MiuixTheme.colorScheme.onSurface)
+                                Text(t.pkg, fontSize = 10.5.sp,
+                                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                    modifier = Modifier.padding(top = 1.dp))
+                            }
+                            Text(if (!probed) "未知" else if (running) "运行中" else "未运行",
+                                fontSize = 11.5.sp,
+                                color = if (running) MiuixTheme.colorScheme.primary
+                                        else MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                        }
+                        if (i < scopeTargets.size - 1) {
                             Box(Modifier.fillMaxWidth().height(1.dp)
                                 .background(MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.08f)))
                         }
                     }
-                    Text("取消", fontSize = 15.sp, color = MiuixTheme.colorScheme.primary, textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth().clickable { onDismiss() }.padding(top = 12.dp))
+                    Row(Modifier.fillMaxWidth().padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("全选", fontSize = 14.sp, color = MiuixTheme.colorScheme.primary,
+                            modifier = Modifier.clickable {
+                                val all = scopeTargets.all { picked[it.pkg] == true }
+                                scopeTargets.forEach { picked[it.pkg] = !all }
+                            }.padding(vertical = 6.dp, horizontal = 4.dp))
+                        Spacer(Modifier.weight(1f))
+                        Text("取消", fontSize = 14.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            modifier = Modifier.clickable { onDismiss() }.padding(8.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (count > 0) "重启选中 ($count)" else "重启选中", fontSize = 15.sp,
+                            color = if (count > 0) MiuixTheme.colorScheme.primary
+                                    else MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            modifier = Modifier.clickable {
+                                if (count > 0) {
+                                    onDismiss()
+                                    restartScopes(scopeTargets.filter { picked[it.pkg] == true })
+                                }
+                            }.padding(8.dp))
+                    }
                 }
             }
         }
     }
 
+    /**
+     * 直接弹选择框，不再先跑一次 su -c id 预检 —— 那一步要多等一次授权握手，
+     * 而命令真失败时 restartScopes 已经会明确报"ROOT 授权被拒绝"。
+     */
     private fun requestRootThenPickScope() {
-        Toast.makeText(this, "正在检查ROOT权限…", Toast.LENGTH_SHORT).show()
-        Thread {
-            val root = suExec("id")
-            runOnUiThread {
-                if (!root) Toast.makeText(this, "没有root权限", Toast.LENGTH_SHORT).show()
-                else rootDialogVisible = true
-            }
-        }.start()
+        rootDialogVisible = true
     }
 
     // shown when the root check above succeeds; the Composable observes it
@@ -986,12 +1352,25 @@ class SettingsActivity : ComponentActivity() {
         catch (_: Throwable) { Toast.makeText(this, "未检测到浏览器，请手动搜索群 297649230", Toast.LENGTH_SHORT).show() }
     }
 
-    private fun restartScope(which: Int) {
-        val name = scopeNames[which]
-        Toast.makeText(this, "正在重启$name…", Toast.LENGTH_SHORT).show()
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** 一次 su 会话把选中的作用域全部重启；成功后延后重读自证记录。 */
+    private fun restartScopes(targets: List<ScopeTarget>) {
+        if (targets.isEmpty()) return
+        val names = targets.joinToString("、") { it.label }
+        Toast.makeText(this, "正在重启：$names…", Toast.LENGTH_SHORT).show()
         Thread {
-            val ok = suExec(scopeCmds[which])
-            runOnUiThread { Toast.makeText(this, if (ok) "已重启$name" else "重启失败：ROOT授权被拒绝", Toast.LENGTH_SHORT).show() }
+            val ok = suExec(targets.joinToString(" ; ") { it.cmd })
+            runOnUiThread {
+                Toast.makeText(this,
+                    if (ok) "已重启：$names" else "重启失败：ROOT 授权被拒绝",
+                    Toast.LENGTH_LONG).show()
+            }
+            if (ok) {
+                // 进程重启后要等 Application 起来才会上报，3s / 8s 各读一次
+                mainHandler.postDelayed({ FrameworkProbe.refresh(this, true) }, 3000L)
+                mainHandler.postDelayed({ FrameworkProbe.refresh(this, true) }, 8000L)
+            }
         }.start()
     }
 }
