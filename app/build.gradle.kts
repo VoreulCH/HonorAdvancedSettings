@@ -14,8 +14,8 @@ android {
         applicationId = "io.github.voreulch.honoradvanced"
         minSdk = 33
         targetSdk = 35
-        versionCode = 48
-        versionName = "2.0.2"
+        versionCode = 58
+        versionName = "2.1.2"
         // keep native filter consistent with the hand-built APK (no ABI split)
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
@@ -89,17 +89,15 @@ dependencies {
     implementation(compose.runtime)
     implementation(compose.animation)
 
-    // miuix — official MIUI/HyperOS component library (matches build stack)
+    // miuix — official MIUI/HyperOS component library (matches build stack).
+    // basic/theme come from miuix-ui (which pulls miuix-core transitively);
+    // blur effects come from miuix-blur. preference/icons were dropped with
+    // the v2.0.3 audit: zero code references (icons via androidx
+    // material-icons-core) and R8 had already stripped them anyway.
     implementation("top.yukonga.miuix.kmp:miuix-core:0.9.4")
     implementation("top.yukonga.miuix.kmp:miuix-ui:0.9.4")
-    implementation("top.yukonga.miuix.kmp:miuix-preference:0.9.4")
-    implementation("top.yukonga.miuix.kmp:miuix-icons:0.9.4")
-    implementation("top.yukonga.miuix.kmp:miuix-icons-android:0.9.4")
     // miuix-blur: Backdrop/LayerBackdrop/blur/lens/vibrancy (liquid-glass refraction)
     implementation("top.yukonga.miuix.kmp:miuix-blur:0.9.4")
-
-    // MaterialKolor — seed-color → M3 palette (Monet dynamic theming for the theme page)
-    implementation("com.materialkolor:material-kolor:5.0.1")
 
     // Material icons (native replacement for MiuixIcons where extended set is needed)
 
