@@ -131,17 +131,10 @@ public final class CfgProvider extends ContentProvider {
         if (Cfg.K_DOWNGRADE.equals(key)) {
             return p.getBoolean("downgrade", true);
         }
-        if (Cfg.K_GLASS_EXTREME.equals(key)) {
-            return false; // opt-in: extreme sliders hurt readability
-        }
-        if (Cfg.K_NODUCK.equals(key)) {
-            return false; // opt-in: hooks system_server — must stay off until enabled
-        }
-        if (Cfg.K_HOTTEMP.equals(key)) {
-            return false; // opt-in: root-level thermal bypass — always explicit
-        }
-        if (Cfg.K_DIAG.equals(key)) {
-            return false; // opt-in: verbose logging must never switch itself on
+        // 4 个 opt-in 开关（DIY 总闸 / 不压低音量 / 高温旁路 / 诊断日志）统一由
+        // Cfg.isOptIn 判定，别再在这里各写一个 if —— 那是三份重复逻辑的来源。
+        if (Cfg.isOptIn(key)) {
+            return false;
         }
         return true; // K_SYSTEM / K_PURIFY had no legacy counterpart
     }
