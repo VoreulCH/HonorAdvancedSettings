@@ -96,7 +96,7 @@ public final class MiscHook {
         try {
             tm = cl.loadClass("com.hihonor.powergenie.core.thermal.ThermalManager");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "powergenie: class not in this CL yet (try " + sPgTries + ")");
+            Diag.warn("powergenie: class not in this CL yet (try " + sPgTries + ")");
             return; // do NOT mark done — a later callback may carry the real CL
         }
         sPgDone = true;
@@ -118,24 +118,23 @@ public final class MiscHook {
                                 param.setResult(null);
                                 if (sPgBlocked < 5) {
                                     sPgBlocked++;
-                                    XposedBridge.log(TAG + "powergenie: thermal policy suppressed (" + sPgBlocked + ")");
+                                    Diag.log("powergenie: thermal policy suppressed (" + sPgBlocked + ")");
                                 }
                             } else {
                                 param.setResult(0); // coolest level
                             }
                         } catch (Throwable t) {
-                            XposedBridge.log(TAG + "powergenie gate error: " + t);
+                            Diag.err("powergenie gate error", t);
                         }
                     }
                 });
                 n++;
-                XposedBridge.log(TAG + "powergenie: hooked " + nm);
+                Diag.log("powergenie: hooked " + nm);
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "powergenie: ThermalManager missing (" + t.getClass().getSimpleName() + ")");
+            Diag.err("powergenie: ThermalManager missing", t);
         }
-        XposedBridge.log(TAG + "powergenie: thermal hooks installed " + n
-                + (n == 0 ? " (WARN: no target matched — PowerGenie build changed?)" : ""));
+        Diag.mount("PowerGenie.ThermalManager(handleThermalEvent/getCurThermalLevel)", n, 2);
     }
 
     private static int sPgBlocked = 0;
@@ -204,12 +203,12 @@ public final class MiscHook {
                             try {
                                 if (Cfg.hottempOn()) param.args[0] = 0;
                             } catch (Throwable t) {
-                                XposedBridge.log(TAG + "thermal setStatus gate error: " + t);
+                                Diag.err("thermal setStatus gate error", t);
                             }
                         }
                     });
                     ok++;
-                    XposedBridge.log(TAG + "thermal: status normalized (setStatusLocked -> NONE)");
+                    Diag.log("thermal: status normalized (setStatusLocked -> NONE)");
                 } else if ("shutdownIfNeeded".equals(nm) && ps.length == 1
                         && "android.os.Temperature".equals(ps[0].getName())) {
                     XposedBridge.hookMethod(m, new XC_MethodHook() {
@@ -220,19 +219,19 @@ public final class MiscHook {
                                 param.setResult(null);
                                 if (sShutdownBlocked < 3) {
                                     sShutdownBlocked++;
-                                    XposedBridge.log(TAG + "thermal: emergency shutdown suppressed (" + sShutdownBlocked + ")");
+                                    Diag.log("thermal: emergency shutdown suppressed (" + sShutdownBlocked + ")");
                                 }
                             } catch (Throwable t) {
-                                XposedBridge.log(TAG + "thermal shutdown gate error: " + t);
+                                Diag.err("thermal shutdown gate error", t);
                             }
                         }
                     });
                     ok++;
-                    XposedBridge.log(TAG + "thermal: shutdownIfNeeded suppressed");
+                    Diag.log("thermal: shutdownIfNeeded suppressed");
                 }
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "thermal: ThermalManagerService missing (" + t.getClass().getSimpleName() + ")");
+            Diag.err("thermal: ThermalManagerService missing", t);
         }
         try {
             Class<?> bs = cl.loadClass("com.android.server.power.thermal.ThermalManagerService$2");
@@ -248,15 +247,15 @@ public final class MiscHook {
                         try {
                             if (Cfg.hottempOn()) param.setResult(0);
                         } catch (Throwable t) {
-                            XposedBridge.log(TAG + "thermal getter gate error: " + t);
+                            Diag.err("thermal getter gate error", t);
                         }
                     }
                 });
                 ok++;
-                XposedBridge.log(TAG + "thermal: " + nm + " -> NONE");
+                Diag.log("thermal: " + nm + " -> NONE");
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "thermal: BinderService missing (" + t.getClass().getSimpleName() + ")");
+            Diag.err("thermal: ThermalManagerService$2 missing", t);
         }
         try {
             Class<?> pm = cl.loadClass("com.android.server.power.PowerManagerService$BinderService");
@@ -269,18 +268,17 @@ public final class MiscHook {
                         try {
                             if (Cfg.hottempOn()) param.setResult(null);
                         } catch (Throwable t) {
-                            XposedBridge.log(TAG + "thermal brightness gate error: " + t);
+                            Diag.err("thermal brightness gate error", t);
                         }
                     }
                 });
                 ok++;
-                XposedBridge.log(TAG + "thermal: thermal brightness cap skipped");
+                Diag.log("thermal: thermal brightness cap skipped");
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "thermal: PowerManagerService$BinderService missing (" + t.getClass().getSimpleName() + ")");
+            Diag.err("thermal: PowerManagerService$BinderService missing", t);
         }
-        XposedBridge.log(TAG + "thermal: hooks installed " + ok
-                + (ok == 0 ? " (WARN: nothing matched — ThermalManagerService changed?)" : ""));
+        Diag.mount("system_server thermal(setStatus/shutdown/getters/brightness)", ok, 5);
     }
 
     private static int sShutdownBlocked = 0;
@@ -306,18 +304,18 @@ public final class MiscHook {
                                 // not depend on the focus result, it keeps
                                 // playing — but the music never gets ducked
                                 param.setResult(AUDIOFOCUS_REQUEST_FAILED);
-                                XposedBridge.log(TAG + "notification duck request rejected (" + name + ")");
+                                Diag.log("notification duck request rejected (" + name + ")");
                             }
                         } catch (Throwable t) {
-                            XposedBridge.log(TAG + "noduck error: " + t);
+                            Diag.err("noduck gate error", t);
                         }
                     }
                 });
                 n++;
             }
-            XposedBridge.log(TAG + "hooked AudioManager.requestAudioFocus* overloads: " + n);
+            Diag.mount("AudioManager.requestAudioFocus*", n, 0);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "hook AudioManager failed: " + t);
+            Diag.err("hook AudioManager failed", t);
         }
     }
 
@@ -363,7 +361,7 @@ public final class MiscHook {
         } catch (Throwable t) {
             if (!sHotTempMissLogged) {
                 sHotTempMissLogged = true;
-                XposedBridge.log(TAG + "high-temp: class not in this CL yet (" + t.getClass().getSimpleName() + ")");
+                Diag.warn("high-temp: PowerNotificationWarnings not in this CL yet");
             }
             return;
         }
@@ -376,10 +374,10 @@ public final class MiscHook {
                     param.setResult(null);
                     if (sHotTempBlocked < 5) {
                         sHotTempBlocked++;
-                        XposedBridge.log(TAG + "high-temp popup suppressed (" + sHotTempBlocked + ")");
+                        Diag.log("high-temp popup suppressed (" + sHotTempBlocked + ")");
                     }
                 } catch (Throwable t) {
-                    XposedBridge.log(TAG + "high-temp gate error: " + t);
+                    Diag.err("high-temp gate error", t);
                 }
             }
         };
@@ -393,16 +391,15 @@ public final class MiscHook {
                 try {
                     XposedBridge.hookMethod(m, blocker);
                     hooked++;
-                    XposedBridge.log(TAG + "hooked high-temp popup: " + nm);
+                    Diag.log("hooked high-temp popup: " + nm);
                 } catch (Throwable t) {
-                    XposedBridge.log(TAG + "high-temp hook failed: " + nm + " : " + t);
+                    Diag.err("high-temp hook failed: " + nm, t);
                 }
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "high-temp scan failed: " + t);
+            Diag.err("high-temp scan failed", t);
         }
-        XposedBridge.log(TAG + "high-temp popup hooks installed: " + hooked
-                + (hooked == 0 ? " (WARN: PowerNotificationWarnings changed — popup no longer blocked)" : ""));
+        Diag.mount("PowerNotificationWarnings(high-temp popups)", hooked, 0);
     }
 
     /** flatten AudioFocusRequest objects into their gain int + attributes,
