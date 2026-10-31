@@ -1,7 +1,6 @@
 package io.github.voreulch.honoradvanced;
 
 import android.app.Activity;
-import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
@@ -42,9 +41,6 @@ import de.robv.android.xposed.XposedHelpers;
 public final class InstallerHook {
     private static final String TAG = "[HAS-Purify] ";
     private static String sApk;
-    private static final String K_INFOCARD = Cfg.K_INFOCARD;
-    private static final String K_DOWNGRADE = Cfg.K_DOWNGRADE;
-
     private static boolean purifyOn() {
         return Cfg.isOn(Cfg.K_PURIFY);
     }
@@ -64,6 +60,14 @@ public final class InstallerHook {
         // generic hooks (all installer versions)
         hookNetwork(cl);
         hookAllowDowngrade(cl);
+        // risk-install dialog (the only "risk tip" popup in the installer;
+        // class name is stable on 38.301 / 32.303 / 14.0.22.x)
+        hookRiskTipDialog(cl);
+        // pre-check "anonymous source" warning (no install source package):
+        // the actual popup both 2026-10-29 field reports hit.
+        // primary = zero-popup suppression, fallback = auto-click "继续"
+        hookAnonymousSourceSuppress(cl);
+        hookAnonymousSourceDialog(cl);
         // adaptive set — resolves per build (38.301 / 14.0.22.x / future
         // OTA reshuffles) via signature scanning, see "adaptive resolution"
         hookSecurityCheckCompatV2(cl);
@@ -91,7 +95,7 @@ public final class InstallerHook {
                     XposedBridge.hookMethod(m, new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            if (on(K_DOWNGRADE)) param.setResult(true);
+                            if (on(Cfg.K_DOWNGRADE)) param.setResult(true);
                         }
                     });
                     n++;
@@ -110,7 +114,7 @@ public final class InstallerHook {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            if (!on(K_DOWNGRADE)) return;
+                            if (!on(Cfg.K_DOWNGRADE)) return;
                             Object sp = param.args[0];
                             if (sp != null) {
                                 int flags = XposedHelpers.getIntField(sp, "installFlags");
@@ -141,7 +145,389 @@ public final class InstallerHook {
         }
     }
 
+    // ==================== risk-install dialog ====================
+
+    /**
+     * "风险提示" install popup — the only risk-tip dialog in the installer:
+     * `com.android.packageinstaller.fragment.InstallRiskTipDialog` (the
+     * class name survives every known build; 38.301 builds it from
+     * PIA.R0(12), 14.0.22.x/32.303 from the static factory i("")). It shows
+     * the stock `risk_warning` / `check_risk_poptip_high_risk` text with a
+     * "继续安装" button and otherwise blocks the install flow.
+     *
+     * When purify is on we answer it the same way a user tapping "继续安装"
+     * would: hook the fragment's onStart (the dialog is already attached at
+     * that point) and click the positive button. This reuses the stock
+     * continuation for every build (PIA.D0 / paging Q1-R1 / dr0.l), so a
+     * future installer reshuffle cannot strand the flow. Capped at 10 per
+     * process in case a build re-opens the dialog in a loop.
+     *
+     * Pure addition: purify off → stock dialog, no interception.
+     */
+    private static int sRiskAutoCount = 0;
+
+    private static void hookRiskTipDialog(ClassLoader cl) {
+        try {
+            final Class<?> dlg = cl.loadClass(
+                    "com.android.packageinstaller.fragment.InstallRiskTipDialog");
+            java.util.Set<XC_MethodHook.Unhook> unhooks =
+                    XposedBridge.hookAllMethods(dlg, "onStart", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    // DEFENSIVE: only act when the callback came from the
+                    // dialog class itself. Whether hookAllMethods also visits
+                    // superclass overrides is implementation-dependent; this
+                    // guard makes sure exactly one onStart path clicks the
+                    // positive button.
+                    if (param.method.getDeclaringClass() != dlg) return;
+                    if (!defaultPurify()) return;
+                    try {
+                        if (sRiskAutoCount >= 10) return;
+                        Object d = XposedHelpers.callMethod(param.thisObject, "getDialog");
+                        if (!(d instanceof android.app.AlertDialog)) return;
+                        android.widget.Button ok = ((android.app.AlertDialog) d)
+                                .getButton(android.content.DialogInterface.BUTTON_POSITIVE);
+                        if (ok == null) return;
+                        sRiskAutoCount++;
+                        XposedBridge.log(TAG + "[adapt] risk install dialog auto-continue ("
+                                + sRiskAutoCount + ")");
+                        ok.performClick();
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + "risk dialog auto-continue error: " + t);
+                    }
+                }
+            });
+            if (unhooks == null || unhooks.isEmpty()) {
+                XposedBridge.log(TAG + "risk-tip dialog has no onStart override, skip");
+                return;
+            }
+            XposedBridge.log(TAG + "[adapt] risk-tip dialog auto-continue hooked");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "risk-tip dialog hook skipped: " + t);
+        }
+    }
+
+    // ==================== anonymous-source dialog ====================
+
+    /**
+     * Pre-check "anonymous source" warning — the popup actually seen in the
+     * 2026-10-29 field reports. Shown when PackageInstallerActivity has NO
+     * install-source package (`this.I == null` / `i0 == null` / `o0 == null`),
+     * e.g. an APK delivered by a PC tool / USB copy. Class name is stable on
+     * all four known builds; the text is R.string.anonymous_source_warning,
+     * buttons are R.string.anonymous_source_continue ("继续") / cancel.
+     *
+     * PRIMARY (zero popup): hook framework DialogFragment.onStart, filtered to
+     * AnonymousSourceDialog. After super.onStart() the dialog window and its
+     * positive button exist; hide the window (alpha 0) before show() and tap
+     * the stock positive listener so the installer continuation runs.
+     *
+     * v2.1.1 failure fix ("install button dead", field 2026-10-30): the stock
+     * AlertController does NOT run the listener synchronously — performClick()
+     * only posts mButtonPositiveMessage to the main queue, and the dialog is
+     * dismissed by a *second* posted message. The old code called
+     * dismissAllowingStateLoss() inside the same onStart stack right after the
+     * click; the dialog window went away (wm_dim_removed at the same second),
+     * but the queued listener landed after the fragment was torn down, so
+     * `getActivity()` was null, q0(false) never ran, the PIA stayed in
+     * "waiting for the anonymous-source answer" state and its 继续安装 button
+     * ignored every tap. Fix: never dismiss inside onStart; verify the dialog
+     * actually closed, and if it did not, call the stock listener directly
+     * (AlertController.mButtonPositiveMessage.obj), then dismiss from the main
+     * loop. Worst case (everything fails) alpha is restored to 1 so the user
+     * gets a normal, tappable dialog — never an invisible window.
+     *
+     * FALLBACK: onCreateDialog schedules the same ladder after 200ms when the
+     * primary never owned the fragment (onStart hook missing). A
+     * WeakHashMap<fragment,Boolean> keeps exactly one owner per fragment.
+     */
+    private static int sAnonAutoCount = 0;
+    private static int sAnonSuppressed = 0;
+    private static int sAnonNoAnchor = 0;
+    private static final java.util.WeakHashMap<Object, Boolean> sAnonHandled =
+            new java.util.WeakHashMap<>();
+    private static final Handler sAnonMain = new Handler(Looper.getMainLooper());
+
+    private static void anonLog(String msg) {
+        XposedBridge.log(TAG + "[anon] " + msg);
+    }
+
+    private static void anonNoAnchor(String why) {
+        if (sAnonNoAnchor >= 5) return;
+        sAnonNoAnchor++;
+        anonLog("anonymous-source no anchor (" + why + ")");
+    }
+
+    /** Make the dialog window invisible before show(), or visible again if
+     *  the primary path cannot finish; prevents an invisible residual window
+     *  from swallowing touches when every hook path fails. */
+    private static void setAnonWindowAlpha(Object frag, float alpha) {
+        try {
+            Object d = XposedHelpers.callMethod(frag, "getDialog");
+            if (!(d instanceof android.app.AlertDialog)) return;
+            android.view.Window w = ((android.app.AlertDialog) d).getWindow();
+            if (w == null) return;
+            android.view.WindowManager.LayoutParams lp = w.getAttributes();
+            lp.alpha = alpha;
+            w.setAttributes(lp);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** true when the dialog is gone (dismissed, activity finished or the
+     *  fragment torn down) — i.e. the stock continuation had a chance to run. */
+    private static boolean anonGone(Object frag) {
+        try {
+            Object act = XposedHelpers.callMethod(frag, "getActivity");
+            if (act == null) return true;
+            Object d = XposedHelpers.callMethod(frag, "getDialog");
+            if (!(d instanceof android.app.Dialog)) return true;
+            return !((android.app.Dialog) d).isShowing();
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /**
+     * Call the stock positive-button listener directly. AlertController keeps
+     * the app listener in mButtonPositiveMessage (its obj), and a real tap
+     * runs it from a posted ButtonHandler message. When performClick did not
+     * land (message lost behind the onStart stack / dialog teardown), this is
+     * the exact continuation the installer expects ("继续" → PIA.q0(false) on
+     * 38.301, g3/w2 variants on the other builds). Returns true when called.
+     */
+    private static boolean anonInvokePositive(android.app.Dialog dialog) {
+        try {
+            Object alert = XposedHelpers.getObjectField(dialog, "mAlert");
+            if (alert == null) return false;
+            Object msg = XposedHelpers.getObjectField(alert, "mButtonPositiveMessage");
+            if (msg == null) return false;
+            Object listener = XposedHelpers.getObjectField(msg, "obj");
+            if (!(listener instanceof android.content.DialogInterface.OnClickListener)) {
+                return false;
+            }
+            ((android.content.DialogInterface.OnClickListener) listener)
+                    .onClick(dialog, android.content.DialogInterface.BUTTON_POSITIVE);
+            return true;
+        } catch (Throwable t) {
+            anonLog("direct listener error: " + t);
+            return false;
+        }
+    }
+
+    /**
+     * Tap the stock "继续" and make sure the installer continuation really
+     * ran. Nothing here runs inside the onStart stack:
+     *   1. performClick() — cheap stock tap (queues the app listener)
+     *   2. +120ms: dialog still showing -> invoke the stock listener directly
+     *   3. +100ms after a direct call: dismiss from the main loop, like a tap
+     *   4. +400ms: still showing -> restore alpha 1.0, so the user gets a
+     *      visible, tappable dialog instead of an invisible window that eats
+     *      touches. This is the hard floor: no path may leave alpha 0 behind.
+     */
+    private static void anonContinue(final Object frag, final android.app.Dialog dialog,
+                                     final android.widget.Button ok, final String path) {
+        try {
+            boolean clicked = ok.performClick();
+            anonLog(path + " click result=" + clicked + " enabled=" + ok.isEnabled());
+        } catch (Throwable t) {
+            anonLog(path + " click failed: " + t);
+        }
+        sAnonMain.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (anonGone(frag)) {
+                        anonLog(path + " ok: dialog closed by stock path");
+                        return;
+                    }
+                    boolean invoked = anonInvokePositive(dialog);
+                    anonLog(path + " direct listener=" + invoked);
+                    if (invoked) {
+                        sAnonMain.postDelayed(new Runnable() {
+                            @Override
+                            public void run() {
+                                try {
+                                    if (dialog.isShowing()) dialog.dismiss();
+                                } catch (Throwable t) {
+                                    anonLog(path + " dismiss failed: " + t);
+                                }
+                            }
+                        }, 100L);
+                    }
+                    sAnonMain.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                if (anonGone(frag)) return;
+                                setAnonWindowAlpha(frag, 1.0f);
+                                anonLog(path + " self-heal: dialog visible again");
+                            } catch (Throwable t) {
+                                anonLog(path + " self-heal failed: " + t);
+                            }
+                        }
+                    }, 300L);
+                } catch (Throwable t) {
+                    setAnonWindowAlpha(frag, 1.0f);
+                    anonLog(path + " verify failed: " + t);
+                }
+            }
+        }, 120L);
+    }
+
+    /** PRIMARY: suppress the dialog before its first draw. */
+    private static void hookAnonymousSourceSuppress(final ClassLoader cl) {
+        try {
+            final Class<?> anon = cl.loadClass(
+                    "com.android.packageinstaller.fragment.AnonymousSourceDialog");
+            java.util.Set<XC_MethodHook.Unhook> unhooks =
+                    XposedBridge.hookAllMethods(android.app.DialogFragment.class, "onStart",
+                            new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!anon.isInstance(param.thisObject)) return;
+                    if (!defaultPurify()) return;
+                    if (sAnonHandled.containsKey(param.thisObject)) return;
+                    // make the window transparent before super.onStart()
+                    // calls Dialog.show(); keeps zero-frame even if WindowManager
+                    // latches a traversal before our after-hook runs
+                    setAnonWindowAlpha(param.thisObject, 0.0f);
+                }
+
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (!anon.isInstance(param.thisObject)) return;
+                    if (!defaultPurify()) {
+                        // before-hook may already have made the window
+                        // transparent; restore it if the switch flipped mid-call
+                        setAnonWindowAlpha(param.thisObject, 1.0f);
+                        return;
+                    }
+                    final Object frag = param.thisObject;
+                    if (sAnonHandled.containsKey(frag)) return;
+                    if (sAnonSuppressed >= 10) {
+                        setAnonWindowAlpha(frag, 1.0f);
+                        return;
+                    }
+                    try {
+                        Object d = XposedHelpers.callMethod(frag, "getDialog");
+                        if (!(d instanceof android.app.AlertDialog)) {
+                            setAnonWindowAlpha(frag, 1.0f);
+                            return;
+                        }
+                        android.widget.Button ok = ((android.app.AlertDialog) d)
+                                .getButton(android.content.DialogInterface.BUTTON_POSITIVE);
+                        if (ok == null) {
+                            setAnonWindowAlpha(frag, 1.0f);
+                            return; // fallback will handle
+                        }
+                        sAnonHandled.put(frag, Boolean.TRUE);
+                        sAnonSuppressed++;
+                        anonLog("anonymous-source suppressed (" + sAnonSuppressed + ")");
+                        // NO dismiss here: inside the onStart stack it tears the
+                        // fragment down before AlertController can run the queued
+                        // stock listener (that stranded the install flow). The
+                        // ladder clicks, verifies, then dismisses from the main
+                        // loop and always restores alpha on the failure path.
+                        anonContinue(frag, (android.app.Dialog) d, ok, "[anon]");
+                    } catch (Throwable t) {
+                        setAnonWindowAlpha(frag, 1.0f);
+                        anonLog("anonymous-source suppress failed: " + t);
+                    }
+                }
+            });
+            if (unhooks == null || unhooks.isEmpty()) {
+                XposedBridge.log(TAG + "[adapt] anonymous-source onStart no anchor, fallback only");
+                return;
+            }
+            XposedBridge.log(TAG + "[adapt] anonymous-source zero-popup installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "anonymous-source zero-popup hook skipped: " + t);
+        }
+    }
+
+    /** FALLBACK: onCreateDialog auto-click if the primary did not handle. */
+    private static void hookAnonymousSourceDialog(ClassLoader cl) {
+        try {
+            final Class<?> dlg = cl.loadClass(
+                    "com.android.packageinstaller.fragment.AnonymousSourceDialog");
+            java.util.Set<XC_MethodHook.Unhook> unhooks =
+                    XposedBridge.hookAllMethods(dlg, "onCreateDialog", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (!defaultPurify()) return;
+                    try {
+                        Object d = param.getResult();
+                        if (!(d instanceof android.app.AlertDialog)) return;
+                        final Object frag = param.thisObject;
+                        final Handler h = new Handler(Looper.getMainLooper());
+                        // 200ms head start for the primary onStart path. When
+                        // the primary owns the fragment it also owns visibility
+                        // (its ladder restores alpha if the dialog survives), so
+                        // this fallback must not touch it — a blind dismiss here
+                        // is what used to kill the queued stock listener.
+                        h.postDelayed(new Runnable() {
+                            int tries = 0;
+
+                            @Override
+                            public void run() {
+                                try {
+                                    if (sAnonHandled.containsKey(frag)) return;
+                                    if (anonGone(frag)) return;
+                                    if (sAnonAutoCount >= 10) {
+                                        anonNoAnchor("fallback cap reached");
+                                        return;
+                                    }
+                                    Object dlg = XposedHelpers.callMethod(frag, "getDialog");
+                                    if (!(dlg instanceof android.app.AlertDialog)) {
+                                        if (++tries <= 3) {
+                                            h.postDelayed(this, 50L);
+                                        } else {
+                                            anonNoAnchor("dialog missing");
+                                        }
+                                        return;
+                                    }
+                                    android.widget.Button ok = ((android.app.AlertDialog) dlg)
+                                            .getButton(android.content.DialogInterface.BUTTON_POSITIVE);
+                                    if (ok == null) {
+                                        if (++tries <= 3) {
+                                            h.postDelayed(this, 50L);
+                                        } else {
+                                            anonNoAnchor("button missing");
+                                        }
+                                        return;
+                                    }
+                                    sAnonHandled.put(frag, Boolean.TRUE);
+                                    sAnonAutoCount++;
+                                    anonLog("anonymous-source auto-continue (" + sAnonAutoCount + ")");
+                                    anonContinue(frag, (android.app.Dialog) dlg, ok, "[anon-fb]");
+                                } catch (Throwable t) {
+                                    setAnonWindowAlpha(frag, 1.0f);
+                                    anonLog("anonymous-source fallback failed: " + t);
+                                    anonNoAnchor("exception");
+                                }
+                            }
+                        }, 200L);
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + "anonymous-source fallback error: " + t);
+                    }
+                }
+            });
+            if (unhooks == null || unhooks.isEmpty()) {
+                XposedBridge.log(TAG + "[adapt] anonymous-source no anchor (onCreateDialog missing)");
+                return;
+            }
+            XposedBridge.log(TAG + "[adapt] anonymous-source fallback installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "anonymous-source fallback hook skipped: " + t);
+        }
+    }
+
     // ==================== info-card helpers (used by V2) ====================
+
+    /** bounded diagnostics for the v2.1.1 false "降级安装" report: at most
+     *  3 lines per installer process, prefix [dg], one per card fill. */
+    private static int sDgLogged = 0;
 
     private static void fillInfoCard(final View card, final Activity activity, final int attempt) {
         if (card == null || activity == null) {
@@ -183,16 +569,6 @@ public final class InstallerHook {
                 }
             }
         }
-        try {
-            pkgName = (String) XposedHelpers.getObjectField(activity, "x0");
-        } catch (Throwable ignored) {
-        }
-        if (pkgName == null) {
-            try {
-                pkgName = (String) XposedHelpers.getObjectField(activity, "u0");
-            } catch (Throwable ignored) {
-            }
-        }
         if (newInfo == null || newInfo.applicationInfo == null) {
             if (attempt < 10) {
                 card.postDelayed(new Runnable() {
@@ -206,15 +582,30 @@ public final class InstallerHook {
             }
             return;
         }
-        if (pkgName == null || pkgName.length() == 0) {
-            pkgName = newInfo.packageName;
-        }
+        // The parsed APK is the only authoritative target package. Never guess
+        // the PIA's obfuscated fields here: on some builds x0/u0 hold the
+        // *install source* package (file manager / browser), so the card
+        // compared that installed app's version against the new APK and painted
+        // a false "↓ 降级安装" tag on brand-new apps (field reports 2026-10-30:
+        // 文件管理 11.x vs 药师 2.0.2 / 荣耀工具箱 0.9, Edge 155.x vs DeepSeek
+        // 2.7.1). The factory installer never compared versions for that label
+        // anyway — the tag was ours.
+        pkgName = newInfo.packageName;
 
         PackageManager pm = activity.getPackageManager();
         PackageInfo oldInfo = null;
         try {
             oldInfo = pm.getPackageInfo(pkgName, 0);
         } catch (Throwable ignored) {
+        }
+        if (sDgLogged < 3) {
+            sDgLogged++;
+            long oldVc = oldInfo != null ? oldInfo.getLongVersionCode() : -1L;
+            long newVc = newInfo.getLongVersionCode();
+            XposedBridge.log(TAG + "[dg] card pkg=" + pkgName
+                    + " old=" + (oldInfo == null ? "none" : oldVc)
+                    + " new=" + newVc
+                    + " downgrade=" + (oldInfo != null && newVc < oldVc));
         }
 
         ApplicationInfo ai = newInfo.applicationInfo;
@@ -475,18 +866,39 @@ public final class InstallerHook {
      *  with the signature specs, so a wrong DexKit hit can never strand a
      *  hook point — the right class still wins on signature. */
     private static Class<?>[] locateAll(String[] knownNames, String... anchors) {
+        return locateAllUnion(knownNames, anchors);
+    }
+
+    /**
+     * Same as locateAll, but with SEVERAL strict anchor sets. Each set is still
+     * an AND match (the class must reference every string of that set); the
+     * hits are only unioned. Needed for 14.0.22.326/327 and 14.0.39.301, where
+     * the card-tips / info-card class no longer references "AdNetworkUtil"
+     * (14.0.39.301 keeps the literal only in an unrelated class), so the old
+     * {AdNetworkUtil, SafeModeShowUtils} pair can never match while
+     * {SafeModeShowUtils} alone still does. Strict per-set matching keeps the
+     * candidate pool as narrow as before; the method SHAPE scan still decides
+     * which candidate actually gets hooked. Cost: one extra DexKit walk per
+     * resolved set, cached per process like locateAll.
+     */
+    private static Class<?>[] locateAllUnion(String[] knownNames, String[]... anchorSets) {
         StringBuilder ck = new StringBuilder();
-        for (String a : anchors) ck.append(a).append('|');
-        ck.append('#');
+        for (String[] set : anchorSets) {
+            for (String a : set) ck.append(a).append('|');
+            ck.append('#');
+        }
+        ck.append("##");
         for (String n : knownNames) ck.append(n).append(',');
         String key = ck.toString();
         Class<?>[] cached = sLocateCache.get(key);
         if (cached != null) return cached;
         java.util.ArrayList<Class<?>> out = new java.util.ArrayList<>();
-        Class<?> c = DexKitHelper.findClassByStrings(sApk, HookEnv.cl, anchors);
-        if (c != null) {
-            out.add(c);
-            XposedBridge.log(TAG + "[adapt] dexkit anchor hit: " + c.getName());
+        for (String[] set : anchorSets) {
+            Class<?> c = DexKitHelper.findClassByStrings(sApk, HookEnv.cl, set);
+            if (c != null && !out.contains(c)) {
+                out.add(c);
+                XposedBridge.log(TAG + "[adapt] dexkit anchor hit: " + c.getName());
+            }
         }
         for (String n : knownNames) {
             try {
@@ -547,6 +959,11 @@ public final class InstallerHook {
     // Class names via DexKit anchors + per-build fallbacks, methods via
     // signature scanning — see the "adaptive resolution" block above.
 
+    /** one-shot log flag: the preinstall-tip card has no counterpart on
+     *  14.0.39.301 (whole-app signature scan), so an unresolved hook there
+     *  is expected behaviour, not a broken anchor. */
+    private static boolean sPreinstallAbsent = false;
+
     private static void hookSecurityCheckCompatV2(final ClassLoader cl) {
         try {
             // 38.301 ed1.b(cb, boolean) vs 14.0.22.x br0.j(cb): in both the
@@ -557,7 +974,10 @@ public final class InstallerHook {
             // a result-delivery method (a parameter type wrapping
             // HnControlResult). xv0's methods take no such type, so h() is
             // skipped and j() wins.
-            Class<?>[] cs = locateAll(new String[]{"ed1", "br0", "bx1"}, "HnAppCheckJob", "insertRiskAppDb");
+            // 38.301 ed1/bx1 · 14.0.22.x br0 · 14.0.39.301 md1 (md1.b(sd1,
+            // boolean), marker iface sd1, delivery PIA$b.c(ld1, de1))
+            Class<?>[] cs = locateAll(new String[]{"ed1", "br0", "bx1", "md1"},
+                    "HnAppCheckJob", "insertRiskAppDb");
             Method m = null;
             for (Class<?> c : cs) {
                 for (Method mm : c.getDeclaredMethods()) {
@@ -796,7 +1216,9 @@ public final class InstallerHook {
             // c01.d(Context, cb). The callback interface is isomorphic on
             // both builds (a(boolean) + b()), and it is always the LAST
             // parameter.
-            Class<?>[] cs = locateAll(new String[]{"lt1", "c01"},
+            // 38.301 lt1.B0 · 14.0.22.x c01.d · 14.0.39.301 vt1.C0(Context,
+            // String, int, yt1) — same shape as the 38.301 overload
+            Class<?>[] cs = locateAll(new String[]{"lt1", "c01", "vt1"},
                     "AppClearRestrictionUtils", "AppMarketInteractionUtil");
             Method m = resolveAny(cs, "void",
                     "android.content.Context", "java.lang.String", "int", "?");
@@ -884,7 +1306,9 @@ public final class InstallerHook {
         try {
             // 38.301 xt1.O and 14.0.22.x nz0.g share the exact signature
             // (DivideButtonModule) -> boolean — one rule covers both.
-            Class<?>[] cs = locateAll(new String[]{"xt1", "nz0", "hc2", "pz0"},
+            // 38.301 xt1.O · 14.0.22.x nz0.g · 14.0.39.301 hu1.P — the
+            // (DivideButtonModule) -> boolean shape is unchanged
+            Class<?>[] cs = locateAll(new String[]{"xt1", "nz0", "hc2", "pz0", "hu1"},
                     "WebInterceptStrategyUtil", "LinkTrafficUtils");
             Method m = resolveAny(cs, "boolean",
                     "com.hihonor.packageinstaller.entity.resp.DivideButtonModule");
@@ -905,7 +1329,9 @@ public final class InstallerHook {
         try {
             // 38.301 xt1.t and 14.0.22.x nz0.d share the exact signature
             // (CleanSpeedUpModule, boolean, boolean) -> boolean.
-            Class<?>[] cs = locateAll(new String[]{"xt1", "nz0", "hc2", "pz0"},
+            // 14.0.39.301: hu1.u(CleanSpeedUpModule, boolean, boolean) ->
+            // boolean — same shape as the 38.301 / 14.0.22.x rule
+            Class<?>[] cs = locateAll(new String[]{"xt1", "nz0", "hc2", "pz0", "hu1"},
                     "WebInterceptStrategyUtil", "LinkTrafficUtils");
             Method m = resolveAny(cs, "boolean",
                     "com.hihonor.packageinstaller.entity.resp.CleanSpeedUpModule",
@@ -927,9 +1353,13 @@ public final class InstallerHook {
         try {
             // card-tips gate: 38.301 lc1.D1 is (CardTipsRecord, String,
             // boolean, String) -> boolean; 14.0.22.x js0.f is the 3-arg
-            // ancestor. Try both signatures across all candidates.
-            Class<?>[] cs = locateAll(new String[]{"lc1", "js0", "vz1"},
-                    "AdNetworkUtil", "SafeModeShowUtils");
+            // ancestor; 14.0.39.301 is tc1.C1 (same 4-arg shape). The class
+            // no longer references "AdNetworkUtil" on 326/327/39.301, so the
+            // strict {AdNetworkUtil, SafeModeShowUtils} set only covers the
+            // old builds; the single-string set covers the new ones.
+            Class<?>[] cs = locateAllUnion(new String[]{"lc1", "js0", "vz1", "tc1"},
+                    new String[]{"AdNetworkUtil", "SafeModeShowUtils"},
+                    new String[]{"SafeModeShowUtils"});
             Method m = resolveAny(cs, "boolean",
                     "com.hihonor.packageinstaller.utils.CardTipsRecord",
                     "java.lang.String", "boolean", "java.lang.String");
@@ -943,7 +1373,7 @@ public final class InstallerHook {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!defaultPurify()) return;
-                        param.setResult(on(K_INFOCARD));
+                        param.setResult(on(Cfg.K_INFOCARD));
                     }
                 });
                 XposedBridge.log(TAG + "[adapt] card-tips gate hooked: " + m);
@@ -959,10 +1389,16 @@ public final class InstallerHook {
                 XposedBridge.hookMethod(k, new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
-                        if (defaultPurify() && on(K_INFOCARD)) param.setResult(null);
+                        if (defaultPurify() && on(Cfg.K_INFOCARD)) param.setResult(null);
                     }
                 });
                 XposedBridge.log(TAG + "[adapt] preinstall-tip hooked: " + k);
+            } else if (!sPreinstallAbsent) {
+                sPreinstallAbsent = true;
+                // whole-app signature scan: 14.0.39.301 dropped the
+                // (PIA, RbiTempBean) preinstall card entirely — behavioural
+                // gap, not a resolver miss. Keep the hook for older builds.
+                XposedBridge.log(TAG + "[adapt] preinstall-tip absent on this build (expected on 39.301)");
             }
         } catch (Throwable t) {
             XposedBridge.log(TAG + "card-tips adaptive hook failed: " + t);
@@ -971,10 +1407,12 @@ public final class InstallerHook {
 
     private static void hookSafeModeCardInfoCompatV2(ClassLoader cl) {
         try {
-            // info-card fill: 38.301 lc1.u2 and 14.0.22.x js0.j share the
-            // exact signature (View, String, Activity, boolean) -> void.
-            Class<?>[] cs = locateAll(new String[]{"lc1", "js0", "vz1"},
-                    "AdNetworkUtil", "SafeModeShowUtils");
+            // info-card fill: 38.301 lc1.u2 · 14.0.22.x js0.j ·
+            // 14.0.39.301 tc1.s2 — all share (View, String, Activity,
+            // boolean) -> void. Same anchor-set split as the card-tips gate.
+            Class<?>[] cs = locateAllUnion(new String[]{"lc1", "js0", "vz1", "tc1"},
+                    new String[]{"AdNetworkUtil", "SafeModeShowUtils"},
+                    new String[]{"SafeModeShowUtils"});
             Method m = resolveAny(cs, "void",
                     "android.view.View", "java.lang.String",
                     "android.app.Activity", "boolean");
@@ -982,7 +1420,7 @@ public final class InstallerHook {
             XposedBridge.hookMethod(m, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
-                    if (!defaultPurify() || !on(K_INFOCARD)) return;
+                    if (!defaultPurify() || !on(Cfg.K_INFOCARD)) return;
                     try {
                         fillInfoCard((View) param.args[0], (Activity) param.args[2], 0);
                     } catch (Throwable t) {
@@ -1007,9 +1445,13 @@ public final class InstallerHook {
      */
     private static void hookStagingFastPathCompatV2(ClassLoader cl) {
         try {
-            // po1.a's 18-parameter shape is entirely framework types — the
-            // most unique signature in the app; resolve by shape, not name.
-            Class<?>[] cs = locateAll(new String[]{"po1", "eu1"},
+            // po1.a's 16-parameter shape is entirely framework types — the
+            // most unique signature in the app; resolve by shape, not name
+            // (param count verified against the 38.301 decompile).
+            // 14.0.39.301: ap1.a keeps the 16-param shape and field "a" is
+            // still a WeakReference to InstallStaging (lm1), so the body below
+            // (get() -> isActive() -> p(-1)) is unchanged.
+            Class<?>[] cs = locateAll(new String[]{"po1", "eu1", "ap1"},
                     "InstallStagingPresenter", "TencentNoDetectUtils");
             Method m = resolveAny(cs, "void",
                     "java.lang.String", "java.lang.String", "java.lang.String",
