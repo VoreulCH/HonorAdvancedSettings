@@ -15,6 +15,12 @@
 -keep class io.github.voreulch.honoradvanced.GlassHook { *; }
 -keep class io.github.voreulch.honoradvanced.InstallerHook { *; }
 -keep class io.github.voreulch.honoradvanced.Cfg { *; }
+-keep class io.github.voreulch.honoradvanced.MiscHook { *; }
+-keep class io.github.voreulch.honoradvanced.Diag { *; }
+-keep class io.github.voreulch.honoradvanced.DexKitHelper { *; }
+
+# BuildConfig 的版本常量在 hook 日志里被引用；R8 会把它们内联，但显式保留更保险
+-keep class io.github.voreulch.honoradvanced.BuildConfig { *; }
 
 # ===== Compose / Kotlin / KMP =====
 # Compose compiler already emits keep rules for @Composable call sites,
