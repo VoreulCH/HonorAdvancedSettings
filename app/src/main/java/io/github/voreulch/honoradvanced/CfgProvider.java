@@ -74,6 +74,9 @@ public final class CfgProvider extends ContentProvider {
         if (Cfg.K_NODUCK.equals(key)) {
             return false; // opt-in: hooks system_server — must stay off until enabled
         }
+        if (Cfg.K_HOTTEMP.equals(key)) {
+            return false; // opt-in: root-level thermal bypass — always explicit
+        }
         return true; // K_SYSTEM / K_PURIFY had no legacy counterpart
     }
 
