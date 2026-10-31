@@ -101,9 +101,9 @@ public final class InstallerHook {
                     n++;
                 }
             }
-            XposedBridge.log(TAG + "system_server isDowngradePermitted hooked: " + n);
+            Diag.log("system_server isDowngradePermitted hooked: " + n);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "system_server downgrade hook failed: " + t);
+            Diag.log("system_server downgrade hook failed: " + t);
         }
     }
 
@@ -122,9 +122,9 @@ public final class InstallerHook {
                             }
                         }
                     });
-            XposedBridge.log(TAG + "hook createSession(allow downgrade) ok");
+            Diag.log("hook createSession(allow downgrade) ok");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "hook createSession failed: " + t);
+            Diag.log("hook createSession failed: " + t);
         }
     }
 
@@ -139,9 +139,9 @@ public final class InstallerHook {
                             }
                         }
                     });
-            XposedBridge.log(TAG + "hook Socket.connect ok");
+            Diag.log("hook Socket.connect ok");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "hook Socket.connect failed: " + t);
+            Diag.log("hook Socket.connect failed: " + t);
         }
     }
 
@@ -189,21 +189,21 @@ public final class InstallerHook {
                                 .getButton(android.content.DialogInterface.BUTTON_POSITIVE);
                         if (ok == null) return;
                         sRiskAutoCount++;
-                        XposedBridge.log(TAG + "[adapt] risk install dialog auto-continue ("
+                        Diag.log("[adapt] risk install dialog auto-continue ("
                                 + sRiskAutoCount + ")");
                         ok.performClick();
                     } catch (Throwable t) {
-                        XposedBridge.log(TAG + "risk dialog auto-continue error: " + t);
+                        Diag.log("risk dialog auto-continue error: " + t);
                     }
                 }
             });
             if (unhooks == null || unhooks.isEmpty()) {
-                XposedBridge.log(TAG + "risk-tip dialog has no onStart override, skip");
+                Diag.log("risk-tip dialog has no onStart override, skip");
                 return;
             }
-            XposedBridge.log(TAG + "[adapt] risk-tip dialog auto-continue hooked");
+            Diag.log("[adapt] risk-tip dialog auto-continue hooked");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "risk-tip dialog hook skipped: " + t);
+            Diag.log("risk-tip dialog hook skipped: " + t);
         }
     }
 
@@ -249,7 +249,7 @@ public final class InstallerHook {
     private static final Handler sAnonMain = new Handler(Looper.getMainLooper());
 
     private static void anonLog(String msg) {
-        XposedBridge.log(TAG + "[anon] " + msg);
+        Diag.log("[anon] " + msg);
     }
 
     private static void anonNoAnchor(String why) {
@@ -437,12 +437,12 @@ public final class InstallerHook {
                 }
             });
             if (unhooks == null || unhooks.isEmpty()) {
-                XposedBridge.log(TAG + "[adapt] anonymous-source onStart no anchor, fallback only");
+                Diag.log("[adapt] anonymous-source onStart no anchor, fallback only");
                 return;
             }
-            XposedBridge.log(TAG + "[adapt] anonymous-source zero-popup installed");
+            Diag.log("[adapt] anonymous-source zero-popup installed");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "anonymous-source zero-popup hook skipped: " + t);
+            Diag.log("anonymous-source zero-popup hook skipped: " + t);
         }
     }
 
@@ -509,17 +509,17 @@ public final class InstallerHook {
                             }
                         }, 200L);
                     } catch (Throwable t) {
-                        XposedBridge.log(TAG + "anonymous-source fallback error: " + t);
+                        Diag.log("anonymous-source fallback error: " + t);
                     }
                 }
             });
             if (unhooks == null || unhooks.isEmpty()) {
-                XposedBridge.log(TAG + "[adapt] anonymous-source no anchor (onCreateDialog missing)");
+                Diag.log("[adapt] anonymous-source no anchor (onCreateDialog missing)");
                 return;
             }
-            XposedBridge.log(TAG + "[adapt] anonymous-source fallback installed");
+            Diag.log("[adapt] anonymous-source fallback installed");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "anonymous-source fallback hook skipped: " + t);
+            Diag.log("anonymous-source fallback hook skipped: " + t);
         }
     }
 
@@ -602,7 +602,7 @@ public final class InstallerHook {
             sDgLogged++;
             long oldVc = oldInfo != null ? oldInfo.getLongVersionCode() : -1L;
             long newVc = newInfo.getLongVersionCode();
-            XposedBridge.log(TAG + "[dg] card pkg=" + pkgName
+            Diag.log("[dg] card pkg=" + pkgName
                     + " old=" + (oldInfo == null ? "none" : oldVc)
                     + " new=" + newVc
                     + " downgrade=" + (oldInfo != null && newVc < oldVc));
@@ -665,7 +665,7 @@ public final class InstallerHook {
             }
         }
         addAuthorLink(card, activity);
-        XposedBridge.log(TAG + "info card filled for " + pkgName);
+        Diag.log("info card filled for " + pkgName);
     }
 
     private static void addAuthorLink(View card, final Activity activity) {
@@ -715,7 +715,7 @@ public final class InstallerHook {
                     activity.startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW,
                             android.net.Uri.parse("https://github.com/VoreulCH")));
                 } catch (Throwable t) {
-                    XposedBridge.log(TAG + "open repo error: " + t);
+                    Diag.log("open repo error: " + t);
                 }
             }
         });
@@ -897,7 +897,7 @@ public final class InstallerHook {
             Class<?> c = DexKitHelper.findClassByStrings(sApk, HookEnv.cl, set);
             if (c != null && !out.contains(c)) {
                 out.add(c);
-                XposedBridge.log(TAG + "[adapt] dexkit anchor hit: " + c.getName());
+                Diag.log("[adapt] dexkit anchor hit: " + c.getName());
             }
         }
         for (String n : knownNames) {
@@ -995,7 +995,7 @@ public final class InstallerHook {
                 }
                 if (m != null) break;
             }
-            if (m == null) { XposedBridge.log(TAG + "security-check method not resolved, skip"); return; }
+            if (m == null) { Diag.log("security-check method not resolved, skip"); return; }
             final Method target = m;
             XposedBridge.hookMethod(target, new XC_MethodHook() {
                 @Override
@@ -1011,9 +1011,9 @@ public final class InstallerHook {
                     param.setResult(null);
                 }
             });
-            XposedBridge.log(TAG + "[adapt] security-check hooked: " + target);
+            Diag.log("[adapt] security-check hooked: " + target);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "security-check adaptive hook failed: " + t);
+            Diag.log("security-check adaptive hook failed: " + t);
         }
     }
 
@@ -1078,13 +1078,13 @@ public final class InstallerHook {
                 }
                 dm.setAccessible(true);
                 dm.invoke(callback, pass, v2);
-                XposedBridge.log(TAG + "[adapt] security check skipped (383 recipe)");
+                Diag.log("[adapt] security check skipped (383 recipe)");
                 scheduleHideSecurityCard(callback);
                 return true;
             }
             return false;
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "383 recipe error: " + t);
+            Diag.log("383 recipe error: " + t);
             return false;
         }
     }
@@ -1102,7 +1102,7 @@ public final class InstallerHook {
                     Object cand = fm.invoke(controller);
                     if (cand == null) continue;
                     if (safeIntField(cand, "e") == 1 && safeBoolField(cand, "b")) {
-                        XposedBridge.log(TAG + "[adapt] using controller default pass result");
+                        Diag.log("[adapt] using controller default pass result");
                         return cand;
                     }
                 } catch (Throwable ignored) {
@@ -1196,16 +1196,16 @@ public final class InstallerHook {
                         try {
                             d.invoke(cb, pr);
                         } catch (Throwable t) {
-                            XposedBridge.log(TAG + "326 deliver error: " + t);
+                            Diag.log("326 deliver error: " + t);
                         }
                     }
-                    XposedBridge.log(TAG + "[adapt] security check skipped (326 recipe, " + ds.length + " channel(s))");
+                    Diag.log("[adapt] security check skipped (326 recipe, " + ds.length + " channel(s))");
                     scheduleHideSecurityCard(cb);
                 }
             });
             return true;
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "326 recipe error: " + t);
+            Diag.log("326 recipe error: " + t);
             return false;
         }
     }
@@ -1225,7 +1225,7 @@ public final class InstallerHook {
             if (m == null) {
                 m = resolveAny(cs, "void", "android.content.Context", "?");
             }
-            if (m == null) { XposedBridge.log(TAG + "fingerprint method not resolved, skip"); return; }
+            if (m == null) { Diag.log("fingerprint method not resolved, skip"); return; }
             XposedBridge.hookMethod(m, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
@@ -1235,17 +1235,17 @@ public final class InstallerHook {
                         if (cb != null) {
                             cb.getClass().getMethod("b").invoke(cb);
                             cb.getClass().getMethod("a", boolean.class).invoke(cb, true);
-                            XposedBridge.log(TAG + "fingerprint auth bypassed");
+                            Diag.log("fingerprint auth bypassed");
                         }
                     } catch (Throwable t) {
-                        XposedBridge.log(TAG + "fingerprint error: " + t);
+                        Diag.log("fingerprint error: " + t);
                     }
                     param.setResult(null);
                 }
             });
-            XposedBridge.log(TAG + "[adapt] fingerprint hooked: " + m);
+            Diag.log("[adapt] fingerprint hooked: " + m);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "fingerprint adaptive hook failed: " + t);
+            Diag.log("fingerprint adaptive hook failed: " + t);
         }
     }
 
@@ -1289,16 +1289,16 @@ public final class InstallerHook {
                             "java.lang.String", "java.lang.String", "?", "?");
                 }
             }
-            if (m == null) { XposedBridge.log(TAG + "ad method not resolved, skip"); return; }
+            if (m == null) { Diag.log("ad method not resolved, skip"); return; }
             XposedBridge.hookMethod(m, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (defaultPurify()) param.setResult(null);
                 }
             });
-            XposedBridge.log(TAG + "[adapt] ad hooked: " + m);
+            Diag.log("[adapt] ad hooked: " + m);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "ad adaptive hook failed: " + t);
+            Diag.log("ad adaptive hook failed: " + t);
         }
     }
 
@@ -1312,16 +1312,16 @@ public final class InstallerHook {
                     "WebInterceptStrategyUtil", "LinkTrafficUtils");
             Method m = resolveAny(cs, "boolean",
                     "com.hihonor.packageinstaller.entity.resp.DivideButtonModule");
-            if (m == null) { XposedBridge.log(TAG + "diversion method not resolved, skip"); return; }
+            if (m == null) { Diag.log("diversion method not resolved, skip"); return; }
             XposedBridge.hookMethod(m, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (defaultPurify()) param.setResult(false);
                 }
             });
-            XposedBridge.log(TAG + "[adapt] diversion hooked: " + m);
+            Diag.log("[adapt] diversion hooked: " + m);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "diversion adaptive hook failed: " + t);
+            Diag.log("diversion adaptive hook failed: " + t);
         }
     }
 
@@ -1336,16 +1336,16 @@ public final class InstallerHook {
             Method m = resolveAny(cs, "boolean",
                     "com.hihonor.packageinstaller.entity.resp.CleanSpeedUpModule",
                     "boolean", "boolean");
-            if (m == null) { XposedBridge.log(TAG + "clean-cache method not resolved, skip"); return; }
+            if (m == null) { Diag.log("clean-cache method not resolved, skip"); return; }
             XposedBridge.hookMethod(m, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (defaultPurify()) param.setResult(true);
                 }
             });
-            XposedBridge.log(TAG + "[adapt] clean-cache hooked: " + m);
+            Diag.log("[adapt] clean-cache hooked: " + m);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "clean-cache adaptive hook failed: " + t);
+            Diag.log("clean-cache adaptive hook failed: " + t);
         }
     }
 
@@ -1376,9 +1376,9 @@ public final class InstallerHook {
                         param.setResult(on(Cfg.K_INFOCARD));
                     }
                 });
-                XposedBridge.log(TAG + "[adapt] card-tips gate hooked: " + m);
+                Diag.log("[adapt] card-tips gate hooked: " + m);
             } else {
-                XposedBridge.log(TAG + "card-tips gate not resolved, skip");
+                Diag.log("card-tips gate not resolved, skip");
             }
             // 14.0.22.x only: js0.k(PIA, RbiTempBean) preinstall-tip card —
             // absent on 38.301, resolveByParams simply misses and we move on
@@ -1392,16 +1392,16 @@ public final class InstallerHook {
                         if (defaultPurify() && on(Cfg.K_INFOCARD)) param.setResult(null);
                     }
                 });
-                XposedBridge.log(TAG + "[adapt] preinstall-tip hooked: " + k);
+                Diag.log("[adapt] preinstall-tip hooked: " + k);
             } else if (!sPreinstallAbsent) {
                 sPreinstallAbsent = true;
                 // whole-app signature scan: 14.0.39.301 dropped the
                 // (PIA, RbiTempBean) preinstall card entirely — behavioural
                 // gap, not a resolver miss. Keep the hook for older builds.
-                XposedBridge.log(TAG + "[adapt] preinstall-tip absent on this build (expected on 39.301)");
+                Diag.log("[adapt] preinstall-tip absent on this build (expected on 39.301)");
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "card-tips adaptive hook failed: " + t);
+            Diag.log("card-tips adaptive hook failed: " + t);
         }
     }
 
@@ -1416,7 +1416,7 @@ public final class InstallerHook {
             Method m = resolveAny(cs, "void",
                     "android.view.View", "java.lang.String",
                     "android.app.Activity", "boolean");
-            if (m == null) { XposedBridge.log(TAG + "info-card method not resolved, skip"); return; }
+            if (m == null) { Diag.log("info-card method not resolved, skip"); return; }
             XposedBridge.hookMethod(m, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
@@ -1424,14 +1424,14 @@ public final class InstallerHook {
                     try {
                         fillInfoCard((View) param.args[0], (Activity) param.args[2], 0);
                     } catch (Throwable t) {
-                        XposedBridge.log(TAG + "info card error: " + t);
+                        Diag.log("info card error: " + t);
                     }
                     param.setResult(null);
                 }
             });
-            XposedBridge.log(TAG + "[adapt] info-card hooked: " + m);
+            Diag.log("[adapt] info-card hooked: " + m);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "info-card adaptive hook failed: " + t);
+            Diag.log("info-card adaptive hook failed: " + t);
         }
     }
 
@@ -1459,7 +1459,7 @@ public final class InstallerHook {
                     "java.lang.String", "java.lang.String", "java.lang.String",
                     "int", "int", "long", "int", "int",
                     "java.lang.String", "java.lang.String");
-            if (m == null) { XposedBridge.log(TAG + "staging method not resolved, skip"); return; }
+            if (m == null) { Diag.log("staging method not resolved, skip"); return; }
             XposedBridge.hookMethod(m, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
@@ -1470,17 +1470,17 @@ public final class InstallerHook {
                         if (staging != null
                                 && (Boolean) XposedHelpers.callMethod(staging, "isActive")) {
                             XposedHelpers.callMethod(staging, "p", -1);
-                            XposedBridge.log(TAG + "staging fast path (skip network waits)");
+                            Diag.log("staging fast path (skip network waits)");
                         }
                     } catch (Throwable t) {
-                        XposedBridge.log(TAG + "staging fast path error: " + t);
+                        Diag.log("staging fast path error: " + t);
                     }
                     param.setResult(null);
                 }
             });
-            XposedBridge.log(TAG + "[adapt] staging fast-path hooked: " + m);
+            Diag.log("[adapt] staging fast-path hooked: " + m);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "staging adaptive hook failed: " + t);
+            Diag.log("staging adaptive hook failed: " + t);
         }
     }
 
@@ -1506,7 +1506,7 @@ public final class InstallerHook {
         try {
             final Activity act = findActivity(callbackOrActivity);
             if (act == null) {
-                XposedBridge.log(TAG + "[adapt] hide card: no activity reached from callback");
+                Diag.log("[adapt] hide card: no activity reached from callback");
                 return;
             }
             final int resid = act.getResources().getIdentifier(
@@ -1526,7 +1526,7 @@ public final class InstallerHook {
                         }
                         if (v.getVisibility() == View.VISIBLE) {
                             v.setVisibility(View.GONE);
-                            XposedBridge.log(TAG + "[adapt] security result card hidden");
+                            Diag.log("[adapt] security result card hidden");
                         }
                     } catch (Throwable ignored) {
                     }
@@ -1536,7 +1536,7 @@ public final class InstallerHook {
             // hiding on the next main-loop tick beats it to the first frame
             new Handler(Looper.getMainLooper()).post(hide);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "hide card error: " + t);
+            Diag.log("hide card error: " + t);
         }
     }
 
