@@ -53,8 +53,243 @@ public final class MiscHook {
     private MiscHook() {
     }
 
+    // ==================== PowerGenie thermal engine (com.hihonor.powergenie) ====================
+
+    /**
+     * 压制 PowerGenie 自有温控（2026-10-31, round 3). PowerGenie (HAware.apk)
+     * runs its OWN thermal engine that reads the HAL directly — it never calls
+     * the Java PowerManager/ThermalService API, so the system_server status
+     * normalisation cannot reach it. Verified against the current HAware dump
+     * (dexdump, 2026-10-31): the engine ships UNOBFUSCATED in
+     * `com.hihonor.powergenie.core.thermal.ThermalManager` (stable across
+     * builds, unlike the policy classes a1/b1 and the v0.* analyzer):
+     *
+     *   handleThermalEvent(g)        single dispatcher — calls
+     *                                handleThermalAppAction / AppLevel /
+     *                                BgFrz / Media (the four effect handlers)
+     *   handleThermalAppAction(g)    -> p0.o(int) + f0.handleStateChanged(...)
+     *                                   (per-app thermal actions)
+     *   handleThermalBgFrz(g)        -> p0.t(boolean) (background freeze)
+     *   handleThermalMedia(g)        -> p0.o(int) (media/video limits)
+     *   handleThermalAppLevel(g)     -> mCurThermalLevelMap.put(...)
+     *   getCurThermalLevel(String,int) -> mCurThermalLevelMap.get(key)
+     *
+     * Blocking the dispatcher makes all four policies no-ops in one place;
+     * the getter is additionally pinned to level 0 so any consumer that reads
+     * the cached level sees the coolest value. Temperature reporting itself is
+     * NOT faked (charging/battery logic keeps its real numbers).
+     *
+     * SAFETY: com.hihonor.powergenie is a normal app process — a hook failure
+     * can never touch the boot path. Every callback is try/catch'd and gated
+     * by the same system-property switch as the rest of the thermal bypass
+     * (Cfg.hottempOn(), readable from any process, no binder).
+     */
+    public static void initPowerGenie(ClassLoader cl) {
+        // Idempotent, but ONLY after a successful hook pass: the first
+        // handleLoadPackage in the iaware process can arrive before HAware's
+        // dex is reachable from that classloader (observed CNFE at boot,
+        // 2026-10-31), and the follow-up callback for the powergenie package
+        // must still be allowed to try. Bounded to 3 attempts.
+        if (sPgDone || sPgTries >= 3) return;
+        sPgTries++;
+        final Class<?> tm;
+        try {
+            tm = cl.loadClass("com.hihonor.powergenie.core.thermal.ThermalManager");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "powergenie: class not in this CL yet (try " + sPgTries + ")");
+            return; // do NOT mark done — a later callback may carry the real CL
+        }
+        sPgDone = true;
+        int n = 0;
+        try {
+            for (final Method m : tm.getDeclaredMethods()) {
+                final String nm = m.getName();
+                final boolean dispatcher = "handleThermalEvent".equals(nm);
+                final boolean level = "getCurThermalLevel".equals(nm);
+                if (!dispatcher && !level) continue;
+                if (dispatcher && m.getReturnType() != void.class) continue;
+                if (level && m.getReturnType() != int.class) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            if (!Cfg.hottempOn()) return;
+                            if (dispatcher) {
+                                param.setResult(null);
+                                if (sPgBlocked < 5) {
+                                    sPgBlocked++;
+                                    XposedBridge.log(TAG + "powergenie: thermal policy suppressed (" + sPgBlocked + ")");
+                                }
+                            } else {
+                                param.setResult(0); // coolest level
+                            }
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + "powergenie gate error: " + t);
+                        }
+                    }
+                });
+                n++;
+                XposedBridge.log(TAG + "powergenie: hooked " + nm);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "powergenie: ThermalManager missing (" + t.getClass().getSimpleName() + ")");
+        }
+        XposedBridge.log(TAG + "powergenie: thermal hooks installed " + n
+                + (n == 0 ? " (WARN: no target matched — PowerGenie build changed?)" : ""));
+    }
+
+    private static int sPgBlocked = 0;
+    private static boolean sPgDone = false;
+    private static int sPgTries = 0;
+    private static boolean sAmHooked = false;
+
+    // ==================== thermal normalization (system_server) ====================
+
+    /**
+     * 高温不降级 (2026-10-31, round 2): the user wants the phone to behave
+     * EXACTLY as normal while hot — not merely hide the popup. This hooks the
+     * Java thermal pipeline at its source inside system_server:
+     *
+     *   ThermalManagerService.setStatusLocked(int)   -> force status 0 (NONE)
+     *       every Java consumer (SystemUI PowerUI, GameKit, apps' thermal
+     *       listeners, PowerManager.getCurrentThermalStatus) then sees a
+     *       normal device: no warnings, no per-app throttling decisions
+     *   ThermalManagerService$2.getCurrentThermalStatus() -> 0 (belt+braces)
+     *   ThermalManagerService$2.getCurrentThermalStatusForDevice() -> 0
+     *   ThermalManagerService.shutdownIfNeeded(Temperature) -> skipped
+     *       (user decision 2026-10-31: the emergency thermal shutdown is part
+     *        of the restriction being removed; verified that this method reads
+     *        the RAW HAL Temperature — it is NOT driven by mStatus, so it is
+     *        the only place the shutdown lives and must be hooked here)
+     *   PowerManagerService$BinderService.setMaxBrightnessFromThermal()
+     *       -> skipped: Honor's brightness cap at high temperature
+     *
+     * NOT touched (below Xposed reach, still protecting the SoC):
+     *   - MTK kernel/HAL throttling (ThermalDaemon / libPowerHal) — native.
+     *   - Vendor thermal HAL shutdown (if the HAL itself cuts power).
+     *
+     * BOOT SAFETY (explicit requirement): hooks only add an argument rewrite
+     * or a skip on already-running service methods — no class init is forced,
+     * nothing runs before the service starts, every callback is try/catch'd
+     * (an exception inside a hook is swallowed by Xposed and the original
+     * method continues), every target is resolved by NAME with a shape check,
+     * and a per-process guard makes repeated handleLoadPackage calls (Vector
+     * does that) idempotent. Worst case = a hook never installs and stock
+     * thermal behaviour stays.
+     *
+     * COST: every callback reads Cfg.hottempOn(), which is a cached boolean
+     * (one property read per second per process, resolved Method, no binder,
+     * no allocation). Per-call overhead is a volatile read + uptimeMillis.
+     */
+    public static void initSystemServer(ClassLoader cl) {
+        hookThermalNormalize(cl);
+    }
+
+    private static boolean sSysThermalDone = false;
+
+    private static void hookThermalNormalize(ClassLoader cl) {
+        if (sSysThermalDone) return; // idempotent across duplicate load callbacks
+        sSysThermalDone = true;
+        int ok = 0;
+        try {
+            Class<?> tms = cl.loadClass("com.android.server.power.thermal.ThermalManagerService");
+            for (final Method m : tms.getDeclaredMethods()) {
+                final String nm = m.getName();
+                if (m.getReturnType() != void.class) continue;
+                Class<?>[] ps = m.getParameterTypes();
+                if ("setStatusLocked".equals(nm) && ps.length == 1 && ps[0] == int.class) {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (Cfg.hottempOn()) param.args[0] = 0;
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "thermal setStatus gate error: " + t);
+                            }
+                        }
+                    });
+                    ok++;
+                    XposedBridge.log(TAG + "thermal: status normalized (setStatusLocked -> NONE)");
+                } else if ("shutdownIfNeeded".equals(nm) && ps.length == 1
+                        && "android.os.Temperature".equals(ps[0].getName())) {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!Cfg.hottempOn()) return;
+                                param.setResult(null);
+                                if (sShutdownBlocked < 3) {
+                                    sShutdownBlocked++;
+                                    XposedBridge.log(TAG + "thermal: emergency shutdown suppressed (" + sShutdownBlocked + ")");
+                                }
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "thermal shutdown gate error: " + t);
+                            }
+                        }
+                    });
+                    ok++;
+                    XposedBridge.log(TAG + "thermal: shutdownIfNeeded suppressed");
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "thermal: ThermalManagerService missing (" + t.getClass().getSimpleName() + ")");
+        }
+        try {
+            Class<?> bs = cl.loadClass("com.android.server.power.thermal.ThermalManagerService$2");
+            for (final Method m : bs.getDeclaredMethods()) {
+                final String nm = m.getName();
+                boolean global = "getCurrentThermalStatus".equals(nm);
+                boolean perDev = "getCurrentThermalStatusForDevice".equals(nm);
+                if (!global && !perDev) continue;
+                if (m.getReturnType() != int.class) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            if (Cfg.hottempOn()) param.setResult(0);
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + "thermal getter gate error: " + t);
+                        }
+                    }
+                });
+                ok++;
+                XposedBridge.log(TAG + "thermal: " + nm + " -> NONE");
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "thermal: BinderService missing (" + t.getClass().getSimpleName() + ")");
+        }
+        try {
+            Class<?> pm = cl.loadClass("com.android.server.power.PowerManagerService$BinderService");
+            for (final Method m : pm.getDeclaredMethods()) {
+                if (!"setMaxBrightnessFromThermal".equals(m.getName())) continue;
+                if (m.getReturnType() != void.class) continue; // never fake a return value
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            if (Cfg.hottempOn()) param.setResult(null);
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + "thermal brightness gate error: " + t);
+                        }
+                    }
+                });
+                ok++;
+                XposedBridge.log(TAG + "thermal: thermal brightness cap skipped");
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "thermal: PowerManagerService$BinderService missing (" + t.getClass().getSimpleName() + ")");
+        }
+        XposedBridge.log(TAG + "thermal: hooks installed " + ok
+                + (ok == 0 ? " (WARN: nothing matched — ThermalManagerService changed?)" : ""));
+    }
+
+    private static int sShutdownBlocked = 0;
+
     /** called from MainHook for the SystemUI process only. */
     public static void initSystemUI(ClassLoader cl) {
+        hookHighTempWarning(cl); // misc line: suppress the high-temperature popups
+        if (sAmHooked) return;   // Vector can call handleLoadPackage twice per
+        sAmHooked = true;        // process; never mount the same methods twice
         try {
             Class<?> am = cl.loadClass("android.media.AudioManager");
             int n = 0;
@@ -84,6 +319,90 @@ public final class MiscHook {
         } catch (Throwable t) {
             XposedBridge.log(TAG + "hook AudioManager failed: " + t);
         }
+    }
+
+    // ==================== high-temperature popup suppression ====================
+
+    /**
+     * 屏蔽高温提示 (2026-10-31 field report: at high temperature the system
+     * pops a modal "高温提示/建议暂停使用" dialog — screenshot evidence — and
+     * while it is up every app is effectively unusable).
+     *
+     * Source chain (verified against the current SystemUI dex + the
+     * 2026-10 decompile): system_server sends
+     * `hihonor.intent.action.THERMAL_TO_SYSTEMUI` with
+     *   high_temp_warning=1 -> PowerNotificationWarnings.responseHighTempBroadcast()
+     *                          (the popup in the screenshot; body text =
+     *                          string/popupwindow_high02, button = high03)
+     *   high_temp_warning=2 -> showHighTempPreWarningDialog (D8 synthetic,
+     *                          name contains "HighTempPreWarning")
+     *   shutdown=1          -> thermal shutdown countdown dialog — LEFT ALONE
+     *                          (a real shutdown is announced by the system;
+     *                          hiding that notice would only confuse)
+     *
+     * Only these two informational dialogs are suppressed. The kernel/HAL
+     * thermal throttling (screen dimming, CPU limits) and the emergency
+     * shutdown itself are untouched — this hook removes the modal UI, not
+     * the hardware protection.
+     *
+     * BOOT SAFETY: mounted in the SystemUI scope only. A mistake here can
+     * never reach system_server or the boot sequence — worst case SystemUI
+     * restarts itself (no boot-animation hang). Every hook is independently
+     * try/catch'd, resolution is by method NAME (no obfuscated index baked
+     * in), and the callbacks only read the Cfg snapshot (no binder I/O).
+     */
+    private static int sHotTempBlocked = 0;
+    private static boolean sHotTempResolved = false;  // idempotent: Vector may
+    private static boolean sHotTempMissLogged = false; // call handleLoadPackage twice
+
+    private static void hookHighTempWarning(ClassLoader cl) {
+        if (sHotTempResolved) return; // already hooked in this process
+        final Class<?> pnw;
+        try {
+            pnw = cl.loadClass("com.android.systemui.power.PowerNotificationWarnings");
+        } catch (Throwable t) {
+            if (!sHotTempMissLogged) {
+                sHotTempMissLogged = true;
+                XposedBridge.log(TAG + "high-temp: class not in this CL yet (" + t.getClass().getSimpleName() + ")");
+            }
+            return;
+        }
+        sHotTempResolved = true;
+        XC_MethodHook blocker = new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                try {
+                    if (!Cfg.hottempOn()) return;
+                    param.setResult(null);
+                    if (sHotTempBlocked < 5) {
+                        sHotTempBlocked++;
+                        XposedBridge.log(TAG + "high-temp popup suppressed (" + sHotTempBlocked + ")");
+                    }
+                } catch (Throwable t) {
+                    XposedBridge.log(TAG + "high-temp gate error: " + t);
+                }
+            }
+        };
+        int hooked = 0;
+        try {
+            for (Method m : pnw.getDeclaredMethods()) {
+                String nm = m.getName();
+                boolean main = nm.equals("responseHighTempBroadcast");
+                boolean pre = nm.contains("HighTempPreWarning");
+                if (!main && !pre) continue;
+                try {
+                    XposedBridge.hookMethod(m, blocker);
+                    hooked++;
+                    XposedBridge.log(TAG + "hooked high-temp popup: " + nm);
+                } catch (Throwable t) {
+                    XposedBridge.log(TAG + "high-temp hook failed: " + nm + " : " + t);
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "high-temp scan failed: " + t);
+        }
+        XposedBridge.log(TAG + "high-temp popup hooks installed: " + hooked
+                + (hooked == 0 ? " (WARN: PowerNotificationWarnings changed — popup no longer blocked)" : ""));
     }
 
     /** flatten AudioFocusRequest objects into their gain int + attributes,
