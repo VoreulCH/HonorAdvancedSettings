@@ -46,8 +46,18 @@ public final class CfgProvider extends ContentProvider {
         try {
             android.content.Context c = getContext();
             if (c != null) {
-                Cfg.migrateHlSemantics(
-                        c.getSharedPreferences(Cfg.PREFS_FILE, android.content.Context.MODE_PRIVATE));
+                android.content.SharedPreferences sp =
+                        c.getSharedPreferences(Cfg.PREFS_FILE, android.content.Context.MODE_PRIVATE);
+                // ⚠ 顺序：**先**做高光语义迁移，**再**落烧录配方。
+                //
+                // 为什么要这个顺序：migrateHlSemantics 的 else 分支会无条件写
+                // fn_hl_on = 1，如果放在后面，就会把刚写好的配方 1 当成"旧语义的
+                // 关闭"再翻成 0（新装用户四个高光开关全灭）。
+                //
+                // 那为什么不怕它干扰"老用户"判定？因为 migrateBakedParams 判断时
+                // 已经**排除高光四键**（那四个是迁移自己写的，不能算用户调过）。
+                Cfg.migrateHlSemantics(sp);
+                Cfg.migrateBakedParams(sp);
             }
         } catch (Throwable ignored) {
         }
