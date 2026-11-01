@@ -40,6 +40,17 @@ public final class CfgProvider extends ContentProvider {
 
     @Override
     public boolean onCreate() {
+        // v3.0.5：高光语义反转的老数据迁移必须在这里做 —— 这是模块 app 进程
+        // 最早能拿到 prefs 的地方，而且不依赖用户打开界面。hook 侧读 provider
+        // 时也会间接把它触发起来。
+        try {
+            android.content.Context c = getContext();
+            if (c != null) {
+                Cfg.migrateHlSemantics(
+                        c.getSharedPreferences(Cfg.PREFS_FILE, android.content.Context.MODE_PRIVATE));
+            }
+        } catch (Throwable ignored) {
+        }
         return true;
     }
 
