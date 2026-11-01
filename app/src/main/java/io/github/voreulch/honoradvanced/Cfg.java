@@ -311,7 +311,10 @@ public final class Cfg {
                 case F_KG_TXT_DEP: return 130;
                 case F_KG_TXT_DIS: return 130;
                 case F_KG_TXT_EDGE: return 120;
-                case F_KG_WIDGET: return 60;
+                // F_KG_WIDGET（锁屏小组件透明度）v3.2.27 撤出烧录配方：60 -> 100。
+                // 用户定调「新用户默认 100%」= 系统原样，不占位，走 default。
+                // 之所以不再烧 60：小组件是整块 alpha（连文字一起淡），烧低了新用户
+                // 一开箱就觉得天气卡发灰，说不清是自己还是模块干的。
                 case F_KL_CORNER: return 80;
                 case F_KL_MASK: return 40;
                 case F_KL_OVL: return 60;
