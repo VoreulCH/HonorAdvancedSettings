@@ -1669,24 +1669,26 @@ public final class GlassHook implements IXposedHookLoadPackage {
                             scaleAlphaField(o, "liauidGlassNtfOverlayColor", ntf);
                             scaleAlphaField(o, "controlNtfMaskColor", ntf);
                             scaleAlphaField(o, "controlNtfverlayColor", ntf);
-                            scaleAlphaArray(o, "multiMaskColors", ntf);
-                            scaleAlphaArray(o, "dynamicCardGradientMaskColor", ntf);
-                            scaleAlphaArray(o, "dynamicCardGradientMaskColorOther", ntf);
+                            // ⚠ 这三个数组**不在这里处理**（v3.2.6 第 4 轮复查发现的双重叠加）：
+                            //   multiMaskColors              -> 归「多层遮罩浓度」km
+                            //   dynamicCardGradientMaskColor -> 归「动态卡渐变颜色」kc
+                            // 早先它们也在这里跟着 ntf 乘一次，用户同时拖「通知卡底色」和
+                            // 「多层遮罩浓度」就会被乘两次（ntf × km），浓度跑飞。
                             // 控制中心瓦片
                             float cc = sMaskScale;
                             scaleAlphaField(o, "controlMaskColor", cc);
                             scaleAlphaField(o, "controlOverlayColor", cc);
-                            scaleAlphaArray(o, "multiControlMaskColors", cc);
+                            // multiControlMaskColors 归「多层遮罩浓度」统一管，这里不重复乘
                             // 滑块
                             float sl = sMaskScale;
                             scaleAlphaField(o, "sliderMaskColor", sl);
                             scaleAlphaField(o, "sliderOverlayColor", sl);
-                            scaleAlphaArray(o, "multiSliderMaskColors", sl);
+                            // multiSliderMaskColors 同上
                             // 圆形按钮
                             float bt = sMaskScale;
                             scaleAlphaField(o, "buttonMaskColor", bt);
                             scaleAlphaField(o, "buttonOverlayColor", bt);
-                            scaleAlphaArray(o, "multiButtonMaskColors", bt);
+                            // multiButtonMaskColors 同上
                             if (sMaskCount < 3) {
                                 sMaskCount++;
                                 log("mask: initBulrParams case="
