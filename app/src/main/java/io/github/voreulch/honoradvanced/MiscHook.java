@@ -938,27 +938,6 @@ public final class MiscHook {
         }
     }
 
-    /**
-     * 取当前进程名。
-     *
-     * <p>注意不能用 Application.getProcessName()（那是 API 28+ 且需要在 app 里有 Context），
-     * 这里用 /proc/self/cmdline 最稳 —— 系统进程里也能读到，且不需要任何权限。
-     */
-    private static String currentProcessName() {
-        try {
-            java.io.FileInputStream in = new java.io.FileInputStream("/proc/self/cmdline");
-            byte[] buf = new byte[128];
-            int n = in.read(buf);
-            in.close();
-            if (n <= 0) return "";
-            int end = 0;
-            while (end < n && buf[end] != 0) end++;
-            return new String(buf, 0, end, "UTF-8");
-        } catch (Throwable t) {
-            return "";
-        }
-    }
-
     /** 找 WindowManager.LayoutParams 在参数列表里的下标，没有返回 -1。 */
     private static int indexOfLayoutParams(java.lang.reflect.Method m) {
         Class<?>[] pts = m.getParameterTypes();
@@ -1073,6 +1052,10 @@ public final class MiscHook {
     }
 
     private static int sShutdownBlocked = 0;
+    /** 通知回避：首次回调命中（证明钩子真被调用到、开关读到了） */
+    private static boolean sDuckFirstSeen = false;
+    /** 通知回避：首次真的拦下一条 MAY_DUCK 请求 */
+    private static boolean sDuckFirstBlocked = false;
 
     /** called from MainHook for the SystemUI process only. */
     public static void initSystemUI(ClassLoader cl) {
@@ -1089,8 +1072,23 @@ public final class MiscHook {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         try {
-                            if (!Cfg.isOn(Cfg.K_NODUCK)) return;
+                            boolean on = Cfg.isOn(Cfg.K_NODUCK);
+                            if (!sDuckFirstSeen) {
+                                // 首调判据必须放在开关判断之前 —— 否则开关一关
+                                // 就永远看不到这条，排查时分不清"钩子没被调用"
+                                // 和"开关关着"（截图那边踩过这个坑）。
+                                sDuckFirstSeen = true;
+                                Diag.note("noduck: 首次回调命中 " + name
+                                        + " | 开关=" + on
+                                        + (on ? " → 开始拦截" : " → 开关关闭，放行"));
+                            }
+                            if (!on) return;
                             if (isNotificationDuckRequest(expandArgs(param.args))) {
+                                if (!sDuckFirstBlocked) {
+                                    sDuckFirstBlocked = true;
+                                    Diag.note("noduck: 首次拦截 —— 拒绝了 MAY_DUCK 请求（"
+                                            + name + "），音乐不会再被压低");
+                                }
                                 // answer FAILED: the notification player does
                                 // not depend on the focus result, it keeps
                                 // playing — but the music never gets ducked
@@ -1104,7 +1102,11 @@ public final class MiscHook {
                 });
                 n++;
             }
-            Diag.mount("AudioManager.requestAudioFocus*", n, 0);
+            // 期望值写 1 而不是 0：这台设备的 AudioManager 至少有 2 个
+            // requestAudioFocus 重载（旧的三参 + 新的 AudioFocusRequest）。
+            // 写 0 等于"一个都没挂上也只当提示"，写 1 才能把"宿主改名导致全丢"
+            // 变成明确的失败信号。
+            Diag.mount("AudioManager.requestAudioFocus*", n, 1);
         } catch (Throwable t) {
             Diag.err("hook AudioManager failed", t);
         }
