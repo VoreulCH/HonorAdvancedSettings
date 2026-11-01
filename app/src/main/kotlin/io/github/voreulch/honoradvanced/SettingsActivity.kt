@@ -12,7 +12,6 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -153,6 +152,19 @@ class SettingsActivity : ComponentActivity() {
         // "enabled" toast; if turning it OFF fails we also revert the pref so
         // the UI never claims "off" while the system layer is still bypassing.
         // 「清理云端配置残留」不是常驻状态，点开就执行一次删除，然后自动关回去。
+        // 降级安装的 system_server 侧同样读不到 provider，也要走属性。
+        if (key == Cfg.K_DOWNGRADE) {
+            syncDowngradeProp(on) { ok ->
+                if (!ok && on) {
+                    prefs().edit().putBoolean(Cfg.K_DOWNGRADE, false).commit()
+                    notifyCfgChanged()
+                    onResult?.invoke(false)
+                } else {
+                    onResult?.invoke(ok)
+                }
+            }
+            return
+        }
         // 截图限制也必须同步到系统属性：hook 挂在 system_server，那边读不到 provider。
         if (key == Cfg.K_NOSECURE) {
             syncNosecureProp(on) { ok ->
@@ -400,9 +412,18 @@ class SettingsActivity : ComponentActivity() {
         sb.appendLine()
 
         sb.appendLine("===== 属性快照 =====")
+        // 三个走系统属性的开关都要列出来 —— 它们的值决定 system_server 那边
+        // 到底放不放行，用户报"开关不生效"时，这三行是第一手证据。
         sb.appendLine("  " + Cfg.PROP_HOTTEMP + " = " + (readProp(Cfg.PROP_HOTTEMP) ?: "(读不到)"))
+        sb.appendLine("  " + Cfg.PROP_NOSECURE + " = " + (readProp(Cfg.PROP_NOSECURE) ?: "(读不到)"))
+        sb.appendLine("  " + Cfg.PROP_DOWNGRADE + " = " + (readProp(Cfg.PROP_DOWNGRADE) ?: "(读不到)"))
         sb.appendLine()
 
+        // system_server 有没有被注入，之前只能靠猜（它无法向 provider 自证）。
+        // 现在 hook 侧会写 sysprobe 属性，这里读出来即可。
+        sb.appendLine("  persist.sys.has.sysprobe = "
+                + (readProp("persist.sys.has.sysprobe") ?: "(读不到 → system_server 可能未注入)"))
+        sb.appendLine()
         sb.appendLine("===== 开关快照 =====")
         val p = prefs()
         for (k in Cfg.KEYS) {
@@ -656,6 +677,46 @@ class SettingsActivity : ComponentActivity() {
      * <p>写属性需要 root；失败时**把开关拨回 false** 并如实报错 —— 不能让 UI
      * 显示"已开启"而实际没生效（那正是这个 bug 最初的样子）。
      */
+    /**
+     * 把「允许降级安装」同步到系统属性 `persist.sys.has.downgrade`。
+     *
+     * <p>`hookDowngradeInSystemServer` 挂在 system_server，读不到模块 provider
+     * （SELinux），所以系统层的 isDowngradePermitted 需要靠属性判断。
+     * 安装器进程那层（hookAllowDowngrade）不依赖属性，直接读 Cfg 就行。
+     */
+    private fun syncDowngradeProp(on: Boolean, done: (Boolean) -> Unit) {
+        Thread {
+            val want = if (on) "1" else "0"
+            var ok = false
+            try {
+                val before = readProp(Cfg.PROP_DOWNGRADE)
+                AppLog.d("downgrade", "目标=" + want + " 当前=" + before)
+                ok = if (before == want) true
+                else suExecTimeout("setprop " + Cfg.PROP_DOWNGRADE + " " + want, 30000L)
+                if (ok) {
+                    var now = readProp(Cfg.PROP_DOWNGRADE)
+                    if (now != want) {
+                        try { Thread.sleep(250L) } catch (_: Throwable) {}
+                        now = readProp(Cfg.PROP_DOWNGRADE)
+                    }
+                    ok = (now == want)
+                }
+                AppLog.d("downgrade", "写后回读=" + readProp(Cfg.PROP_DOWNGRADE)
+                        + " -> " + (if (ok) "成功" else "失败"))
+            } catch (t: Throwable) {
+                AppLog.d("downgrade", "异常: " + t.javaClass.simpleName)
+            }
+            runOnUiThread {
+                if (!ok) {
+                    Toast.makeText(this,
+                        if (on) "开启失败：su 没执行成功（检查 KernelSU/Magisk 授权）"
+                        else "关闭失败：su 没执行成功", Toast.LENGTH_LONG).show()
+                }
+                done(ok)
+            }
+        }.apply { name = "has-downgrade-sync" }.start()
+    }
+
     private fun syncNosecureProp(on: Boolean, done: (Boolean) -> Unit) {
         Thread {
             val want = if (on) "1" else "0"
@@ -1277,7 +1338,7 @@ class SettingsActivity : ComponentActivity() {
                         ParamGroup("边缘高光（全局）", "hl", openGroup, { openGroup = it }) {
                             TuneRow("高光宽度", Cfg.F_HL_THICK, "玻璃边缘那圈亮边的粗细。")
                             TuneRow("高光亮度", Cfg.F_HL_ALPHA, "那圈亮边的透明度，越低越淡。")
-                            TuneRow("高光角度", Cfg.F_HL_ANGLE, "光源方向，0 到 360 度。原厂 250，改它能让光从别的方向照过来。", rangeMax = 360, unit = "°", stepCount = 71)
+                            TuneRow("高光角度", Cfg.F_HL_ANGLE, "光源方向，0 到 360 度。原厂 250，改它能让光从别的方向照过来。", rangeMax = 360, unit = "°")
                             HighlightSwitches()
                             TuneSwitch("锁屏控制中心展开态", Cfg.F_CC_EXPAND,
                                 "强制锁屏上的控制中心按「展开」状态渲染。注意：它同时会让锁屏不再使用窗口模糊（系统里这两件事绑在一起），观感变化比较大，默认关闭。")
@@ -1565,8 +1626,19 @@ class SettingsActivity : ComponentActivity() {
      * **原厂值 250 根本不在网格上**（只能落在 234 或 252），用户一动就回不去。
      * 71 格 = 5°/格，250 正好是 5 的倍数；haptic 的 %10 判断在两种网格下都能命中。
      */
+    /**
+     * 精细调节滑条。
+     *
+     * @param stepCount 吸附段数；**传 -1（默认）表示"1 单位一格"**，即无极调整。
+     *        历史上这里是 19（200 范围 → 每格 10%），太粗，用户反馈"拧一下跳好多"。
+     *
+     * 说明：`steps` 只影响**停靠点**，不产生额外绘制 —— 所以 199 段和 19 段的
+     * 渲染开销一样，不会因为变精细就卡。
+     */
     private fun TuneRow(label: String, key: String, tip: String = "",
-                        rangeMax: Int = 200, unit: String = "%", stepCount: Int = 19) {
+                        rangeMax: Int = 200, unit: String = "%", stepCount: Int = -1) {
+        // -1 = 无极：rangeMax 段 → 每段 1 个单位
+        val effSteps = if (stepCount > 0) stepCount else (rangeMax - 1).coerceAtLeast(1)
         // fn_ 开头的是精细参数、其余是分区域强度，两者的出厂默认分开烧录
         val defPct = if (key.startsWith("fn_")) Cfg.fnDefPct(key) else Cfg.tuneDefPct(key)
         var pct by remember { mutableStateOf(prefs().getInt(key, defPct)) }
@@ -1585,13 +1657,15 @@ class SettingsActivity : ComponentActivity() {
                 value = pct.toFloat(),
                 onValueChange = { v ->
                     val nv = v.toInt()
-                    if (nv != pct && nv % 10 == 0) {
+                    // 1% 粒度下每格都震会很吵，改成每 5% 震一次作为"刻度感"；
+                    // 数值本身仍然是 1% 连续可调。
+                    if (nv != pct && nv % 5 == 0) {
                         view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
                     }
                     pct = nv
                 },
                 valueRange = 0f..rangeMax.toFloat(),
-                steps = stepCount,
+                steps = effSteps,
                 onValueChangeFinished = { prefs().edit().putInt(key, pct).commit() },
                 modifier = Modifier.fillMaxWidth()
             )
@@ -1782,7 +1856,7 @@ class SettingsActivity : ComponentActivity() {
                     LinkRow("GitHub 仓库") {
                         try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/VoreulCH/HonorAdvancedSettings"))) } catch (_: Throwable) {}
                     },
-                    LinkRow("联系我们") { donateDialog = 2 },
+                    LinkRow("加入群聊") { donateDialog = 2 },
                     LinkRow(if (checking) "正在检查更新…" else "检查更新") {
                         if (!checking) {
                             checking = true
@@ -1844,7 +1918,7 @@ class SettingsActivity : ComponentActivity() {
             when (donateDialog) {
                 0 -> QrDialog("支付宝收款", "img/donate_alipay.jpg", true, "支付宝收款", "打开支付宝扫一扫", onJump = { openAlipayScan() }) { donateDialog = -1 }
                 1 -> QrDialog("微信赞赏", "img/donate_wechat.png", true, "微信赞赏", "打开微信扫一扫", onJump = { openWechatScan() }) { donateDialog = -1 }
-                2 -> QrDialog("联系我们", "img/qq_group.jpg", false, "QQ群二维码", "打开加群链接（跳转浏览器）", onJump = { openQqJoinLink() }) { donateDialog = -1 }
+                2 -> QrDialog("加入群聊", "img/qq_group.jpg", false, "QQ群二维码", "打开加群链接（跳转浏览器）", onJump = { openQqJoinLink() }) { donateDialog = -1 }
                 3 -> PrivacyDialog { donateDialog = -1 }
                 4 -> CreditsDialog { donateDialog = -1 }
             }
@@ -2339,14 +2413,27 @@ class SettingsActivity : ComponentActivity() {
             Surface(shape = RoundedCornerShape(24.dp), color = MiuixTheme.colorScheme.surface) {
                 Column(Modifier.padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(title, fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MiuixTheme.colorScheme.onSurface)
-                    if (bmp != null) {
+                    if (bmp != null && bmp.width > 0 && bmp.height > 0) {
                         val avail = (resources.displayMetrics.widthPixels - 96 * resources.displayMetrics.density).toInt()
                         val w = (if (square) 260 else 230).let { kotlin.math.min(it, avail) }
-                        val h = if (square) w else (w * bmp.height / bmp.width).let { hh -> kotlin.math.min(hh, resources.displayMetrics.heightPixels / 2) }
+                        // 除零保护：bmp.width 理论上不会是 0，但解码异常时可能给个
+                        // 0×0 的畸形位图，除法会直接 ArithmeticException 崩掉整个对话框。
+                        val h = if (square) w else {
+                            val ratio = bmp.height.toFloat() / bmp.width.toFloat()
+                            (w * ratio).toInt().let { hh ->
+                                kotlin.math.min(hh, resources.displayMetrics.heightPixels / 2)
+                            }
+                        }
                         Image(bmp.asImageBitmap(), contentDescription = title,
                             modifier = Modifier.padding(top = 12.dp).size(w.dp, h.dp)
                                 .clip(RoundedCornerShape(16.dp)).background(Color.White).padding(8.dp)
                                 .clickable { saveQrToDownload(file, saveName) })
+                    } else {
+                        // 图片没加载出来（assets 里缺文件 / 解码失败）时给一句明确提示，
+                        // 否则用户只看到一个空框，不知道是资源丢了还是屏幕问题。
+                        Text("二维码图片缺失（assets/" + file + "）",
+                            fontSize = 13.sp, color = MiuixTheme.colorScheme.error,
+                            modifier = Modifier.padding(top = 16.dp))
                     }
                     Text("截图或点击二维码保存", fontSize = 12.5.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 10.dp, bottom = 4.dp))
