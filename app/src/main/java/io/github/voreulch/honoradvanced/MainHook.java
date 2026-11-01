@@ -38,6 +38,10 @@ public final class MainHook implements IXposedHookLoadPackage {
         }
 
         if ("android".equals(pkg)) {
+            // system_server 无法走 provider 自证（会挂住），这里改用系统属性留个痕迹：
+            // 有 root 时写 persist.sys.has.sysprobe，之后 adb shell getprop 就能
+            // 直接确认它到底有没有被注入，不用再靠猜。
+            markSystemServerInjected();
             Diag.setEssential(true); // 读不到模块 provider，只留挂载结果/警告
             enter("system_server", pkg, lpparam);
             Cfg.startPreload(true); // observer: downgrade switch without reboot
@@ -105,6 +109,24 @@ public final class MainHook implements IXposedHookLoadPackage {
     }
 
     /** 每个 scope 的公共开场：横幅恒定输出，环境快照只在诊断开关打开时输出。 */
+    /**
+     * 给 system_server 留一个「已被注入」的痕迹。
+     *
+     * 它不能像其他进程那样往模块 provider 里 insert（会挂住），所以改用系统属性。
+     * 有 root 能写成功，之后 adb shell getprop persist.sys.has.sysprobe 可查；
+     * 没 root 静默跳过，不影响功能。
+     */
+    private static void markSystemServerInjected() {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            java.lang.reflect.Method set = sp.getMethod("set", String.class, String.class);
+            set.invoke(null, "persist.sys.has.sysprobe",
+                    io.github.voreulch.honoradvanced.BuildConfig.VERSION_NAME
+                            + "(" + io.github.voreulch.honoradvanced.BuildConfig.VERSION_CODE + ")");
+        } catch (Throwable ignored) {
+        }
+    }
+
     private static void enter(String scope, String pkg, XC_LoadPackage.LoadPackageParam lpparam) {
         Diag.setScope(scope);
         Diag.banner(pkg);
