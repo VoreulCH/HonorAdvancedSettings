@@ -1636,10 +1636,15 @@ class SettingsActivity : ComponentActivity() {
                     SwRow("允许截屏 / 录屏（ROOT）",
                         "清除窗口的 FLAG_SECURE，让原本一截就黑屏、录屏一片黑的页面（银行 / 支付 / 部分阅读类 app）"
                                 + "可以正常截图录屏。"
-                                + "需要两样东西：① system_server 作用域（下方状态会显示，钩子装在那里）；"
-                                + "② ROOT（开关值要写成系统属性 persist.sys.has.nosecure 才能传过去，"
-                                + "因为 system_server 读不到模块自己的设置，SELinux 限制）。",
-                        Cfg.K_NOSECURE, true, false, confirmOnEnable = true, scopes = S_SYSTEM,
+                                + "需要两样东西：① LSPosed 里勾选「系统框架」（system_server，钩子装在那里）；"
+                                + "② ROOT（开关值要写成系统属性 persist.sys.has.nosecure 才能传过去）。"
+                                + "注：system_server 无法向本模块自证，所以这里不显示作用域状态，"
+                                + "勾没勾请到 LSPosed 模块页确认。",
+                        // 不传 scopes：system_server 无法向模块 provider 自证
+                        // （它 binder 到普通 app 的 provider 会挂住，MainHook 里明确排除了），
+                        // 所以 FrameworkProbe 永远认为 android 作用域缺失 —— 传了只会
+                        // 一直显示"作用域未生效"，哪怕功能已经正常工作。
+                        Cfg.K_NOSECURE, true, false, confirmOnEnable = true,
                         confirmTitle = "允许截屏 / 录屏（需要 ROOT）",
                         confirmLines = listOf(
                             "开启后：",
