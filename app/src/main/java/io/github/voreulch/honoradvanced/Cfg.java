@@ -103,17 +103,86 @@ public final class Cfg {
      * <p>同 {@link #tuneDefPct(String)}，烧录时在这里逐项写死。
      * 注意 {@link #F_HL_ANGLE} 是角度而不是百分比，它的出厂值单独写在下面。
      */
+    /** v3.0.5「高光语义反转」的一次性迁移标记。 */
+    public static final String MIG_HL_V2 = "hl_semantic_v2";
+
+    /**
+     * v3.0.5：四个高光键的语义反转（旧 1 = 关闭高光 → 新 1 = 开启高光），
+     * 把老用户存下来的值翻转一次。
+     *
+     * <p><b>⚠ 必须在 {@code CfgProvider.onCreate()} 里调，不能只放在
+     * SettingsActivity</b> —— 那个方法只有用户打开模块界面才会跑。老用户升级后
+     * 如果一直没打开界面，hook 读到的还是旧语义的值，四个高光开关会整个反掉
+     * （本来关了的变成全开、本来开着的变成全灭）。
+     *
+     * <p>幂等：靠 {@link #MIG_HL_V2} 标记；新装用户 prefs 里没有这四个键，
+     * 循环里 {@code contains} 直接跳过，不会被写脏。
+     *
+     * <p>不主动拿 Context —— 这个类在 system_server 里也会被加载，
+     * 那里没有 SharedPreferences 可用。由调用方把实例传进来。
+     */
+    public static void migrateHlSemantics(android.content.SharedPreferences p) {
+        if (p == null) return;
+        try {
+            if (p.getBoolean(MIG_HL_V2, false)) return;
+            android.content.SharedPreferences.Editor ed = p.edit();
+
+            // 旧语义：1 = 关闭这一类高光，0 = 不关（默认，原厂全开）
+            int oldOn = intOf(p, F_HL_ON);
+            int oldCc = intOf(p, F_HL_CC);
+            int oldBtn = intOf(p, F_HL_BTN);
+            int oldSl = intOf(p, F_HL_SL);
+
+            if (oldOn != 0) {
+                // 用户旧版勾过「关闭全部高光」——新语义下等价于**四个全关**。
+                //
+                // ⚠ 这里绝不能逐个翻转。逐个翻会得到「hl_on=0（关）+ 三个分项=1（开）」
+                // 的自相矛盾状态；hook 按"任一开着就算开"判断，结果反而是**全亮** ——
+                // 用户明明全关了，升级后却全开。
+                ed.putInt(F_HL_ON, 0);
+                ed.putInt(F_HL_CC, 0);
+                ed.putInt(F_HL_BTN, 0);
+                ed.putInt(F_HL_SL, 0);
+            } else {
+                // 全局原本是开的 -> 全局置开，三个分项逐个翻转
+                ed.putInt(F_HL_ON, 1);
+                if (p.contains(F_HL_CC)) ed.putInt(F_HL_CC, oldCc != 0 ? 0 : 1);
+                if (p.contains(F_HL_BTN)) ed.putInt(F_HL_BTN, oldBtn != 0 ? 0 : 1);
+                if (p.contains(F_HL_SL)) ed.putInt(F_HL_SL, oldSl != 0 ? 0 : 1);
+            }
+            ed.putBoolean(MIG_HL_V2, true);
+            ed.commit();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 读 int，类型不对就按 0（"没关"）处理。极老版本可能存成 boolean。 */
+    private static int intOf(android.content.SharedPreferences p, String k) {
+        try {
+            return p.getInt(k, 0);
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
     public static int fnDefPct(String key) {
         if (F_HL_ANGLE.equals(key)) {
             return 250;   // 边缘光方向，原厂 250°
         }
-        // 开关型：0 = 跟随原厂（原厂四类高光全开、窗口模糊关闭）
-        // ⚠ v3.0.0 修：F_FORCE_LIQUID 之前漏在这里，导致 fnDefPct 返回 100，
-        // TuneSwitch 的 `getInt(key, fnDefPct(key)) != 0` 判定成"默认开启"，
-        // 界面上显示"已开启"；可 hook 侧用的是 `getInt(key, 0) != 0`，
-        // 默认其实是关的 —— 两边对不上，用户看到的状态是假的。
+        // ---- 开关型默认值 ----
+        //
+        // v3.0.5 语义反转：四个高光键从「1 = 关闭高光」改成「1 = 开启高光」。
+        // 原厂是四类高光**全开**的，所以默认值必须是 1，不是 0。
+        // 判定侧同步改了：hook 里现在是 `getInt(key, 1) == 0` 才关。
+        //
+        // ⚠ 老用户的数据由 migratePrefs 一次性翻转（见那个方法里的 hl_semantic_v2 标记），
+        // 不翻的话他们升级后四个开关会全部反掉。
         if (F_HL_ON.equals(key) || F_HL_CC.equals(key) || F_HL_BTN.equals(key)
-                || F_HL_SL.equals(key) || F_FORCE_LIQUID.equals(key)) {
+                || F_HL_SL.equals(key)) {
+            return 1;
+        }
+        // 这两个是"默认关"的开关，保持 0。
+        if (F_FORCE_LIQUID.equals(key) || F_CC_EXPAND.equals(key)) {
             return 0;
         }
         return 100;
@@ -299,6 +368,29 @@ public final class Cfg {
     // 强制成 2 可能渲染成一片糊或者纯色。开关默认关，出问题关掉即可。
     public static final String F_FORCE_LIQUID = "fn_force_liquid";
 
+    // ===== 多层遮罩 / 动态渐变 / 锁屏控制中心（v3.1.3）=====
+    //
+    // 这几个字段在 BlurParametersConfig 里一直是"有但没接"的状态（v3.1.2 时
+    // 逐个核对字段名才发现的）：
+    //
+    //   multiMaskColors / multiButtonMaskColors / multiControlMaskColors /
+    //   multiSliderMaskColors   —— int[]，**多层**遮罩的 ARGB 数组
+    //     ButtonViewModel:136 直接 setMultiMaskColors(数组, blendModes)，
+    //     所以数组里每个元素的 alpha 才是最终的遮罩浓度。
+    //     单根 maskColor 只是其中一层，调它盖不住其余几层。
+    //
+    //   dynamicCardGradientMaskColor / ...Other   —— int[]，动态卡渐变的两组颜色
+    //   dynamicCardGradientPos / ...Other         —— float[]，渐变位置（0~1）
+    //
+    //   isKerguardContrlCenterExpand —— 锁屏控制中心「展开态」。
+    //     注意它还会反哺 isWindowBlur（KeyguardBusinessDataProvider:178
+    //     `isWindowBlur = !isKerguardContrlCenterExpand && ...`），
+    //     所以改它等于同时切换"锁屏上是否用窗口模糊"。
+    public static final String F_MULTI_MASK = "fn_multi_mask";     // 多层遮罩浓度（4 个数组一起）
+    public static final String F_DYN_GRAD_COLOR = "fn_dyn_grad_clr"; // 动态卡渐变颜色
+    public static final String F_DYN_GRAD_POS = "fn_dyn_grad_pos";   // 动态卡渐变位置
+    public static final String F_CC_EXPAND = "fn_cc_expand";         // 锁屏控制中心强制展开态（开关）
+
     // ===== 桌面（launcher）的卡片玻璃（v2.6.19）=====
     //
     // 桌面卡片走的是另一套类，和 SystemUI 完全不相干：
@@ -333,7 +425,8 @@ public final class Cfg {
             F_KG_BTN_DEP, F_KG_BTN_DIS, F_KG_BTN_THK, F_KG_BTN_EDGE,
             F_KG_ICON_DEP, F_KG_ICON_DIS, F_KG_ICON_THK, F_KG_ICON_EDGE,
             F_KG_TXT_DEP, F_KG_TXT_DIS, F_KG_TXT_THK, F_KG_TXT_EDGE,
-            F_FORCE_LIQUID, F_DESK_RADIUS, F_DESK_SAT, F_DESK_BRIGHT,
+            F_FORCE_LIQUID,
+            F_MULTI_MASK, F_DYN_GRAD_COLOR, F_DYN_GRAD_POS, F_CC_EXPAND, F_DESK_RADIUS, F_DESK_SAT, F_DESK_BRIGHT,
     };
 
     /**
