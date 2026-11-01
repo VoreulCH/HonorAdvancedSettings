@@ -8,6 +8,11 @@
         <item>com.android.packageinstaller</item>
         <item>com.hihonor.powergenie</item>
         <item>com.hihonor.iaware</item>
+        <item>com.hihonor.securityserver</item>
+        <!-- 模块自身也列进来：LSPosed 的「已激活」判定看的是模块 app 进程有没有被注入，
+             不列进来就永远显示「未激活」（功能其实是好的，只是状态显示唬人）。
+             MainHook 对自身包名是直接 return 的，注入后不会做任何事。 -->
+        <item>io.github.voreulch.honoradvanced</item>
         <item>android</item>
     </string-array>
 </resources>
