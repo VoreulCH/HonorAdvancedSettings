@@ -4,6 +4,7 @@ import java.lang.reflect.Method;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.XposedHelpers;
 
 /**
  * 杂项 hooks — SystemUI line (v2.0.1).
@@ -90,6 +91,7 @@ public final class MiscHook {
         // 结果 ThermalManager 连挂 3 次失败后整个函数直接 return，
         // thermal-extra 永远拿不到执行机会 —— sExtraDone 的重试逻辑等于白写。
         hookThermalExtra(apkPath, cl);
+        hookCloudPolicy(cl, apkPath);
         // Idempotent, but ONLY after a successful hook pass: the first
         // handleLoadPackage in the iaware process can arrive before HAware's
         // dex is reachable from that classloader (observed CNFE at boot,
@@ -118,7 +120,14 @@ public final class MiscHook {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         try {
-                            if (!Cfg.hottempOn()) return;
+                            boolean on = Cfg.hottempOn();
+                            if (!sTgFirstSeen) {
+                                sTgFirstSeen = true;
+                                Diag.note("powergenie: 首次回调命中 " + nm
+                                        + " | 开关=" + on
+                                        + (on ? " → 已拦截" : " → 开关关闭，放行"));
+                            }
+                            if (!on) return;
                             if (dispatcher) {
                                 param.setResult(null);
                                 if (sPgBlocked < 5) {
@@ -144,6 +153,453 @@ public final class MiscHook {
 
     private static int sPgBlocked = 0;
     private static int sExtraBlocked = 0;
+    private static boolean sCloudDone = false;
+    private static boolean sFraudDone = false;
+    private static int sFraudBlocked = 0;
+    // 温控/云控的"首次回调"判据：证明钩子真被调用到、且开关读到的是开
+    private static boolean sThermalFirstSeen = false;
+    private static boolean sCloudFirstSeen = false;
+    /** 第一次真的拦下一条云控时打一条（区别于"挂钩成功"）。 */
+    private static boolean sCloudFirstBlocked = false;
+    /** 是否已经报告过"检测到读云端配置"（避免刷屏）。 */
+    private static boolean sCloudStreamSeen = false;
+    private static boolean sTgFirstSeen = false;
+    /** 第一次真正进到拦截回调时打一条，用来证明"钩子确实被调用到了"。 */
+    private static boolean sFraudFirstSeen = false;
+    private static boolean sFraudFirstOn = false;
+
+    /**
+     * 屏蔽反诈组件的数据采集与上报（v3.2.0）。
+     *
+     * <p>主体是 {@code com.hihonor.securityserver}（uid=system 的系统应用）。
+     * 它的类名全被混淆了，dex 里只留下三条可读线索：
+     * <pre>
+     *   " ant antifraud detect state switch, enable "     开关状态
+     *   "(start register Antifraud Detect Observer"       注册检测观察者
+     *   " fraud_cloud_security_check "                    云控安全校验
+     * </pre>
+     * 所以用 **DexKit 字符串锚点**定位（和温控那边同一套办法），
+     * 挂到"引用了这几条字符串的方法"上，把它们的返回值 / 执行流程掐掉：
+     * <ul>
+     *   <li>注册观察者 -> 检测根本不启动，后续采集自然没有</li>
+     *   <li>开关状态 -> 一律返回 false（对宿主表现为"功能关闭"）</li>
+     *   <li>云控校验 -> 不通过，不去拿下发规则</li>
+     * </ul>
+     *
+     * <p><b>为什么挡"采集"而不是挡"发送"</b>：发送走的是系统统一的诊断通道
+     * （HiView / HwDdmp），全系统共用 —— 在那儿拦会把崩溃上报、系统诊断一起干掉，
+     * 属于杀敌一千自损八百。挡在源头最干净：数据压根没被收集。
+     */
+    /** 反诈组件的入口（securityserver 进程调用）。 */
+    public static void initSecurityServer(ClassLoader cl, String apkPath) {
+        hookAntiFraud(cl, apkPath);
+    }
+
+    private static void hookAntiFraud(ClassLoader cl, String apkPath) {
+        if (sFraudDone) return;
+        if (apkPath == null) return;
+
+        // 不需要额外的进程白名单校验：Xposed 的钩子**只在勾进作用域的进程里生效**，
+        // 而作用域声明（res/values/arrays.xml 的 xposed_scope）只列了 securityserver。
+        // 所以 awareness 那套围栏在这里被拦，YOYO / 情景智能自己的进程完全不受影响。
+
+        int n = 0;
+        int nCtl = 0;     // SafetyCtrlService（反诈云控校验）
+        int nAware = 0;   // awareness 发送入口
+        int nRecv = 0;    // 云参数接收器
+        String[][] anchors = {
+                {"antifraud", "antifraud detect state switch"},       // 开关/观察者注册
+                {"fraud_cloud", "fraud_cloud_security_check"},        // 云控校验
+        };
+        for (String[] pair : anchors) {
+            final String tag = pair[0];
+            try {
+                java.util.List<java.lang.reflect.Method> ms =
+                        DexKitHelper.findMethodsByStrings(apkPath, cl, pair[1]);
+                for (final java.lang.reflect.Method m : ms) {
+                    final Class<?> rt = m.getReturnType();
+                    try {
+                        XposedBridge.hookMethod(m, new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                try {
+                                    boolean on = Cfg.isOn(Cfg.K_NOFRAUD);
+                                    if (!sFraudFirstSeen) {
+                                        // 关键时刻：钩子被真正调用了。
+                                        // 这里打印的 on 才是"开关到底生效没生效"的真相。
+                                        sFraudFirstSeen = true;
+                                        sFraudFirstOn = on;
+                                        Diag.note("nofraud: 首次回调命中 " + tag
+                                                + " | 开关=" + on
+                                                + (on ? " → 已拦截" : " → 开关关闭，放行"));
+                                    }
+                                    if (!on) return;
+                                    // 按返回类型给"关闭/失败"的语义
+                                    if (rt == boolean.class) param.setResult(Boolean.FALSE);
+                                    else if (rt == void.class) param.setResult(null);
+                                    else if (rt == int.class) param.setResult(Integer.valueOf(0));
+                                    else return;   // 返回对象的不碰，防 NPE
+                                    if (sFraudBlocked < 8) {
+                                        sFraudBlocked++;
+                                        Diag.log("nofraud: 已阻断 " + tag + " -> "
+                                                + m.getDeclaringClass().getSimpleName()
+                                                + "." + m.getName());
+                                    }
+                                } catch (Throwable t) {
+                                    Diag.err("nofraud gate error", t);
+                                }
+                            }
+                        });
+                        n++;
+                        nCtl++;
+                        Diag.note("ok: nofraud " + tag + " <- "
+                                + m.getDeclaringClass().getName() + "." + m.getName()
+                                + " ret=" + rt.getSimpleName());
+                    } catch (Throwable ignored) {
+                    }
+                }
+            } catch (Throwable t) {
+                Diag.err("nofraud hook failed: " + tag, t);
+            }
+        }
+        // 3) 感知框架（com.hihonor.awareness）的围栏注册。
+        //
+        //    第 3 轮深挖发现：反诈真正拿数据靠的是这套"围栏"，它有多达 30 种：
+        //      SMSNotifyFence / ClipboardFence / NotificationFence  内容类
+        //      ScanCodePayFence / QrCollectFence / TrafficQrCodeScan 支付与扫码
+        //      GeoLocationFence / FingerprintFence / UserAccountFence 位置·生物·账号
+        //      ApkInstallOrUninstallFence / FrequentAppFence         装了什么·常用什么
+        //      HealthCodePageFence / EyeGazeFence / UserSleepFence   页面·视线·作息
+        //
+        //    ⚠ 这个框架是**全系统共用**的（智慧助手、情景智能都靠它），所以绝不能
+        //    在全局挡。好在 hookAntiFraud 只跑在 securityserver 进程里 —— 这里挡掉的
+        //    只是"反诈自己注册的围栏"，其它 app 的感知能力完全不受影响。
+        try {
+            Class<?> ac = XposedHelpers.findClass("com.hihonor.awareness.client.AwarenessClient", cl);
+            int before = n;
+            for (java.lang.reflect.Method m : ac.getDeclaredMethods()) {
+                String nm = m.getName();
+                // 拦截范围（第 4 遍复查补全）。
+                //
+                // ⚠ 只拦 addFence 是**不够的**：addFence 只是"订阅事件"，
+                // 真正把数据取出来的是 collect 系列。DexKit 扫出来的完整清单：
+                //   addFence / addSelfRestoreFence / checkFence     订阅
+                //   addCollect / collect / scanCollect /
+                //   scanPayCollect / metroCollect / cellularCollect  ← 真正取数据
+                //   addJob / addAppPredictJob / addNearByCellJob     定时任务
+                //   *Snapshot（get/check/getJob）                    快照读取
+                // 这四类一起挡，反诈才真的拿不到东西。
+                // 拦截范围：**只拦语义明确的"注册/采集/发送"**。
+                //
+                // 刻意排除两类（v3.2.5 第 4 轮复查）：
+                //   · *Snapshot       —— checkSnapshot 语义可能是"验证快照有效"，
+                //                        返回 false 等于"无效"，会触发宿主禁用逻辑，
+                //                        而不是"停止采集"。拦错语义比不拦更危险。
+                //   · addSelfRestore* —— 自恢复机制，拦了会让状态卡住无法自愈。
+                //
+                // 保留的都是"往服务端注册 / 从服务端取数 / 发送请求"，拦掉 = 不注册不发。
+                boolean target =
+                        nm.startsWith("addFence")                       // 注册围栏
+                        || nm.startsWith("checkFence")                  // 检查围栏
+                        || nm.startsWith("addCollect") || "collect".equals(nm)  // 注册采集 / 采集
+                        || nm.startsWith("scanCollect") || nm.startsWith("scanPayCollect")
+                        || nm.startsWith("metroCollect") || nm.startsWith("cellularCollect")
+                        || nm.startsWith("addJob") || nm.startsWith("addAppPredict")
+                        || nm.startsWith("addNearByCell")
+                        // beginDispatch 是所有请求的**起点**（dispatch* 只是分发），
+                        // 漏了它等于没堵住总入口
+                        || nm.startsWith("dispatch") || "beginDispatch".equals(nm);
+                if (!target) continue;
+                final String tag2 = nm;
+                try {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!Cfg.isOn(Cfg.K_NOFRAUD)) return;
+                                Class<?> rt = m.getReturnType();
+                                if (rt == boolean.class) param.setResult(Boolean.FALSE);
+                                else if (rt == void.class) param.setResult(null);
+                                else if (rt == int.class) param.setResult(Integer.valueOf(0));
+                                else return;
+                                if (sFraudBlocked < 24) {
+                                    sFraudBlocked++;
+                                    Diag.log("nofraud: 已阻断 " + tag2);
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+                    n++;
+                    nAware++;
+                    Diag.note("ok: awareness <- " + nm);
+                } catch (Throwable ignored) {
+                }
+            }
+            if (n > before) {
+                Diag.note("ok: awareness 已拦截 " + (n - before) + " 处（仅 securityserver 进程）");
+            }
+        } catch (Throwable t) {
+            Diag.note("skip: AwarenessClient (" + t.getClass().getSimpleName() + ")");
+        }
+
+        // 4) 静态注册的「云参数」接收器（第 4 轮深挖发现）。
+        //
+        // dumpys 里 securityserver 挂着两个 Receiver：
+        //   .scenerecommend.CloudParaReceiver            场景推荐云参数
+        //   .facerecognition.receiver.CloudParaReceiver  人脸识别云参数
+        // 反诈的规则/名单大概率也从这里下发 —— 不拦的话，就算本地采集被堵，
+        // 云端仍能推新规则让它换个姿势采。
+        String[] cloudRecv = {
+                "com.hihonor.securityserver.scenerecommend.CloudParaReceiver",
+                "com.hihonor.securityserver.facerecognition.receiver.CloudParaReceiver",
+        };
+        for (final String rn : cloudRecv) {
+            try {
+                Class<?> rc = XposedHelpers.findClass(rn, cl);
+                XposedBridge.hookAllMethods(rc, "onReceive", new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            if (!Cfg.isOn(Cfg.K_NOFRAUD)) return;
+                            param.setResult(null);
+                            if (sFraudBlocked < 24) {
+                                sFraudBlocked++;
+                                Diag.log("nofraud: 已拦截云参数 "
+                                        + rn.substring(rn.lastIndexOf('.') + 1));
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                n++;
+                nRecv++;
+                Diag.note("ok: nofraud 云参数接收器 <- "
+                        + rn.substring(rn.lastIndexOf('.') + 1));
+            } catch (Throwable t) {
+                Diag.note("skip: " + rn.substring(rn.lastIndexOf('.') + 1)
+                        + " (" + t.getClass().getSimpleName() + ")");
+            }
+        }
+
+        // ⚠ 判定不能只看总数。早先是 `sFraudDone = n > 0` —— 只要挂上 1 处就永不重试，
+        // 于是 DexKit 首次查询没就绪时（只挂上 2 个静态的），另外 6 处永远没机会挂，
+        // 日志还显示"共接管 2 处"，看着像成功了。
+        //
+        // 现在按**类别**判定：三类里任何一类为 0 就认为没挂全，留待下次 handleLoadPackage 重试。
+        //
+        // 另外这里**故意不读** Cfg.isOn：startPreload 是后台异步加载，挂载这一刻
+        // 快照必然还没就绪，读出来一定是 false，反而会误导人。真正的判据在第一次回调里。
+        boolean complete = nCtl > 0 && nAware > 0 && nRecv > 0;
+        sFraudDone = complete;
+        Diag.note("nofraud: 共接管 " + n + " 处（控制=" + nCtl
+                + " 感知=" + nAware + " 云参数=" + nRecv + "）"
+                + (complete ? "" : " ⚠ 有类别未命中，下次重试"));
+    }
+    private static int sCloudBlocked = 0;
+
+    /**
+     * 屏蔽**性能/温控策略的云控下发**（v3.2.0）。
+     *
+     * <p>来源：反编译 HAware 时挖到的
+     * {@code com.hihonor.powergenie.integration.eventhub.bcreceiver.ThermalCfgCotaUpdateReceiver}
+     * —— "Cota" 就是云侧配置（Cloud OTA Config）更新。系统收到云端的温控策略包后，
+     * 这个 Receiver 负责把它落进本地策略库，之后 PowerGenie 就按云端那套降频/限帧。
+     *
+     * <p>阻断点选在 **onReceive**：直接 setResult 掉，等于"收到了但不当回事"，
+     * 本地策略保持出厂状态。比去改配置库安全得多（不碰数据，不会写坏）。
+     *
+     * <p>⚠ 这也是为什么它和「屏蔽高温限制」是两个开关：那个管的是**设备已经热了之后**
+     * 别降频；这个管的是**云端别再把新的降频策略推下来**。两者互补。
+     */
+    private static void hookCloudPolicy(ClassLoader cl, String apkPath) {
+        if (sCloudDone) return;
+        int n = 0;
+        int nRecv = 0;    // COTA Receiver（下发入口，最关键）
+        int nRead = 0;    // 读取入口
+        // 1) 三条 COTA 下发通道全拦。反编译 HAware 后确认云端配置按类型分开落地：
+        //      CpuCfgCotaUpdateReceiver   -> /data/cota/para/cpuconfig      CPU 频率/核数策略
+        //      PgConfigCotaUpdateReceiver -> /data/cota/para/pg_config      PowerGenie 通用策略
+        //      ThermalCfgCotaUpdateReceiver -> /data/cota/para/thermal_config 温控策略
+        //    只拦温控那一个是不够的 —— CPU 配置单独走 CpuCfg 通道，那份才是真正
+        //    定「什么温度压到多少频率」的东西。
+        String[] recv = {
+                "com.hihonor.powergenie.integration.eventhub.bcreceiver.CpuCfgCotaUpdateReceiver",
+                "com.hihonor.powergenie.integration.eventhub.bcreceiver.PgConfigCotaUpdateReceiver",
+                "com.hihonor.powergenie.integration.eventhub.bcreceiver.ThermalCfgCotaUpdateReceiver",
+        };
+        for (final String rn : recv) {
+            try {
+                Class<?> rec = XposedHelpers.findClass(rn, cl);
+                XposedBridge.hookAllMethods(rec, "onReceive", new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            boolean on = Cfg.isOn(Cfg.K_NOCLOUD);
+                            if (!sCloudFirstSeen) {
+                                sCloudFirstSeen = true;
+                                Diag.note("nocloud: 首次回调命中 " + rn.substring(rn.lastIndexOf('.') + 1)
+                                        + " | 开关=" + on
+                                        + (on ? " → 已拦截" : " → 开关关闭，放行"));
+                            }
+                            if (!on) return;
+                            param.setResult(null);
+                            if (!sCloudFirstBlocked) {
+                                sCloudFirstBlocked = true;
+                                Diag.note("nocloud: 首次拦截 "
+                                        + rn.substring(rn.lastIndexOf('.') + 1) + "（真的拦下了）");
+                            }
+                            if (sCloudBlocked < 8) {
+                                sCloudBlocked++;
+                                Diag.log("nocloud: 已拦截 "
+                                        + rn.substring(rn.lastIndexOf('.') + 1)
+                                        + " (" + sCloudBlocked + ")");
+                            }
+                        } catch (Throwable t) {
+                            Diag.err("nocloud gate error", t);
+                        }
+                    }
+                });
+                n++;
+                nRecv++;
+                Diag.note("ok: " + rn.substring(rn.lastIndexOf('.') + 1) + " 云控下发已接管");
+            } catch (Throwable t) {
+                Diag.note("skip: " + rn.substring(rn.lastIndexOf('.') + 1)
+                        + " (" + t.getClass().getSimpleName() + ")");
+            }
+        }
+
+        // 1b) 读取入口也要堵：即便 Receiver 被拦，进程启动时若已经读过
+        //     /data/cota/para/ 下的旧配置，照样会按云端那套跑。
+        if (apkPath != null) {
+            // 锚点用**文件路径**而不是日志文案（v3.2.5 第 5 轮）。
+            //
+            // 反编译后发现读 /data/cota/para/ 的方法有 8 个，分布在三处：
+            //   powergenie.core.f0.q
+            //   powergenie.core.policy.b.B / b.C / b.D / b.M / b.t
+            //   powergenie.core.policy.l.d / l.e
+            //   powergenie.modules.networkpolicy.n.h
+            //   thermal.core.b.v
+            // 之前只按"日志文案"找，只盖住 3 个，其余照旧读云端配置。
+            // 换成路径当锚点，一处覆盖全部。
+            String[] readAnchors = {
+                    "/data/cota/para/",              // ← 统一入口，覆盖所有 Cota 配置文件读取
+                    "pg_config_list.xml",
+                    "thermal_config_cloud.xml",
+                    "Load CPU config file from cota dir",
+                    "use new cpu policy config file from cota",
+                    "onCotaConfigChanged",
+                    // ⚠ PolicyProvider：除了读文件，云控配置还通过 ContentProvider
+                    //   对外暴露（content://com.hihonor.powergenie/cotaconfig）。
+                    //   PolicyProvider.c 里就是 "get cotaconfig cursor"。
+                    //   它走的是数据库/内存，不碰 /data/cota/para/，上面那些路径锚点
+                    //   一个都盖不到 —— 第 6 轮复查才发现。
+                    "get cotaconfig cursor",
+                    "cotaconfig",
+            };
+            for (String a2 : readAnchors) {
+                try {
+                    java.util.List<java.lang.reflect.Method> ms =
+                            DexKitHelper.findMethodsByStrings(apkPath, cl, a2);
+                    for (final java.lang.reflect.Method m : ms) {
+                        final String nm = m.getName();
+                        if (nm.startsWith("on") && nm.endsWith("Receive")) continue;
+                        final Class<?> rt = m.getReturnType();
+                        try {
+                            XposedBridge.hookMethod(m, new XC_MethodHook() {
+                                @Override
+                                protected void beforeHookedMethod(MethodHookParam param) {
+                                    try {
+                                        if (!Cfg.isOn(Cfg.K_NOCLOUD)) return;
+                                        if (rt == boolean.class) param.setResult(Boolean.FALSE);
+                                        else if (rt == void.class) param.setResult(null);
+                                        else if (rt == int.class) param.setResult(Integer.valueOf(0));
+                                        else if (java.io.InputStream.class.isAssignableFrom(rt)) {
+                                            // ⚠ 返回流的方法**不改返回值，只记录**（v3.2.5 第 6 轮）。
+                                            //
+                                            // 之前给空流，本想"让解析失败退回默认策略"。但反编译核查
+                                            // powergenie.core.f0.q 的方法体：**move-exception 出现 0 次**
+                                            // —— 它根本没有 try/catch。空流解析失败会把异常抛上去，
+                                            // powergenie 是常驻系统进程，崩了温控直接失效，
+                                            // 比"没拦住云控"严重得多。
+                                            //
+                                            // 所以这里降级为观察：读到配置照常返回，只在日志里点名，
+                                            // 让用户/我们知道"这台机器上有云端配置"。真正阻断靠
+                                            // 上面那三个 Receiver —— 新配置压根不会落地。
+                                            if (!sCloudStreamSeen) {
+                                                sCloudStreamSeen = true;
+                                                Diag.note("nocloud: 检测到读云端配置 "
+                                                        + m.getDeclaringClass().getSimpleName()
+                                                        + "." + nm + "（只观察，不改返回值）");
+                                            }
+                                            return;
+                                        }
+                                        else return;
+                                        if (!sCloudFirstBlocked) {
+                                            sCloudFirstBlocked = true;
+                                            Diag.note("nocloud: 首次拦截读取入口 "
+                                                    + m.getDeclaringClass().getSimpleName()
+                                                    + "." + nm + " ret=" + rt.getSimpleName());
+                                        }
+                                        if (sCloudBlocked < 12) {
+                                            sCloudBlocked++;
+                                            Diag.log("nocloud: 已阻断读取入口 " + nm);
+                                        }
+                                    } catch (Throwable ignored) {
+                                    }
+                                }
+                            });
+                            n++;
+                            nRead++;
+                            Diag.note("ok: 云控读取入口 <- "
+                                    + m.getDeclaringClass().getSimpleName()
+                                    + "." + nm + " ret=" + rt.getSimpleName());
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+
+        // 2) DexKit 兜底：按字符串锚点再找一遍（类名随 OTA 变了也能命中）
+        if (apkPath != null) {
+            for (String anchor2 : new String[]{"ThermalCfgCotaUpdate", "thermal_cota", "cota_thermal"}) {
+                try {
+                    java.util.List<java.lang.reflect.Method> ms =
+                            DexKitHelper.findMethodsByStrings(apkPath, cl, anchor2);
+                    for (final java.lang.reflect.Method m : ms) {
+                        if (m.getName().startsWith("on")) {
+                            // 已经按类名挂过的跳过（同方法重复挂会触发两次）
+                            continue;
+                        }
+                        XposedBridge.hookMethod(m, new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                try {
+                                    if (!Cfg.isOn(Cfg.K_NOCLOUD)) return;
+                                    param.setResult(null);
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        });
+                        n++;
+                        Diag.note("ok: 云控兜底锚点 " + anchor2 + " -> "
+                                + m.getDeclaringClass().getSimpleName() + "." + m.getName());
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        // ⚠ 和反诈一样：不能只看总数。三个 Receiver 是真正阻断下发的关键，
+        // 只要有一类没挂上就必须重试 —— 否则"挂了 18 个读取入口、3 个 Receiver 全失败"
+        // 也算成功，云端照样能推。
+        boolean complete = nRecv >= 3;
+        sCloudDone = complete;
+        Diag.note("nocloud: 共接管 " + n + " 处（下发=" + nRecv
+                + " 读取=" + nRead + "）"
+                + (complete ? "" : " ⚠ Receiver 未挂全，下次重试"));
+    }
     private static boolean sExtraDone = false;
 
     /**
@@ -169,24 +625,36 @@ public final class MiscHook {
         if (apkPath == null || cl == null) return;
 
         int n = 0;
-        n += hookByString(apkPath, cl, "fps", "setScheduleFPS");
+        int nFps = 0;      // 帧率链路（最关键）
+        int nOther = 0;    // 画质 / 亮度
+        nFps += hookByString(apkPath, cl, "fps", "setScheduleFPS");
         n += hookByString(apkPath, cl, "quality", "Game picture quality change");
+        nOther += hookByString(apkPath, cl, "quality", "Game picture quality change");
         n += hookByString(apkPath, cl, "brightness-off", "Disable local brightness");
+        nOther += hookByString(apkPath, cl, "brightness-off", "Disable local brightness");
         n += hookByString(apkPath, cl, "brightness-exit", "exit local brightness");
+        nOther += hookByString(apkPath, cl, "brightness-exit", "exit local brightness");
         // ⚠ 充电分离**只观察不阻断**（v3.1.0 第 5 遍复查结论）。
         // 它不是"性能限制"，而是**电池保护**：游戏时绕过电池、由充电器直接供电，
         // 避免边充边放导致电池发热。阻断它 = 电池边充边放 = 机身更热
         // = 反而更早触发温控降频。挡它属于帮倒忙。
         n += hookByString(apkPath, cl, "charge-sep(observe)", "charge separation switch", false);
         n += hookByString(apkPath, cl, "fps-report", "sendFpsResult");
+        nFps += hookByString(apkPath, cl, "fps-report", "sendFpsResult");
         // checkFpsAsync：PanguResGovernor 里的**异步帧率检查**线程。
         // 只挡上报（sendFpsResult）不够 —— 检查逻辑本身仍会按实际帧率
         // 生成"需要限帧"的结论并下发。两个都要挡。
         n += hookByString(apkPath, cl, "fps-check", "checkFpsAsync");
+        nFps += hookByString(apkPath, cl, "fps-check", "checkFpsAsync");
         // 一个都没挂上（DexKit 还没就绪 / apk 路径不对）就别把 sExtraDone 锁死，
         // 留给下一次 handleLoadPackage 重试
-        sExtraDone = n > 0;
-        Diag.note("thermal-extra: 共挂载 " + n + " 处" + (n == 0 ? "（下次重试）" : ""));
+        // ⚠ 同反诈/云控的坑：不能只看总数。帧率链路（fps / fps-report / fps-check）
+        // 是游戏掉帧的主因，它没挂上就等于白干；画质/亮度可以少一两处。
+        boolean complete = nFps >= 2 && nOther >= 1;
+        sExtraDone = complete;
+        Diag.note("thermal-extra: 共挂载 " + n + " 处（帧率=" + nFps
+                + " 画质亮度=" + nOther + "）"
+                + (complete ? "" : " ⚠ 帧率链路未挂全，下次重试"));
         // 挂完就把 dex 索引放掉：Hook 已经拿到 Method 对象，不再需要 bridge。
         // 没挂上则保留（还要重试）。
         if (sExtraDone) DexKitHelper.release();
@@ -231,7 +699,14 @@ public final class MiscHook {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             try {
-                                if (!Cfg.hottempOn()) return;
+                                boolean on = Cfg.hottempOn();
+                                if (!sThermalFirstSeen) {
+                                    sThermalFirstSeen = true;
+                                    Diag.note("thermal: 首次回调命中 " + tag
+                                            + " | 开关=" + on
+                                            + (on ? " → 已拦截" : " → 开关关闭，放行"));
+                                }
+                                if (!on) return;
                                 if (!blockable) return;   // 只观察
                                 if (rt == void.class) param.setResult(null);
                                 else if (rt == boolean.class) param.setResult(Boolean.FALSE);
@@ -309,7 +784,196 @@ public final class MiscHook {
      */
     public static void initSystemServer(ClassLoader cl) {
         hookThermalNormalize(cl);
+        hookSecureFlag(cl);
     }
+
+    // ==================== 安全组件：屏蔽截图/录屏限制（v3.2.0） ====================
+
+    /**
+     * 去掉窗口的 FLAG_SECURE，让原本禁止截图/录屏的页面可以被正常截图。
+     *
+     * <p>FLAG_SECURE(0x2000) 是 app 在 WindowManager.LayoutParams 上设的位，
+     * 一旦置上：截屏黑屏、录屏黑块、最近任务里也变成纯色。银行、支付、部分阅读类
+     * app 都靠它防截屏。这里在 **system_server 的窗口添加/更新入口**把它清掉，
+     * 一次覆盖所有 app —— 不需要给每个 app 单独挂作用域。
+     *
+     * <p>⚠ 副作用（必须让用户知道）：清了之后这些页面也能被截图，包括别人拿你手机时。
+     * 所以做成默认关闭、单独开关。
+     *
+     * <p>⚠ 只动 flags，**不改 SurfaceControl 的 secure 属性**。有些 app 走的是
+     * SurfaceView.setSecure(true) 这条路，那属于真正的硬件层保护，这里不碰
+     * （碰了会黑屏）。
+     */
+    private static void hookSecureFlag(ClassLoader cl) {
+        if (sSecureHooked) return;
+        try {
+            Class<?> wms = XposedHelpers.findClass("com.android.server.wm.WindowManagerService", cl);
+            final int FLAG_SECURE = 0x00002000;
+
+            // addWindow 和 relayoutWindow 都会收到 WindowManager.LayoutParams 作为参数，
+            // 清掉这个位即可。两个都挂：有的窗口是 add 时带的，有的是后续 relayout 才设上。
+            int n = 0;
+            int nAdd = 0;      // addWindow：窗口创建时带的 FLAG_SECURE
+            int nRelayout = 0; // relayoutWindow：窗口后续改 flags 走这里
+            for (java.lang.reflect.Method m : wms.getDeclaredMethods()) {
+                final String nm = m.getName();
+                if (!"addWindow".equals(nm) && !"relayoutWindow".equals(nm)) continue;
+                final int idx = indexOfLayoutParams(m);
+                if (idx < 0) continue;
+                try {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                // ⚠ 首调判据必须放在开关判断**之前**。
+                                // 放后面的话，开关一关就永远看不到这条日志，
+                                // 排查时分不清"钩子没被调用"和"开关关着"。
+                                if (!sSecureFirstSeen) {
+                                    sSecureFirstSeen = true;
+                                    boolean on0 = Cfg.nosecureOn();
+                                    Diag.note("nosecure: 首次回调命中 " + nm
+                                            + " | 开关=" + on0
+                                            + (on0 ? " → 开始清除" : " → 开关关闭，放行"));
+                                }
+                                if (!Cfg.nosecureOn()) return;
+                                if (param.args.length <= idx) return;
+                                Object a = param.args[idx];
+                                if (!(a instanceof android.view.WindowManager.LayoutParams)) return;
+                                android.view.WindowManager.LayoutParams lp =
+                                        (android.view.WindowManager.LayoutParams) a;
+                                if ((lp.flags & FLAG_SECURE) != 0) {
+                                    lp.flags &= ~FLAG_SECURE;
+                                    if (!sSecureFirstBlocked) {
+                                        sSecureFirstBlocked = true;
+                                        Diag.note("nosecure: 首次拦截 —— 清掉了窗口 \""
+                                                + lp.getTitle() + "\" 的 FLAG_SECURE");
+                                    }
+                                    if (sSecureLogged < 6) {
+                                        sSecureLogged++;
+                                        Diag.log("nosecure: 已清除 FLAG_SECURE ("
+                                                + lp.getTitle() + ")");
+                                    }
+                                }
+                            } catch (Throwable t) {
+                                Diag.err("nosecure gate error", t);
+                            }
+                        }
+                    });
+                    n++;
+                    if ("addWindow".equals(nm)) nAdd++;
+                    else nRelayout++;
+                } catch (Throwable ignored) {
+                }
+            }
+            // ⚠ 两个入口都要挂上才算完整：
+            //   addWindow     -- 窗口创建时带的 FLAG_SECURE
+            //   relayoutWindow -- 窗口后续 setFlags 时走这里
+            // 只挂一个也能"看起来成功"（n>0），但另一条路会漏 —— 用户表现就是
+            // "有的页面能截图、有的还是黑"。所以按类别判定。
+            // 第 3 条写入路径：setWindowFlags(int flags, int mask)
+            //
+            // Window.setFlags / addFlags / clearFlags 走的是 IWindowSession.setFlags
+            // -> WMS.setWindowFlags -> WindowState.mAttrs.flags = flags，
+            // **参数是 int，不经过 LayoutParams**，上面两个 hook 一个都盖不到。
+            //
+            // 通常改完 flags 会顺带 relayout（那时能兜住），但只改 flags 不 relayout
+            // 的情况就会漏。补一条，彻底封死。
+            int nSetFlags = 0;
+            for (java.lang.reflect.Method m : wms.getDeclaredMethods()) {
+                if (!"setWindowFlags".equals(m.getName())) continue;
+                Class<?>[] pt = m.getParameterTypes();
+                // 找 flags 参数：第一个 int（mask 是第二个 int，不能弄反）
+                int flagsIdx = -1;
+                for (int i = 0; i < pt.length; i++) {
+                    if (pt[i] == int.class) { flagsIdx = i; break; }
+                }
+                if (flagsIdx < 0) continue;
+                final int fi = flagsIdx;
+                try {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!sSecureFirstSeen) {
+                                    sSecureFirstSeen = true;
+                                    boolean on0 = Cfg.nosecureOn();
+                                    Diag.note("nosecure: 首次回调命中 setWindowFlags | 开关=" + on0);
+                                }
+                                if (!Cfg.nosecureOn()) return;
+                                if (param.args.length <= fi) return;
+                                Object o = param.args[fi];
+                                if (!(o instanceof Integer)) return;
+                                int f = (Integer) o;
+                                if ((f & FLAG_SECURE) != 0) {
+                                    param.args[fi] = f & ~FLAG_SECURE;
+                                    if (!sSecureFirstBlocked) {
+                                        sSecureFirstBlocked = true;
+                                        Diag.note("nosecure: 首次拦截 —— setWindowFlags 清掉 FLAG_SECURE");
+                                    }
+                                }
+                            } catch (Throwable t) {
+                                Diag.err("nosecure setFlags error", t);
+                            }
+                        }
+                    });
+                    nSetFlags++;
+                } catch (Throwable ignored) {
+                }
+            }
+            n += nSetFlags;
+
+            // 判定：addWindow + relayoutWindow 必须都有（这两条是 LayoutParams 通道，
+            // 覆盖 99% 的场景）。setWindowFlags 是**可选**的第三条 —— 实测这台设备的
+            // WMS 根本没有这个方法（Honor 可能改了签名），不能因为它缺席就判定失败，
+            // 否则会一直挂着"未挂全"的误报。
+            boolean complete = nAdd > 0 && nRelayout > 0;
+            sSecureHooked = complete;
+            Diag.note("ok: 截图限制钩子 -> " + n + " 处（addWindow=" + nAdd
+                    + " relayout=" + nRelayout
+                    + (nSetFlags > 0 ? " setWindowFlags=" + nSetFlags : " setWindowFlags=本机无此方法")
+                    + "）"
+                    + (complete ? "" : " ⚠ LayoutParams 通道未挂全，下次重试"));
+        } catch (Throwable t) {
+            Diag.note("skip: WindowManagerService 找不到 (" + t.getClass().getSimpleName() + ")");
+        }
+    }
+
+    /**
+     * 取当前进程名。
+     *
+     * <p>注意不能用 Application.getProcessName()（那是 API 28+ 且需要在 app 里有 Context），
+     * 这里用 /proc/self/cmdline 最稳 —— 系统进程里也能读到，且不需要任何权限。
+     */
+    private static String currentProcessName() {
+        try {
+            java.io.FileInputStream in = new java.io.FileInputStream("/proc/self/cmdline");
+            byte[] buf = new byte[128];
+            int n = in.read(buf);
+            in.close();
+            if (n <= 0) return "";
+            int end = 0;
+            while (end < n && buf[end] != 0) end++;
+            return new String(buf, 0, end, "UTF-8");
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /** 找 WindowManager.LayoutParams 在参数列表里的下标，没有返回 -1。 */
+    private static int indexOfLayoutParams(java.lang.reflect.Method m) {
+        Class<?>[] pts = m.getParameterTypes();
+        for (int i = 0; i < pts.length; i++) {
+            if (android.view.WindowManager.LayoutParams.class.isAssignableFrom(pts[i])) return i;
+        }
+        return -1;
+    }
+
+    private static boolean sSecureHooked = false;
+    private static int sSecureLogged = 0;
+    /** 首次回调命中（证明钩子被调用、开关读到） */
+    private static boolean sSecureFirstSeen = false;
+    /** 首次真的清掉 FLAG_SECURE（证明拦截生效） */
+    private static boolean sSecureFirstBlocked = false;
 
     private static boolean sSysThermalDone = false;
 
