@@ -84,7 +84,12 @@ public final class MiscHook {
      * by the same system-property switch as the rest of the thermal bypass
      * (Cfg.hottempOn(), readable from any process, no binder).
      */
-    public static void initPowerGenie(ClassLoader cl) {
+    public static void initPowerGenie(ClassLoader cl, String apkPath) {
+        // ⚠ 必须先跑：下面那行 `if (sPgDone || sPgTries >= 3) return;` 是给
+        // ThermalManager 那部分用的闸门。早先把 hookThermalExtra 放在函数末尾，
+        // 结果 ThermalManager 连挂 3 次失败后整个函数直接 return，
+        // thermal-extra 永远拿不到执行机会 —— sExtraDone 的重试逻辑等于白写。
+        hookThermalExtra(apkPath, cl);
         // Idempotent, but ONLY after a successful hook pass: the first
         // handleLoadPackage in the iaware process can arrive before HAware's
         // dex is reachable from that classloader (observed CNFE at boot,
@@ -138,6 +143,128 @@ public final class MiscHook {
     }
 
     private static int sPgBlocked = 0;
+    private static int sExtraBlocked = 0;
+    private static boolean sExtraDone = false;
+
+    /**
+     * 游戏/温控的**真正执行端**（v3.1.0）。
+     *
+     * <p>背景：`ThermalManager.handleThermalEvent` 只挡住"通知类"策略（弹窗、后台冻结）。
+     * 真正让游戏掉帧、降画质、锁亮度的是另一条链 —— 这些类**类名可读、方法名被 R8
+     * 压成单字母**（`c1.l` / `f1.o0` / `display.d.o`），按名字 hook 既写不出、OTA 一变就废。
+     *
+     * <p>所以改用 DexKit 的字符串锚点定位（见 {@link DexKitHelper#findMethodsByStrings}）。
+     * 反编译 HAware(3.8MB dex) 得到的映射：
+     * <pre>
+     *   setScheduleFPS              com.hihonor.thermal.core.c1.l          帧率下发
+     *   Game picture quality change com.hihonor.thermal.core.f1.o0         画质降级
+     *   Disable local brightness    powergenie.core.display.d.o + display.m.p   亮度禁用
+     *   exit local brightness       DisplayCtrlManager.checkPkgLocalBrightness* 亮度退出
+     *   charge separation switch    v0.i.q / v0.i.r                        充电分离
+     *   sendFpsResult               PanguResGovernor.T                     帧率上报
+     * </pre>
+     */
+    private static void hookThermalExtra(String apkPath, ClassLoader cl) {
+        if (sExtraDone) return;
+        if (apkPath == null || cl == null) return;
+
+        int n = 0;
+        n += hookByString(apkPath, cl, "fps", "setScheduleFPS");
+        n += hookByString(apkPath, cl, "quality", "Game picture quality change");
+        n += hookByString(apkPath, cl, "brightness-off", "Disable local brightness");
+        n += hookByString(apkPath, cl, "brightness-exit", "exit local brightness");
+        // ⚠ 充电分离**只观察不阻断**（v3.1.0 第 5 遍复查结论）。
+        // 它不是"性能限制"，而是**电池保护**：游戏时绕过电池、由充电器直接供电，
+        // 避免边充边放导致电池发热。阻断它 = 电池边充边放 = 机身更热
+        // = 反而更早触发温控降频。挡它属于帮倒忙。
+        n += hookByString(apkPath, cl, "charge-sep(observe)", "charge separation switch", false);
+        n += hookByString(apkPath, cl, "fps-report", "sendFpsResult");
+        // checkFpsAsync：PanguResGovernor 里的**异步帧率检查**线程。
+        // 只挡上报（sendFpsResult）不够 —— 检查逻辑本身仍会按实际帧率
+        // 生成"需要限帧"的结论并下发。两个都要挡。
+        n += hookByString(apkPath, cl, "fps-check", "checkFpsAsync");
+        // 一个都没挂上（DexKit 还没就绪 / apk 路径不对）就别把 sExtraDone 锁死，
+        // 留给下一次 handleLoadPackage 重试
+        sExtraDone = n > 0;
+        Diag.note("thermal-extra: 共挂载 " + n + " 处" + (n == 0 ? "（下次重试）" : ""));
+        // 挂完就把 dex 索引放掉：Hook 已经拿到 Method 对象，不再需要 bridge。
+        // 没挂上则保留（还要重试）。
+        if (sExtraDone) DexKitHelper.release();
+    }
+
+    /**
+     * 按锚点字符串把**所有**匹配的方法都挂上。
+     *
+     * <p>关键点（都是踩过的）：
+     * <ul>
+     *   <li>同一方法名常有重载（`display.d.o` 有 `()AtomicBoolean` 和 `(String)Z`），
+     *       只取第一个容易挑错、白 hook</li>
+     *   <li>返回值只给**原始类型**的默认值：void→null、boolean→false、int/long→0</li>
+     *   <li>返回**对象**的方法（如 `()AtomicBoolean`）**不阻断** —— 给 null 会让
+     *       调用方直接 NPE，崩了比不生效更糟。这类只挂上去记日志，便于诊断</li>
+     * </ul>
+     */
+    private static int hookByString(String apkPath, ClassLoader cl,
+                                    final String tag, String anchor) {
+        return hookByString(apkPath, cl, tag, anchor, true);
+    }
+
+    /**
+     * @param block true = 阻断（setResult 掉）；false = 只挂上去记日志，不影响原逻辑
+     */
+    private static int hookByString(String apkPath, ClassLoader cl,
+                                    final String tag, String anchor, final boolean block) {
+        int hooked = 0;
+        try {
+            java.util.List<java.lang.reflect.Method> methods =
+                    DexKitHelper.findMethodsByStrings(apkPath, cl, anchor);
+            if (methods.isEmpty()) {
+                Diag.warn("thermal-extra: " + tag + " 未找到（锚点 " + anchor + "）");
+                return 0;
+            }
+            for (final java.lang.reflect.Method m : methods) {
+                final Class<?> rt = m.getReturnType();
+                final boolean blockable = block && (rt == void.class || rt == boolean.class
+                        || rt == int.class || rt == long.class);
+                try {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!Cfg.hottempOn()) return;
+                                if (!blockable) return;   // 只观察
+                                if (rt == void.class) param.setResult(null);
+                                else if (rt == boolean.class) param.setResult(Boolean.FALSE);
+                                else if (rt == int.class) param.setResult(Integer.valueOf(0));
+                                else if (rt == long.class) param.setResult(Long.valueOf(0L));
+                                else return;   // 返回对象：不阻断，防 NPE
+                                if (sExtraBlocked < 12) {
+                                    sExtraBlocked++;
+                                    Diag.log("thermal-extra: blocked " + tag + " -> "
+                                            + m.getDeclaringClass().getSimpleName()
+                                            + "." + m.getName());
+                                }
+                            } catch (Throwable t) {
+                                Diag.err("thermal-extra gate error", t);
+                            }
+                        }
+                    });
+                    hooked++;
+                    Diag.note("ok: thermal-extra " + tag + " <- "
+                            + m.getDeclaringClass().getName() + "." + m.getName()
+                            + " ret=" + rt.getSimpleName()
+                            + (blockable ? "" : "（只观察不阻断）"));
+                } catch (Throwable t) {
+                    Diag.err("thermal-extra hookMethod failed: " + tag, t);
+                }
+            }
+        } catch (Throwable t) {
+            Diag.err("thermal-extra hook failed: " + tag, t);
+        }
+        return hooked;
+    }
+
+
     private static boolean sPgDone = false;
     private static int sPgTries = 0;
     private static boolean sAmHooked = false;
