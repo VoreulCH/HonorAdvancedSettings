@@ -1635,9 +1635,10 @@ class SettingsActivity : ComponentActivity() {
                 SwitchCard(listOf(
                     SwRow("允许截屏 / 录屏（ROOT）",
                         "清除窗口的 FLAG_SECURE，让原本一截就黑屏、录屏一片黑的页面（银行 / 支付 / 部分阅读类 app）"
-                                + "可以正常截图录屏。**需要 ROOT**：这个钩子挂在 system_server，"
-                                + "它读不到模块的开关（SELinux），只能通过写系统属性 persist.sys.has.nosecure 传递，"
-                                + "而写属性必须 root。",
+                                + "可以正常截图录屏。"
+                                + "需要两样东西：① system_server 作用域（下方状态会显示，钩子装在那里）；"
+                                + "② ROOT（开关值要写成系统属性 persist.sys.has.nosecure 才能传过去，"
+                                + "因为 system_server 读不到模块自己的设置，SELinux 限制）。",
                         Cfg.K_NOSECURE, true, false, confirmOnEnable = true, scopes = S_SYSTEM,
                         confirmTitle = "允许截屏 / 录屏（需要 ROOT）",
                         confirmLines = listOf(
@@ -1674,7 +1675,10 @@ class SettingsActivity : ComponentActivity() {
                     SwRow("清理云端配置残留",
                         "删除 /data/cota/para/ 下三份**性能相关**云端配置（cpuconfig / pg_config / thermal_config）。"
                                 + "这是**一次性动作**，执行完会自动关回去。需要 ROOT。",
-                        Cfg.K_PURGECOTA, false, false, confirmOnEnable = true, scopes = S_SYSTEM,
+                        // 不传 scopes：这个开关只是 app 内执行一次 su rm，
+                        // 跟 systemui / system_server 的作用域没有半点关系。
+                        // 传 S_SYSTEM 会让它错误地显示"系统作用域失效"。
+                        Cfg.K_PURGECOTA, false, false, confirmOnEnable = true,
                         confirmTitle = "⚠ 清理云端配置残留（危险操作）",
                         confirmLines = listOf(
                             "将要删除这三个文件（不可撤销）：",
