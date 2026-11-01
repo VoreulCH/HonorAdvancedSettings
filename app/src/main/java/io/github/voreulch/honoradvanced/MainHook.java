@@ -58,7 +58,7 @@ public final class MainHook implements IXposedHookLoadPackage {
             // (dumpsys: powergenie ServiceRecord processName=com.hihonor.iaware),
             // hence both packages are scoped and routed here.
             enter("powergenie", pkg, lpparam);
-            MiscHook.initPowerGenie(cl);
+            MiscHook.initPowerGenie(cl, lpparam.appInfo != null ? lpparam.appInfo.sourceDir : null);
             return;
         }
 
