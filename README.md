@@ -17,11 +17,28 @@
 > This repository is the LSPosed distribution mirror; source code, issues and
 > discussions live in the source repository above.
 
+## 隐私 / Privacy
+
+本模块完全运行于本机，**不获取、不上传任何隐私内容**：
+
+- 不读取通讯录、短信、通话记录、位置、相册、麦克风、摄像头、剪贴板
+- 不收集设备标识（IMEI / 序列号 / Android ID / 广告 ID），不碰任何账号信息
+- 没有埋点统计、没有第三方 SDK、不做用户画像
+- 开关与参数只保存在本机应用私有目录，卸载即删除
+- 唯一声明的网络权限用于「检查更新」（**只有你点它**的时候才访问 GitHub 公开接口）
+- 「导出诊断报告」只在用户点击时生成一个文本文件，存在本机「下载」目录，**发不发、发给谁完全由用户决定**
+
+This module runs entirely on-device and **collects/uploads no private data**:
+no contacts, SMS, call logs, location, photos, microphone, camera or clipboard;
+no device identifiers or account info; no analytics, no third-party SDKs.
+Preferences live in the app's private directory and are removed on uninstall.
+The only network permission is used for the manual "check for updates" action.
+
 面向荣耀 MagicOS 11 的一站式 LSPosed 模块，整合了前作 **荣耀液态玻璃恢复（HonorLiquidGlassRestore）** 与 **荣耀安装器净化（HonorInstallerPurify）** 的全部功能，并重写了模块界面：
 
-- **液态玻璃**：还原系统 OTA 更新阉割的控制中心 / 通知中心液态玻璃，覆盖**系统 / 锁屏 / 通知横幅 / 桌面 / 相册**五条线，每线独立开关；配方按界面分组、共 **71 项精确参数**（100% = 原厂，0~200% 可调），从「通知卡底色」到「锁屏时钟的玻璃腐蚀强度」都能单独拖。
+- **液态玻璃**：还原系统 OTA 更新阉割的控制中心 / 通知中心液态玻璃，覆盖**系统 / 锁屏 / 通知横幅 / 桌面 / 相册**五条线，每线独立开关；配方按界面分组、共 **75 项精确参数**（100% = 不改动，0~200% 可调），从「通知卡底色」到「锁屏时钟的玻璃腐蚀强度」都能单独拖。
 - **安装器净化**：跳过安装器联网安全检测与指纹预装提示、禁止联网、隐藏推广卡片，支持降级安装；**钩子点自适应解析**（DexKit 字符串锚 + 参数签名扫描），荣耀安装器 OTA 混淆重排后大概率无需更新模块。
-- **高温限制解除**（需 ROOT）：高温时不弹「建议暂停使用」提示、不限制屏幕亮度、系统热状态按正常上报、压制 PowerGenie 温控（游戏限帧 / 后台清理）、高温自动关机不再触发；默认关闭、开启前二次确认，内核调度与降频不受影响。
+- **高温限制解除**（需 ROOT）：高温时不弹「建议暂停使用」提示、不限制屏幕亮度、系统热状态按正常上报、**压制 PowerGenie 的全部性能限制**（游戏锁帧 / 降画质 / 锁亮度 / 帧率检查与上报，共 10 个执行点，用 DexKit 字符串锚点定位、抗 OTA 混淆）、高温自动关机不再触发；默认关闭、开启前二次确认，内核调度与降频不受影响。
 - **应用内开关**：所有功能在 miuix 风格界面以开关呈现，配置经 ContentProvider 桥跨进程同步，安装器线改开关无需重启，玻璃线一键重启作用域。
 
 An all-in-one LSPosed module for Honor MagicOS 11 that merges the previous
@@ -46,7 +63,8 @@ toggleable in-app, with cross-process config sync via a ContentProvider bridge.
 | 相册液态玻璃 / Gallery | 相册照片页工具栏的液态玻璃效果 Liquid glass on the gallery photo-page toolbar |
 | 分线开关 / Per-line switches | 三条线独立开关；系统级底层钩子（材质判定 / HIGH 强制渲染）归总开关管辖，避免关闭分开关连带破坏依赖底层的玻璃效果 Per-line switches; system-level hooks live under the master switch so turning a sub-switch off never breaks the shared base |
 | 桌面液态玻璃 / Launcher | 桌面卡片与文件夹的模糊 / 饱和度 / 亮度，独立开关 Card & folder blur / saturation / brightness, own switch |
-| 精细调节 / Fine tuning | **71 项参数，按界面分组**：系统 42（通知卡 / 大按钮 / 小按钮 / 滑块 / 光学 / 模糊 / 高光）、锁屏 25（通知卡 / 时钟腐蚀 / 按钮·图标·文字各 5 / 小组件 / 壁纸指纹）、横幅 5、桌面 3。100% = 原厂 71 parameters grouped per surface: 42 system, 25 lock screen, 5 banner, 3 launcher; 100% = stock |
+| 精细调节 / Fine tuning | **75 项参数，按界面分组**：系统 45（含横幅 5；通知卡 / 大按钮 / 小按钮 / 滑块 / 光学 / 模糊 / 高光 / 多层遮罩与渐变）、锁屏 25（通知卡 / 时钟腐蚀 / 按钮·图标·文字各 5 / 小组件 / 壁纸指纹）、桌面 3、总开关 2。100% = 不改动 75 parameters grouped per surface: 45 system (incl. 5 banner), 25 lock screen, 3 launcher, 2 master switches; 100% = untouched |
+| 诊断报告 / Diagnostics | 关于页一键导出：设备信息 / su 路径探测 / root 方案痕迹 / 属性与开关快照 / 模块操作日志 / LSPosed 日志尾部，存到「下载」目录 One-tap diagnostic report (device, su probe, root traces, prefs, op log, LSPosed tail) saved to Downloads |
 | 强制液态 / Force liquid | 某些界面系统会自己判定成磨砂，这个开关强制它们走液态折射 Forces surfaces the system renders as frosted onto the liquid path |
 
 ### 安装器净化 / Installer purify
@@ -154,6 +172,7 @@ gradle assembleRelease
 
 - **2.1.2（58）**：适配荣耀安装器 **14.0.39.301** 新构建；修复部分渠道（如 MT 管理器）安装时匿名来源弹窗消失后「安装」按钮点不动的问题；修复安装全新应用被误标「降级安装」；移除历史调试代码、压缩冗余。
 - **2.0.2（48）**：新增「杂项」页与**屏蔽通知回避**（通知音响起时不再压低正在播放的音乐，闹钟不受影响）；安装器净化适配 **14.0.32.303 / 14.0.22.327**（累计覆盖 38.301 · 32.303 · 22.326 · 22.327 四版，自适应零开关）；隐藏安装页「未发现风险」残留卡片（与渲染同帧，无闪现）；液态玻璃通知卡片 / 工具栏按钮参数回迁 1.4.22 认可配方。
+- **3.1.3（128）**：**温控大更新** —— 反编译 PowerGenie 后接管了 10 个真正的性能限制执行点（帧率下发/上报/检查、画质降级、亮度禁用/退出），用 DexKit 字符串锚点定位以抗 OTA 混淆；修复「温控开关关不掉」（su 超时 8s→30s + 7 路径兜底 + 强制杀）；新增诊断报告一键导出（AppLog + 6 类环境快照）；边缘高光改用真开关并语义反转（默认全开，双向联动，老数据自动迁移）；新增多层遮罩浓度 / 动态卡渐变 / 锁屏控制中心展开态；参数 71→75。
 - **3.0.1（119）**：**液态玻璃大更新** —— 从「一套配方」改成 **71 项按界面分组的精细调节**（系统 42 / 锁屏 25 / 横幅 5 / 桌面 3 + 强制液态开关）；打通锁屏四条以前调不了的链路（时钟腐蚀表 / 按钮·图标·文字的通用参数包 / 小组件 / 壁纸与指纹）；新增桌面液态玻璃（独立开关）；三级菜单重构；**DIY 模式整体移除**（被精细调节完全覆盖）；修 4 个真 bug（桌面光学被绝对值覆盖、参数重复应用叠乘、强制液态开关状态造假、高温旁路缓存初值方向写反）。
 - **2.0.0（46）**：大版本重构 —— DIY 模式（14 个 0~100 滑条实时调观感）、界面 miuix 化、安装器净化自适应钩子集（兼容模式开关取消）、安装提速。
 - 2.0.3 ~ 2.0.9 为内部迭代版本，未单独发布，改动已全部并入 2.1.2。
