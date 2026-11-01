@@ -50,8 +50,23 @@ public final class Cfg {
     public static final String K_NODUCK = "noduck";       // misc: block notification audio ducking
     public static final String K_HOTTEMP = "hottemp";     // misc: suppress the system high-temperature popups
     public static final String K_DIAG = "diag";           // about: verbose diagnostics into the LSPosed log
+    // ===== 安全组件（v3.2.0）=====
+    //
+    // 这几个都是"解除系统限制"型开关，默认全关、需要用户显式打开。
+    public static final String K_NOSECURE = "nosecure";   // 允许截屏/录屏（清 FLAG_SECURE）
+    public static final String K_NOCLOUD = "nocloud";     // 屏蔽性能/温控策略的云控下发
+    public static final String K_NOFRAUD = "nofraud";     // 屏蔽反诈组件的数据采集与上报
+    /**
+     * 清理云端配置残留（一次性操作，不是常驻开关）。
+     *
+     * 删除 /data/cota/para/ 下三份性能相关配置（cpuconfig / pg_config / thermal_config）。
+     * 需要 ROOT。执行完 UI 会自动把它关回去 —— 它代表"动作"而不是"状态"。
+     */
+    public static final String K_PURGECOTA = "purgecota";
+
     public static final String[] KEYS = {
-            K_GLASS, K_SYSTEM, K_KEYGUARD, K_GALLERY, K_BANNER, K_DESK,
+            K_GLASS,
+            K_NOSECURE, K_NOCLOUD, K_NOFRAUD, K_PURGECOTA, K_SYSTEM, K_KEYGUARD, K_GALLERY, K_BANNER, K_DESK,
             K_PURIFY, K_INFOCARD, K_DOWNGRADE, K_NODUCK, K_HOTTEMP, K_DIAG,
     };
 
@@ -67,6 +82,7 @@ public final class Cfg {
             "com.android.packageinstaller",
             "com.hihonor.powergenie",
             "com.hihonor.iaware",
+            "com.hihonor.securityserver",
             "android",
     };
 
@@ -165,6 +181,78 @@ public final class Cfg {
         }
     }
 
+    /** v3.2.0「烧录配方落地」的一次性标记。 */
+    public static final String MIG_BAKED = "baked_v1";
+
+    /**
+     * **原厂**默认值（不是烧录配方）。
+     *
+     * <p>和 {@link #fnDefPct} 的区别要分清：
+     * <ul>
+     *   <li>{@code fnDefPct} = <b>本品出厂观感</b>（主人烧录的那套，不是原厂）</li>
+     *   <li>{@code factoryDefPct} = <b>系统原厂值</b>（100 = 不改动、角度 250、开关 0/1）</li>
+     * </ul>
+     * 老用户缺键时补的是**这个**，不能补烧录值 —— 否则他就成了"半套我的配方"。
+     */
+    public static int factoryDefPct(String key) {
+        if (F_HL_ANGLE.equals(key)) return 250;
+        if (F_FORCE_LIQUID.equals(key) || F_CC_EXPAND.equals(key)) return 0;
+        if (F_HL_ON.equals(key) || F_HL_CC.equals(key)
+                || F_HL_BTN.equals(key) || F_HL_SL.equals(key)) {
+            return 1;   // 原厂四类高光全开
+        }
+        return 100;
+    }
+
+    /**
+     * v3.2.0：把「烧录配方」按新装 / 老用户两种情况落地。
+     *
+     * <p><b>规则（用户定死）</b>：
+     * <ul>
+     *   <li>全新安装（prefs 里一个 {@code fn_} 键都没有）→ 把烧录配方写进去，开箱即用</li>
+     *   <li><b>老用户只要调过任何一项</b>（哪怕只有一根滑条）→ 缺的键补**原厂值**，
+     *       绝不把烧录配方掺进去。他调过的那套完整保留</li>
+     * </ul>
+     *
+     * <p>为什么必须显式落地、不能只靠 {@code fnDefPct} 兜底：一旦某个键在 prefs 里不存在，
+     * 读出来就是烧录值 —— 老用户没调过的项会自动变成我的观感，形成"半套我的配方"。
+     * 这种混合状态最难排查（用户以为是自己的设置，其实一半是别人的）。
+     */
+    public static void migrateBakedParams(android.content.SharedPreferences p) {
+        if (p == null) return;
+        try {
+            if (p.getBoolean(MIG_BAKED, false)) return;
+
+            // 判据：prefs 里是否存在任何一个 fn_ 键 = 他是不是调过
+            // 判据：有没有用户自己动过的精细参数。
+            // ⚠ 必须排除高光那四个键 —— migrateHlSemantics 会无条件写 fn_hl_on，
+            // 把它算进来的话，全新安装也会被误判成"老用户调过"。
+            boolean userHasParams = false;
+            for (String k : p.getAll().keySet()) {
+                if (k == null || !k.startsWith("fn_")) continue;
+                if (F_HL_ON.equals(k) || F_HL_CC.equals(k)
+                        || F_HL_BTN.equals(k) || F_HL_SL.equals(k)) continue;
+                userHasParams = true;
+                break;
+            }
+
+            android.util.Log.d("HAS-Baked", "userHasParams=" + userHasParams
+                    + " prefsKeys=" + p.getAll().size()
+                    + " sample_blur_card=" + Cfg.fnDefPct(F_BLUR_CARD));
+            android.content.SharedPreferences.Editor ed = p.edit();
+            if (userHasParams) {
+                for (String k : FN_KEYS) {
+                    if (!p.contains(k)) ed.putInt(k, factoryDefPct(k));
+                }
+            } else {
+                for (String k : FN_KEYS) ed.putInt(k, fnDefPct(k));
+            }
+            ed.putBoolean(MIG_BAKED, true);
+            ed.commit();
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static int fnDefPct(String key) {
         if (F_HL_ANGLE.equals(key)) {
             return 250;   // 边缘光方向，原厂 250°
@@ -181,9 +269,64 @@ public final class Cfg {
                 || F_HL_SL.equals(key)) {
             return 1;
         }
-        // 这两个是"默认关"的开关，保持 0。
-        if (F_FORCE_LIQUID.equals(key) || F_CC_EXPAND.equals(key)) {
+        // 开关型默认值：锁屏控制中心展开，出厂关。
+        // （强制液态已并入下面的烧录配方 —— 主人那台是开着的。）
+        if (F_CC_EXPAND.equals(key)) {
             return 0;
+        }
+
+        // ===== 出厂配方（v3.2.0 烧录）=====
+        //
+        // 这一版的"100%"不再是"系统原厂"，而是**主人自己调好的那套观感**。
+        // 也就是说新装用户打开就是下面这组值，不用自己再拖一遍。
+        //
+        // 数据来源：从共享 prefs 里逐项导出（fn_* -> 值），只列非 100 的项
+        // （100 本来就是"不改动"，不用占位）。改这里等于改所有人的出厂观感，
+        // 动之前先想清楚。
+        switch (key) {
+                case F_BLUR_CARD: return 80;
+                case F_BN_BLUR: return 90;
+                case F_BN_MASK: return 70;
+                case F_BN_OVL: return 80;
+                case F_BTN_MASK: return 60;
+                case F_BTN_OVL: return 60;
+                case F_CC_EXPAND: return 0;
+                case F_CC_MASK: return 60;
+                case F_CC_OVL: return 60;
+                case F_DESK_RADIUS: return 130;
+                case F_FORCE_LIQUID: return 1;
+                case F_HL_ANGLE: return 250;
+                case F_HL_BTN: return 1;
+                case F_HL_CC: return 1;
+                case F_HL_ON: return 1;
+                case F_HL_SL: return 1;
+                case F_KG_BTN: return 50;
+                case F_KG_BTN_DEP: return 140;
+                case F_KG_BTN_DIS: return 110;
+                case F_KG_BTN_EDGE: return 120;
+                case F_KG_ICON: return 50;
+                case F_KG_ICON_DEP: return 130;
+                case F_KG_ICON_DIS: return 130;
+                case F_KG_ICON_EDGE: return 120;
+                case F_KG_TXT_DEP: return 130;
+                case F_KG_TXT_DIS: return 130;
+                case F_KG_TXT_EDGE: return 120;
+                case F_KG_WIDGET: return 60;
+                case F_KL_CORNER: return 80;
+                case F_KL_MASK: return 40;
+                case F_KL_OVL: return 60;
+                case F_MULTI_MASK: return 80;
+                case F_NTF_CORNER: return 80;
+                case F_NTF_MASK: return 50;
+                case F_NTF_OVL: return 60;
+                case F_OPT_DEPTH: return 130;
+                case F_OPT_DISP: return 110;
+                case F_OPT_REFRACT: return 160;
+                case F_OPT_THICK: return 120;
+                case F_SL_MASK: return 60;
+                case F_SL_OVL: return 60;
+            default:
+                break;
         }
         return 100;
     }
@@ -439,6 +582,15 @@ public final class Cfg {
      * be silently active on a fresh install.
      */
     public static final String PROP_HOTTEMP = "persist.sys.has.hottemp";
+    /**
+     * 截图限制开关的系统属性。
+     *
+     * 为什么必须走属性：`hookSecureFlag` 挂在 **system_server**，它读不到模块的
+     * ContentProvider（SELinux 禁止 system_server 访问普通 app 的 provider），
+     * 所以 `Cfg.isOn(K_NOSECURE)` 在那里恒为 false —— 钩子挂上也不会拦任何东西。
+     * 属性是唯一全局可读的通道，和高温那条同一套机制。
+     */
+    public static final String PROP_NOSECURE = "persist.sys.has.nosecure";
 
     // Cached reader: the thermal hooks fire on EVERY HAL temperature callback
     // (several per second) and on EVERY status query, so a Class.forName +
@@ -453,6 +605,39 @@ public final class Cfg {
     // 而这恰恰是注释里说"绝不能发生"的情况（root 级安全绕过）。
     // 改成 false 后：首次成功读取前一律按关处理，最多延迟 1 秒（TTL）。
     private static volatile boolean sPropVal = false;
+
+    /** 截图限制开关的缓存时间戳（独立于高温，避免互相干扰）。 */
+    private static volatile long sNsAt;
+    private static volatile boolean sNsVal = false;
+
+    /**
+     * 截图限制是否开启。
+     *
+     * <p>语义：**1 = 允许截屏/录屏**（清掉 FLAG_SECURE），0 = 保持系统限制。
+     * 默认 "0"（关）。
+     *
+     * <p>与 {@link #hottempOn()} 结构完全一致：1 秒缓存 + 反射读属性，
+     * 读失败时沿用上次值而不反复重试。
+     */
+    public static boolean nosecureOn() {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - sNsAt < 1000L) {
+            return sNsVal;
+        }
+        try {
+            java.lang.reflect.Method m = sPropGet;
+            if (m == null) {
+                Class<?> sp = Class.forName("android.os.SystemProperties");
+                m = sp.getMethod("get", String.class, String.class);
+                sPropGet = m;
+            }
+            sNsVal = !"0".equals(m.invoke(null, PROP_NOSECURE, "0"));
+        } catch (Throwable t) {
+            // 读失败沿用上次值，别在每次回调里重试反射
+        }
+        sNsAt = now;
+        return sNsVal;
+    }
 
     public static boolean hottempOn() {
         long now = android.os.SystemClock.uptimeMillis();
@@ -503,6 +688,19 @@ public final class Cfg {
      * "UI 显示关闭、hook 实际开启"的鬼故事 —— 别再拆开写。
      */
     public static boolean isOptIn(String key) {
+        // ===== v3.2.0：所有**总闸**默认关闭 =====
+        //
+        // 规则（用户定）：装完模块什么都不该自动生效，要用户自己开。
+        //   · 有总开关的 -> 总开关默认关
+        //   · 二级 / 三级（分线、分项）-> 默认全开
+        // 例：液态玻璃只关 K_GLASS，系统/锁屏/横幅/桌面/相册这几条线仍默认开；
+        //     安装器净化只关 K_PURIFY，信息卡/降级安装等子项仍默认开。
+        //
+        // 这样总闸一开就是"完整的一套"，用户不需要进去逐条勾，关的时候也是整块关。
+        if (K_GLASS.equals(key) || K_PURIFY.equals(key)) return true;
+        // 安全组件：每一项都是独立的能力，默认全关。
+        if (K_NOSECURE.equals(key) || K_NOCLOUD.equals(key)
+                || K_NOFRAUD.equals(key) || K_PURGECOTA.equals(key)) return true;
         return K_NODUCK.equals(key) || K_HOTTEMP.equals(key)
                 || K_DIAG.equals(key);
     }
@@ -714,12 +912,39 @@ public final class Cfg {
     }
 
     /** one provider query; true on success. Never called from a hook callback. */
-    private static boolean loadOnce() {
-        Context ctx = null;
+    /**
+     * 拿一个能用的 Context（v3.2.5）。
+     *
+     * <p>原来只用 {@code AndroidAppHelper.currentApplication()}，但**有些系统进程
+     * 根本没有 Application 实例** —— securityserver 就是以 Service 为主的进程，
+     * 那个调用恒返回 null。后果极其隐蔽：
+     * <ul>
+     *   <li>{@code loadOnce()} 每次都 false → 30 次重试全失败 → 快照永远为空</li>
+     *   <li>{@code isOn()} 对 opt-in 键返回 false → **每个钩子回调都静默 return**</li>
+     *   <li>日志里只显示"共接管 N 处"，看起来一切正常，实际一个都没拦</li>
+     * </ul>
+     * 所以补一条后备路径：走 ActivityThread 的 systemContext（系统进程一定有）。
+     */
+    private static Context apiContext() {
         try {
-            ctx = AndroidAppHelper.currentApplication();
+            Context c = AndroidAppHelper.currentApplication();
+            if (c != null) return c;
         } catch (Throwable ignored) {
         }
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object thread = at.getMethod("currentActivityThread").invoke(null);
+            if (thread != null) {
+                Object sys = at.getMethod("getSystemContext").invoke(thread);
+                if (sys instanceof Context) return (Context) sys;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static boolean loadOnce() {
+        Context ctx = apiContext();
         if (ctx == null) {
             return false;
         }
