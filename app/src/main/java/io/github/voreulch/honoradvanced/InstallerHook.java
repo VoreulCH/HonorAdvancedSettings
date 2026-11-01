@@ -54,7 +54,21 @@ public final class InstallerHook {
         return purifyOn() && Cfg.isOn(key);
     }
 
+    /**
+     * installer 进程是否已经初始化过。
+     *
+     * <p>Vector 对同一进程可能调用两次 handleLoadPackage，没有这个标记的话
+     * 所有 hook 会被挂两遍 —— 每个回调执行两次，自动点弹窗会连点、
+     * 计数会翻倍。MiscHook 那边有 sAmHooked，这边之前漏了。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean sInitDone =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
     public static void init(ClassLoader cl, String apkPath) {
+        if (!sInitDone.compareAndSet(false, true)) {
+            Diag.log("installer init skipped (already done)");
+            return;
+        }
         sApk = apkPath;
         HookEnv.cl = cl;
         // generic hooks (all installer versions)
@@ -95,7 +109,10 @@ public final class InstallerHook {
                     XposedBridge.hookMethod(m, new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            if (on(Cfg.K_DOWNGRADE)) param.setResult(true);
+                            // ⚠ 不能用 on(Cfg.K_DOWNGRADE)：这个回调挂在 system_server，
+                            // 它读不到模块 provider（SELinux），永远返回 false ——
+                            // 等于系统层校验从来没放行过降级。改读系统属性。
+                            if (Cfg.downgradeOn()) param.setResult(true);
                         }
                     });
                     n++;
@@ -115,6 +132,7 @@ public final class InstallerHook {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             if (!on(Cfg.K_DOWNGRADE)) return;
+                            if (param.args.length < 1) return;
                             Object sp = param.args[0];
                             if (sp != null) {
                                 int flags = XposedHelpers.getIntField(sp, "installFlags");
@@ -1001,6 +1019,7 @@ public final class InstallerHook {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (!defaultPurify()) return;
+                    if (param.args.length < 1) return;
                     Object callback = param.args[0];
                     if (callback == null) { param.setResult(null); return; }
                     // two pass recipes, tried in order — each resolves every
@@ -1289,14 +1308,99 @@ public final class InstallerHook {
                             "java.lang.String", "java.lang.String", "?", "?");
                 }
             }
-            if (m == null) { Diag.log("ad method not resolved, skip"); return; }
-            XposedBridge.hookMethod(m, new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    if (defaultPurify()) param.setResult(null);
+            // ---- 广告入口全屏蔽（v3.2.8，按 39.301 真实签名重写）----
+            //
+            // 精确解析 1.0.39.301 的 AbstractAdBusinessPresenter **主类**（不含 $ 子类），
+            // 真实签名是这样的：
+            //     g (Lu81; LRbiTempBean; Lav1; Z)V              ← 4 参，老代码能命中
+            //     h (String,String,J,LRbiTempBean,I,Z,Lxb1;)V   ← 8 参，**老代码没拦**
+            //     B (LAdApp; IIJI)V                             ← **老代码没拦**
+            //     F (LAdApp; I S S J I S S S S I I I I I S I I I)V ← **老代码没拦**
+            //
+            // 也就是说广告数据有 4 个入口，老代码只堵了 1 个（g）。这就是
+            // 「用过该应用的还喜欢」按钮偶现的真正原因 —— 不是每次都走 g。
+            //
+            // 新策略：**只要参数列表里出现广告数据类型的（Ad* / Rbi*），一律拦掉**。
+            // 这样对所有版本免疫，也不依赖方法名。
+            int adSinks = 0;
+            for (Method mm : c.getDeclaredMethods()) {
+                Class<?>[] ps = mm.getParameterTypes();
+                if (ps.length == 0) continue;
+                // ⚠ 不能直接 contains("Ad") —— AbstractAdBusinessPresenter 类名里
+                // 本来就带 "Ad"（AdBusiness），会把 presenter 自己的正常方法
+                // （r/t/u/v 等）也当成广告入口跳过掉，安装器功能会坏。
+                // 只认**广告数据所在的包**：
+                //   com.hihonor.packageinstaller.entity.resp.*   (AdApp / AdAssemblyInfo / AdRespV4 / AdReqRecord)
+                //   com.hihonor.packageinstaller.rbi.*           (RbiTempBean)
+                boolean hasAdData = false;
+                for (Class<?> p : ps) {
+                    String pn = p.getName();
+                    boolean inAdPkg = pn.startsWith("com.hihonor.packageinstaller.entity.resp.")
+                            || pn.startsWith("com.hihonor.packageinstaller.rbi.");
+                    if (inAdPkg && (pn.contains("Ad") || pn.contains("Rbi"))) {
+                        hasAdData = true;
+                        break;
+                    }
                 }
-            });
-            Diag.log("[adapt] ad hooked: " + m);
+                if (!hasAdData) continue;
+                // 请求对象不能动（presenter 内部会直接读字段，置 null 会崩在方法体里）
+                boolean isReq = false;
+                for (Class<?> p : ps) {
+                    String pn = p.getName();
+                    if (pn.startsWith("com.hihonor.packageinstaller.")
+                            && (pn.contains("Req") || pn.contains("Request"))) {
+                        isReq = true;
+                        break;
+                    }
+                }
+                if (isReq) {
+                    Diag.log("[adapt] ad req entry skipped: " + mm.getName());
+                    continue;
+                }
+                try {
+                    // 不再限制返回类型 —— 非 void 的在回调里按类型给安全值
+                    XposedBridge.hookMethod(mm, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!defaultPurify()) return;
+                            if (!(param.method instanceof Method)) return;
+                            Class<?> rt = ((Method) param.method).getReturnType();
+                            String nm = ((Method) param.method).getName();
+                            // 按返回类型给"安全值"，别一律给 null：
+                            //   · void   -> setResult(null) 直接跳过执行（最理想）
+                            //   · 基本类型 -> 给 false / 0，不会 NPE
+                            //   · 对象    -> **不拦**，返回 null 会让调用方 NPE
+                            // 实测 1.0.23.301 的 k(Z) 返回 boolean，就属于第二种。
+                            if (rt == void.class) {
+                                param.setResult(null);
+                                Diag.log("[adapt] ad entry blocked(void): " + nm);
+                            } else if (rt == boolean.class) {
+                                param.setResult(Boolean.FALSE);
+                                Diag.log("[adapt] ad entry blocked(false): " + nm);
+                            } else if (rt == int.class) {
+                                param.setResult(Integer.valueOf(0));
+                                Diag.log("[adapt] ad entry blocked(0): " + nm);
+                            } else if (rt == long.class) {
+                                param.setResult(Long.valueOf(0L));
+                                Diag.log("[adapt] ad entry blocked(0L): " + nm);
+                            } else {
+                                Diag.log("[adapt] ad entry NOT blocked (non-primitive "
+                                        + rt.getSimpleName() + "): " + nm);
+                            }
+                        }
+                    });
+                    adSinks++;
+                    Diag.log("[adapt] ad entry hooked: " + mm.getName()
+                            + " (" + ps.length + " params)");
+                } catch (Throwable ignored) {
+                }
+            }
+            if (adSinks == 0) {
+                Diag.log("ad method not resolved, skip");
+                return;
+            }
+            m = null;
+            Diag.log("[adapt] ad hooked: " + adSinks + " entry(ies)");
         } catch (Throwable t) {
             Diag.log("ad adaptive hook failed: " + t);
         }
