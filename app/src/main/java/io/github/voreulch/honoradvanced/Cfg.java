@@ -591,6 +591,16 @@ public final class Cfg {
      * 属性是唯一全局可读的通道，和高温那条同一套机制。
      */
     public static final String PROP_NOSECURE = "persist.sys.has.nosecure";
+    /**
+     * 允许降级安装的系统属性。
+     *
+     * <p>和截图同一个原因：`hookDowngradeInSystemServer` 挂在 system_server，
+     * 它读不到模块的 provider（SELinux），`on(K_DOWNGRADE)` 恒 false，
+     * 于是系统层的 `isDowngradePermitted` 一直返回"不允许"。
+     * 安装器进程那层（`hookAllowDowngrade` 设 installFlags）是好的，
+     * 但 system_server 会二次校验，两层都得过。
+     */
+    public static final String PROP_DOWNGRADE = "persist.sys.has.downgrade";
 
     // Cached reader: the thermal hooks fire on EVERY HAL temperature callback
     // (several per second) and on EVERY status query, so a Class.forName +
@@ -605,6 +615,31 @@ public final class Cfg {
     // 而这恰恰是注释里说"绝不能发生"的情况（root 级安全绕过）。
     // 改成 false 后：首次成功读取前一律按关处理，最多延迟 1 秒（TTL）。
     private static volatile boolean sPropVal = false;
+
+    /** 降级开关的缓存时间戳。 */
+    private static volatile long sDgAt;
+    private static volatile boolean sDgVal = false;
+
+    /** 降级安装是否开启（system_server 侧用，走属性）。 */
+    public static boolean downgradeOn() {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - sDgAt < 1000L) {
+            return sDgVal;
+        }
+        try {
+            java.lang.reflect.Method m = sPropGet;
+            if (m == null) {
+                Class<?> sp = Class.forName("android.os.SystemProperties");
+                m = sp.getMethod("get", String.class, String.class);
+                sPropGet = m;
+            }
+            sDgVal = !"0".equals(m.invoke(null, PROP_DOWNGRADE, "0"));
+        } catch (Throwable t) {
+            // 沿用上次值
+        }
+        sDgAt = now;
+        return sDgVal;
+    }
 
     /** 截图限制开关的缓存时间戳（独立于高温，避免互相干扰）。 */
     private static volatile long sNsAt;
