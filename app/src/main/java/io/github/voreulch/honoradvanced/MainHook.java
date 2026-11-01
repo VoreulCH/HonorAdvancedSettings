@@ -50,6 +50,10 @@ public final class MainHook implements IXposedHookLoadPackage {
             return;
         }
         if ("com.android.packageinstaller".equals(pkg)) {
+            // 这个进程的净化 hook 每次挂载都会打一行 Diag.log，但 Diag 默认只在
+            // 诊断开关打开时输出 —— 用户反馈"按钮偶现"时，日志里只有版本行，
+            // 根本判断不了那次到底挂没挂上。打开 essential，让它常开。
+            Diag.setEssential(true);
             enter("installer", pkg, lpparam);
             Cfg.startPreload(true); // observer: "next install" picks up changes
             InstallerHook.init(cl, lpparam.appInfo == null ? null : lpparam.appInfo.sourceDir);
