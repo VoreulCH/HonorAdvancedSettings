@@ -24,6 +24,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -97,7 +98,11 @@ class SettingsActivity : ComponentActivity() {
             "killall com.hihonor.android.launcher || true"),
         ScopeTarget("com.hihonor.desktop.systemui", "桌面模式",
             "killall com.hihonor.desktop.systemui || true"),
-        ScopeTarget("com.hihonor.iaware", "温控服务", "killall com.hihonor.iaware || true")
+        ScopeTarget("com.hihonor.iaware", "温控服务", "killall com.hihonor.iaware || true"),
+        ScopeTarget("com.hihonor.securityserver", "反诈服务", "killall com.hihonor.securityserver || true"),
+        // 特殊项：android（system_server）作用域改不了单个进程，只能整机重启。
+        // pkg 用 __reboot__ 作哨兵，restartScopes 会单独识别并弹确认。
+        ScopeTarget("__reboot__", "重启系统（system_server 生效）", "reboot")
     )
 
     // 各开关依赖的作用域（用于"作用域状态"提示）。system_server（android）读不到
@@ -107,6 +112,10 @@ class SettingsActivity : ComponentActivity() {
     private val S_LAUNCHER = listOf("com.hihonor.android.launcher")
     private val S_INSTALLER = listOf("com.android.packageinstaller")
     private val S_THERMAL = listOf("com.android.systemui", "com.hihonor.iaware")
+    /** 安全组件里的窗口/系统级钩子都在 system_server（作用域显示为 android）。 */
+    private val S_SYSTEM = listOf("android")
+    /** 反诈组件在 securityserver 进程。 */
+    private val S_NOFRAUD = listOf("com.hihonor.securityserver")
 
     // switch write target shared with hooks via CfgProvider
     private fun prefs() = getSharedPreferences(Cfg.PREFS_FILE, MODE_PRIVATE)
@@ -143,6 +152,34 @@ class SettingsActivity : ComponentActivity() {
         // The write needs root, so report the real outcome instead of a blind
         // "enabled" toast; if turning it OFF fails we also revert the pref so
         // the UI never claims "off" while the system layer is still bypassing.
+        // 「清理云端配置残留」不是常驻状态，点开就执行一次删除，然后自动关回去。
+        // 截图限制也必须同步到系统属性：hook 挂在 system_server，那边读不到 provider。
+        if (key == Cfg.K_NOSECURE) {
+            syncNosecureProp(on) { ok ->
+                // 写属性失败时把开关拨回去，别让 UI 显示"已开启"却没生效
+                if (!ok && on) {
+                    prefs().edit().putBoolean(Cfg.K_NOSECURE, false).commit()
+                    notifyCfgChanged()
+                    onResult?.invoke(false)
+                } else {
+                    onResult?.invoke(ok)
+                }
+            }
+            return
+        }
+        if (key == Cfg.K_PURGECOTA) {
+            if (!on) {
+                onResult?.invoke(true)
+                return
+            }
+            purgeCotaConfigs { ok ->
+                // 无论成败都把开关复位 —— 它代表动作，不代表状态
+                prefs().edit().putBoolean(Cfg.K_PURGECOTA, false).commit()
+                notifyCfgChanged()
+                onResult?.invoke(ok)
+            }
+            return
+        }
         if (key == Cfg.K_HOTTEMP) {
             Toast.makeText(this, "正在写入系统属性（ROOT）…", Toast.LENGTH_SHORT).show()
             syncHottempProp(on) { ok ->
@@ -440,6 +477,300 @@ class SettingsActivity : ComponentActivity() {
         try { getContentResolver().notifyChange(CfgProvider.URI, null) } catch (_: Throwable) {}
     }
 
+    // ================= 液态玻璃参数导出 / 导入（v3.1.4） =================
+
+    /** 液态玻璃这一摊子管的所有键：6 个线开关 + 75 个精细参数。 */
+    private fun glassSwitchKeys() = listOf(
+        Cfg.K_GLASS, Cfg.K_SYSTEM, Cfg.K_KEYGUARD,
+        Cfg.K_GALLERY, Cfg.K_BANNER, Cfg.K_DESK
+    )
+
+    /**
+     * 把液态玻璃的全部配置打包成 JSON。
+     *
+     * 只导**这一摊**的键（线开关 + 精细参数），不带安装器 / 温控 / 诊断开关 ——
+     * 那份配置拿去别的机器上导入时，不应该顺手改掉别人的安装器净化设置。
+     */
+    private fun buildGlassConfigJson(): String {
+        val p = prefs()
+        val root = org.json.JSONObject()
+        root.put("app", "HonorAdvancedSettings")
+        root.put("kind", "glass-config")
+        root.put("version", BuildConfig.VERSION_NAME)
+        root.put("versionCode", BuildConfig.VERSION_CODE)
+        root.put("exportedAt", java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss",
+            java.util.Locale.US).format(java.util.Date()))
+
+        val sw = org.json.JSONObject()
+        for (k in glassSwitchKeys()) sw.put(k, p.getBoolean(k, true))
+        root.put("switches", sw)
+
+        val params = org.json.JSONObject()
+        for (k in Cfg.FN_KEYS) params.put(k, p.getInt(k, Cfg.fnDefPct(k)))
+        root.put("params", params)
+
+        return root.toString(2)
+    }
+
+    /** 导出：写进「下载」目录，文件名带时间戳。 */
+    private fun exportGlassConfig() {
+        Thread {
+            val json = try { buildGlassConfigJson() } catch (t: Throwable) {
+                runOnUiThread {
+                    Toast.makeText(this, "导出失败：" + t.javaClass.simpleName, Toast.LENGTH_LONG).show()
+                }
+                return@Thread
+            }
+            val name = "has-glass-" + java.text.SimpleDateFormat("yyyyMMdd-HHmmss",
+                java.util.Locale.US).format(java.util.Date()) + ".json"
+            val saved = saveTextToDownloads(name, json, "application/json")
+            runOnUiThread {
+                if (saved != null) {
+                    Toast.makeText(this, "已导出到 " + saved + "，换机时用「导入」恢复",
+                        Toast.LENGTH_LONG).show()
+                } else {
+                    Toast.makeText(this, "导出失败，请检查存储空间", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.apply { name = "has-glass-export" }.start()
+    }
+
+    /**
+     * 导入：读 JSON → 校验 → 写 prefs。
+     *
+     * 校验规则：只认**允许列表内**的键（防手改 JSON 塞奇怪的东西），
+     * 数值夹到 0..1000。导入完提示重启系统界面。
+     */
+    private fun importGlassConfig(uri: android.net.Uri) {
+        Thread {
+            var okCount = 0
+            var err: String? = null
+            try {
+                // 上限 1MB：一份完整配置不到 8KB，超过这个数一定是选错文件了。
+                // 不设限的话 readBytes() 会把整个文件读进内存，选了个几百 MB 的
+                // 文件就直接 OOM —— 后台线程 OOM 会拖崩整个进程。
+                val bytes = contentResolver.openInputStream(uri)?.use { ins ->
+                    val buf = java.io.ByteArrayOutputStream()
+                    val tmp = ByteArray(8192)
+                    while (true) {
+                        val n = ins.read(tmp)
+                        if (n < 0) break
+                        buf.write(tmp, 0, n)
+                        if (buf.size() > 1024 * 1024) {
+                            throw IllegalStateException("文件太大，不像是配置文件")
+                        }
+                    }
+                    buf.toByteArray()
+                } ?: throw IllegalStateException("读不到文件")
+                val text = bytes.toString(Charsets.UTF_8)
+                val root = org.json.JSONObject(text)
+                if (root.optString("kind") != "glass-config") {
+                    throw IllegalStateException("这不是液态玻璃配置（缺少 kind 标记）")
+                }
+                val ed = prefs().edit()
+                val sw = root.optJSONObject("switches")
+                if (sw != null) {
+                    for (k in glassSwitchKeys()) {
+                        if (sw.has(k)) {
+                            ed.putBoolean(k, sw.optBoolean(k, true))
+                            okCount++
+                        }
+                    }
+                }
+                val ps = root.optJSONObject("params")
+                if (ps != null) {
+                    for (k in Cfg.FN_KEYS) {
+                        if (ps.has(k)) {
+                            val v = ps.optInt(k, Cfg.fnDefPct(k)).coerceIn(0, 1000)
+                            ed.putInt(k, v)
+                            okCount++
+                        }
+                    }
+                }
+                if (okCount == 0) throw IllegalStateException("文件里没有任何可识别的参数")
+                if (!ed.commit()) throw IllegalStateException("写入失败（存储异常）")
+                AppLog.d("glasscfg", "导入成功 " + okCount + " 项")
+            } catch (t: Throwable) {
+                err = t.message ?: t.javaClass.simpleName
+                AppLog.d("glasscfg", "导入失败: " + err)
+            }
+            runOnUiThread {
+                if (err == null) {
+                    notifyCfgChanged()
+                    Toast.makeText(this,
+                        "已导入 " + okCount + " 项。"
+                                + "\n液态玻璃效果需要重启「系统界面」才会生效（锁屏/桌面要重启手机/桌面）",
+                        Toast.LENGTH_LONG).show()
+                    // 关键：所有 TuneRow 的值都缓存在 remember 里，光写 prefs 界面不会变。
+                    // recreate() 让整个 Activity 重建，重新从 prefs 读一遍 —— 这才是
+                    // 用户说的「导入后 UI 要立刻生效」。
+                    window.decorView.postDelayed({ try { recreate() } catch (_: Throwable) {} }, 1200)
+                } else {
+                    Toast.makeText(this, "导入失败：" + err, Toast.LENGTH_LONG).show()
+                }
+            }
+        }.apply { name = "has-glass-import" }.start()
+    }
+
+    /**
+     * 恢复官方原始参数：把 75 项精细调节全部写回**系统原厂值**。
+     *
+     * <p>注意用的是 {@link Cfg#factoryDefPct} 而不是 {@code fnDefPct} ——
+     * 后者是本品的**烧录配方**（主人调好的观感），不是原厂。用户想要的是"回到原厂"，
+     * 不是"回到我的配方"。
+     *
+     * <p>线开关不动：用户点这个通常只是想清掉参数，不想把整条线关掉。
+     */
+    private fun restoreFactoryParams() {
+        Thread {
+            var ok = false
+            try {
+                val ed = prefs().edit()
+                for (k in Cfg.FN_KEYS) ed.putInt(k, Cfg.factoryDefPct(k))
+                ok = ed.commit()
+                AppLog.d("glasscfg", "恢复原厂参数 " + (if (ok) "成功" else "失败"))
+            } catch (t: Throwable) {
+                AppLog.d("glasscfg", "恢复原厂参数异常: " + t.javaClass.simpleName)
+            }
+            runOnUiThread {
+                if (ok) {
+                    notifyCfgChanged()
+                    Toast.makeText(this,
+                        "已恢复官方原始参数。重启「系统界面」后液态玻璃生效",
+                        Toast.LENGTH_LONG).show()
+                    window.decorView.postDelayed({ try { recreate() } catch (_: Throwable) {} }, 1200)
+                } else {
+                    Toast.makeText(this, "恢复失败，请检查存储空间", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.apply { name = "has-factory-restore" }.start()
+    }
+
+    /**
+     * 把截图限制开关同步到系统属性 `persist.sys.has.nosecure`。
+     *
+     * <p>为什么必须这么做：`hookSecureFlag` 挂在 **system_server**，它读不到模块的
+     * ContentProvider（SELinux），`Cfg.isOn(K_NOSECURE)` 在那里恒 false。
+     * 属性和 `persist.sys.has.hottemp` 一样是全局可读的，所以走这条。
+     *
+     * <p>写属性需要 root；失败时**把开关拨回 false** 并如实报错 —— 不能让 UI
+     * 显示"已开启"而实际没生效（那正是这个 bug 最初的样子）。
+     */
+    private fun syncNosecureProp(on: Boolean, done: (Boolean) -> Unit) {
+        Thread {
+            val want = if (on) "1" else "0"
+            var ok = false
+            try {
+                val before = readProp(Cfg.PROP_NOSECURE)
+                AppLog.d("nosecure", "目标=" + want + " 当前=" + before)
+                ok = if (before == want) {
+                    true
+                } else {
+                    suExecTimeout("setprop " + Cfg.PROP_NOSECURE + " " + want, 30000L)
+                }
+                if (ok) {
+                    var now = readProp(Cfg.PROP_NOSECURE)
+                    if (now != want) {
+                        try { Thread.sleep(250L) } catch (_: Throwable) {}
+                        now = readProp(Cfg.PROP_NOSECURE)
+                    }
+                    ok = (now == want)
+                    AppLog.d("nosecure", "写后回读=" + now + " → " + (if (ok) "成功" else "不一致"))
+                } else {
+                    AppLog.d("nosecure", "写入失败，回读=" + readProp(Cfg.PROP_NOSECURE))
+                }
+            } catch (t: Throwable) {
+                AppLog.d("nosecure", "异常: " + t.javaClass.simpleName)
+            }
+            runOnUiThread {
+                if (!ok) {
+                    Toast.makeText(this,
+                        if (on) "开启失败：su 没执行成功（检查 KernelSU/Magisk 授权）"
+                        else "关闭失败：su 没执行成功",
+                        Toast.LENGTH_LONG).show()
+                }
+                done(ok)
+            }
+        }.apply { name = "has-nosecure-sync" }.start()
+    }
+
+    /**
+     * 删除 /data/cota/para/ 下三份性能相关的云端配置。
+     *
+     * 设计上刻意保守：
+     *   · 只删这三个明确已知的文件，不做通配（`rm -rf` 太危险）
+     *   · 删之前先判断存不存在，不存在就如实告诉用户"本来就干净"
+     *   · 每条命令都带 `2>/dev/null`，避免 SELinux 警告污染结果
+     *   · 不删其他 10 类云控（contenttransfer / compliancecontrol 等，与本功能无关）
+     */
+    private fun purgeCotaConfigs(done: (Boolean) -> Unit) {
+        Thread {
+            val files = listOf(
+                "/data/cota/para/cpuconfig",
+                "/data/cota/para/pg_config",
+                "/data/cota/para/thermal_config"
+            )
+            // 先数一下删之前有几个
+            val before = try {
+                val out = suReadOutput("ls " + files.joinToString(" ") + " 2>/dev/null", 6000L) ?: ""
+                out.split('\n').count { it.trim().isNotEmpty() }
+            } catch (_: Throwable) { -1 }
+            AppLog.d("purgecota", "清理前存在 " + before + " 个")
+
+            if (before == 0) {
+                runOnUiThread {
+                    Toast.makeText(this, "云端配置本来就不存在，无需清理", Toast.LENGTH_LONG).show()
+                }
+                done(false)
+                return@Thread
+            }
+
+            val ok = suExec("rm -f " + files.joinToString(" ") + " 2>/dev/null")
+            val after = try {
+                val out = suReadOutput("ls " + files.joinToString(" ") + " 2>/dev/null", 6000L) ?: ""
+                out.split('\n').count { it.trim().isNotEmpty() }
+            } catch (_: Throwable) { -1 }
+            AppLog.d("purgecota", "清理后剩 " + after + " 个 (su=" + ok + ")")
+
+            runOnUiThread {
+                when {
+                    !ok -> Toast.makeText(this,
+                        "清理失败：su 没执行成功（检查 KernelSU/Magisk 授权）", Toast.LENGTH_LONG).show()
+                    after == 0 -> Toast.makeText(this,
+                        "已清理 " + before + " 个云端配置文件。\n请立即重启手机，让 PowerGenie 回到内置默认策略。",
+                        Toast.LENGTH_LONG).show()
+                    else -> Toast.makeText(this,
+                        "部分清理：还剩 " + after + " 个（可能被系统占用）", Toast.LENGTH_LONG).show()
+                }
+            }
+            done(ok)
+        }.apply { name = "has-purge-cota" }.start()
+    }
+
+    /** 通用：把文本写进「下载」目录。 */
+    private fun saveTextToDownloads(fileName: String, text: String, mime: String): String? {
+        return try {
+            val values = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.Downloads.DISPLAY_NAME, fileName)
+                put(android.provider.MediaStore.Downloads.MIME_TYPE, mime)
+                put(android.provider.MediaStore.Downloads.RELATIVE_PATH,
+                    android.os.Environment.DIRECTORY_DOWNLOADS)
+            }
+            val uri = contentResolver.insert(
+                android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return null
+            val os = contentResolver.openOutputStream(uri)
+            if (os == null) {
+                try { contentResolver.delete(uri, null, null) } catch (_: Throwable) {}
+                return null
+            }
+            os.use { it.write(text.toByteArray(Charsets.UTF_8)) }
+            "Download/" + fileName
+        } catch (t: Throwable) {
+            AppLog.d("export", "失败: " + t.javaClass.simpleName)
+            null
+        }
+    }
+
     /** 写进系统「下载」目录（MediaStore，Android 10+ 免存储权限）。 */
     private fun saveReportToDownloads(report: String): String? {
         return try {
@@ -610,7 +941,7 @@ class SettingsActivity : ComponentActivity() {
         val dark = (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
             android.content.res.Configuration.UI_MODE_NIGHT_YES
         MiuixTheme(colors = if (dark) darkColorScheme() else lightColorScheme()) {
-            var page by remember { mutableStateOf(Page.Mine) }
+            var page by rememberSaveable { mutableStateOf(Page.Mine) }
             val uiBlur = remember { mutableStateOf(true) }          // locked on (磨砂)
             val uiFloatingBar = remember { mutableStateOf(true) }   // locked on (悬浮底栏)
             // rootColor follows the theme (NOT black — the liquid-glass toggle
@@ -699,6 +1030,7 @@ class SettingsActivity : ComponentActivity() {
                             Page.Glass -> GlassPage { page = Page.Mine }
                             Page.Installer -> InstallerPage { page = Page.Mine }
                             Page.Misc -> MiscPage { page = Page.Mine }
+                            Page.Security -> SecurityPage { page = Page.Mine }
                             Page.About -> AboutPage()
                         }
                         if (rootDialogVisible) ScopeRestartDialog { rootDialogVisible = false }
@@ -708,7 +1040,7 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
-    private enum class Page { Mine, Glass, Installer, Misc, About }
+    private enum class Page { Mine, Glass, Installer, Misc, Security, About }
 
     // ================= Mine (home) =================
 
@@ -723,6 +1055,7 @@ class SettingsActivity : ComponentActivity() {
             item { ActionCard("液态玻璃", "系统 / 锁屏 / 相册三线玻璃效果与总开关") { go(Page.Glass) } }
             item { ActionCard("安装器净化", "跳过安全检测、禁止联网、信息卡与降级安装") { go(Page.Installer) } }
             item { ActionCard("系统综合", "通知音量、高温限制与系统级行为的总开关集合") { go(Page.Misc) } }
+            item { ActionCard("安全组件", "允许截屏 / 录屏、屏蔽云控下发、屏蔽反诈组件") { go(Page.Security) } }
             item {
                 ActionCard("重启作用域（需ROOT）", "可多选一次重启：系统界面 / 相册 / 安装器 / 桌面 / 温控服务") { requestRootThenPickScope() }
             }
@@ -791,8 +1124,29 @@ class SettingsActivity : ComponentActivity() {
     private fun GlassPage(back: () -> Unit) {
         val probeCtx = LocalContext.current
         LaunchedEffect(Unit) { FrameworkProbe.refresh(probeCtx, true) }
-        var subPage by remember { mutableStateOf("") }
-        var openGroup by remember { mutableStateOf("") }
+        var subPage by rememberSaveable { mutableStateOf("") }
+        var openGroup by rememberSaveable { mutableStateOf("") }
+        // 导入用系统文件选择器：只让用户挑 json/txt，不申请任何存储权限。
+        var restoreAsk by remember { mutableStateOf(false) }
+        val glassImportLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+            androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
+        ) { uri -> if (uri != null) importGlassConfig(uri) }
+        if (restoreAsk) {
+            ConfirmEnableDialog(
+                title = "恢复官方原始参数",
+                lines = listOf(
+                    "把 75 项精细调节全部重置为系统原厂值（100 = 不改动）",
+                    "线开关（总开关 / 系统 / 锁屏 / 横幅 / 桌面 / 相册）保持不变",
+                    "你烧录或自己调过的观感会被清掉"
+                ),
+                note = "这个操作不可撤销，建议先「导出液态玻璃参数」备份一份。",
+                onConfirm = {
+                    restoreAsk = false
+                    restoreFactoryParams()
+                },
+                onDismiss = { restoreAsk = false }
+            )
+        }
         // 三级子页的物理返回：先回二级菜单，而不是直接退出整个「液态玻璃」页。
         // 之前漏了这个，子页按返回键会一路弹回首页（用户报的 bug）。
         BackHandler(enabled = subPage.isNotEmpty()) { subPage = "" }
@@ -806,6 +1160,18 @@ class SettingsActivity : ComponentActivity() {
                         SwRow("总开关", "液态玻璃总闸，含 HIGH 强制渲染、LIQUID 材质判定等系统级底层，关闭后全部回退原厂", Cfg.K_GLASS, true, scopes = S_SYSTEMUI)
                     ))
                 }
+                item {
+                    // 参数备份：换机 / 刷机 / 折腾前先把这一摊配置存一份。
+                    // 复用现成的 LinkCard，不额外造卡片样式。
+                    LinkCard(listOf(
+                        LinkRow("导出液态玻璃参数（到 下载 目录）") { exportGlassConfig() },
+                        LinkRow("导入液态玻璃参数") {
+                            glassImportLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                        },
+                        LinkRow("恢复官方原始参数") { restoreAsk = true }
+                    ))
+                }
+                item { Footnote("导出的 json 只包含液态玻璃这一摊的开关和 75 项参数，不含安装器/温控设置。导入后需要重启「系统界面」生效（锁屏和桌面要重启手机/桌面）。") }
                 item {
                     NavRow("系统液态玻璃", "通知卡片、工具栏按钮与亮度条，含光学 / 模糊 / 高光",
                         onClick = { subPage = "sys" })
@@ -1030,7 +1396,9 @@ class SettingsActivity : ComponentActivity() {
                     Text(desc, fontSize = 12.sp,
                         color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
                 }
-                Text(">", fontSize = 20.sp, color = MiuixTheme.colorScheme.primary)
+                // 和其它卡片（LinkCard / ActionCard）统一：用 › 而不是 ASCII >，
+                // 颜色也用次要色 —— 主色会让箭头抢眼，像可点的按钮。
+                Text("›", fontSize = 20.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
             }
         }
     }
@@ -1245,6 +1613,101 @@ class SettingsActivity : ComponentActivity() {
                 ))
             }
             item { Footnote("开关后需重启安装器生效，降级开关需重启手机生效") }
+        }
+    }
+
+    // ================= Security =================
+
+    /**
+     * 安全组件。
+     *
+     * 全部是"解除系统限制"型的开关，默认关闭、开启前二次确认 —— 它们都会让系统
+     * 变得"更不设防"，必须让用户自己承担这个选择。
+     */
+    @Composable
+    private fun SecurityPage(back: () -> Unit) {
+        LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp),
+            contentPadding = PaddingValues(top = 8.dp, bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            item { BackHeader("安全组件", back) }
+            item { TipText("下面每一项都会让系统变得更「不设防」。默认全部关闭，开启前会二次确认，请确认你理解它的后果。") }
+            item {
+                SwitchCard(listOf(
+                    SwRow("允许截屏 / 录屏（ROOT）",
+                        "清除窗口的 FLAG_SECURE，让原本一截就黑屏、录屏一片黑的页面（银行 / 支付 / 部分阅读类 app）"
+                                + "可以正常截图录屏。**需要 ROOT**：这个钩子挂在 system_server，"
+                                + "它读不到模块的开关（SELinux），只能通过写系统属性 persist.sys.has.nosecure 传递，"
+                                + "而写属性必须 root。",
+                        Cfg.K_NOSECURE, true, false, confirmOnEnable = true, scopes = S_SYSTEM,
+                        confirmTitle = "允许截屏 / 录屏（需要 ROOT）",
+                        confirmLines = listOf(
+                            "开启后：",
+                            "· 原本禁止截图的页面（银行、支付、部分阅读类 app）可以正常截图",
+                            "· 录屏不再出现黑色区域",
+                            "· 最近任务里的纯色卡片恢复正常预览",
+                            "",
+                            "需要 ROOT 的原因：",
+                            "· 这个钩子挂在 system_server（系统进程）",
+                            "· system_server 读不到模块的开关（SELinux 限制）",
+                            "· 只能通过系统属性 persist.sys.has.nosecure 传递",
+                            "· 写系统属性必须 root",
+                            "",
+                            "⚠ 安全提醒：",
+                            "· 开启后这些敏感页面也能被别人截图，包括别人拿你手机时",
+                            "· 该属性会持久保存，重启后仍然有效",
+                            "· 卸载模块前请先关闭此开关，否则属性会残留",
+                            "· 如果 su 授权失败，开关会自动拨回关闭状态"
+                        ),
+                        confirmNote = "首次开启会弹出 su 授权请求，请点「允许」。"),
+                    SwRow("屏蔽性能 / 温控策略云控下发",
+                        "系统收到云端下发的温控策略包后，不再让它落地（ThermalCfgCotaUpdateReceiver 被拦）。"
+                                + "本地策略保持出厂状态，不会被云端推着走。和「屏蔽高温限制」互补：那个管设备已经热了别降频，这个管别再推新策略。",
+                        Cfg.K_NOCLOUD, true, false, confirmOnEnable = true, scopes = S_THERMAL,
+                        confirmTitle = "屏蔽性能 / 温控策略云控下发",
+                        confirmLines = listOf(
+                            "云端下发的 CPU 配置（cpuconfig）不再落地",
+                            "云端下发的 PowerGenie 通用配置（pg_config）不再落地",
+                            "云端下发的温控配置（thermal_config）不再落地",
+                            "进程启动时也不会再去读 /data/cota/para/ 下的旧配置"
+                        ),
+                        confirmNote = "和「屏蔽高温限制」互补：那个管设备已经热了别降频，这个管云端别再推新策略。"),
+                    SwRow("清理云端配置残留",
+                        "删除 /data/cota/para/ 下三份**性能相关**云端配置（cpuconfig / pg_config / thermal_config）。"
+                                + "这是**一次性动作**，执行完会自动关回去。需要 ROOT。",
+                        Cfg.K_PURGECOTA, false, false, confirmOnEnable = true, scopes = S_SYSTEM,
+                        confirmTitle = "⚠ 清理云端配置残留（危险操作）",
+                        confirmLines = listOf(
+                            "将要删除这三个文件（不可撤销）：",
+                            "  /data/cota/para/cpuconfig      ← CPU 频率/核数策略",
+                            "  /data/cota/para/pg_config      ← PowerGenie 通用策略",
+                            "  /data/cota/para/thermal_config ← 温控策略",
+                            "",
+                            "删除后无法恢复。如果这些文件正被系统使用，",
+                            "可能出现功耗/温控策略异常（异常发热、耗电变快或降温变慢）。",
+                            "",
+                            "执行完请立即重启手机，让 PowerGenie 回到内置默认策略。",
+                            "",
+                            "⚠ 绝大多数设备上这三个文件**根本不存在**，",
+                            "不需要点这个开关。只有你确认出现过「云端下发把温控改了」",
+                            "的情况才需要清理。"
+                        ),
+                        confirmNote = "需要 ROOT。执行结果会在通知里告诉你删了几个文件。"),
+                    SwRow("屏蔽反诈组件采集与上报",
+                        "主体是系统的 securityserver（uid=system）。拦在**采集**环节而不是发送环节："
+                                + "不注册检测观察者、开关一律返回关闭、云控校验不通过 —— 数据压根不会被收集，自然也谈不上上传。"
+                                + "⚠ 发送通道（HiView/HwDdmp）是全系统共用的，不去动它，否则崩溃上报和系统诊断会一起挂掉。",
+                        Cfg.K_NOFRAUD, true, false, confirmOnEnable = true, scopes = S_NOFRAUD,
+                        confirmTitle = "屏蔽反诈组件采集与上报",
+                        confirmLines = listOf(
+                            "反诈检测不再注册观察者（检测不启动）",
+                            "不再注册感知围栏：短信、剪贴板、扫码支付、位置、指纹、账号、安装/卸载、常用应用、通知等",
+                            "云控安全校验一律返回不通过",
+                            "上述拦截**只作用于 securityserver 进程**，YOYO / 情景智能自己的感知能力不受影响"
+                        ),
+                        confirmNote = "拦在采集环节而不是发送环节 —— 发送通道（HiView/HwDdmp）是全系统共用的，动它会连崩溃上报一起挂掉。")
+                ))
+            }
+            item { Footnote("改完重启「系统界面」生效（这个钩子在 system_server 里，作用域要勾「android」/显示为「系统」）。") }
         }
     }
 
@@ -1566,6 +2029,12 @@ class SettingsActivity : ComponentActivity() {
         val def: Boolean = true,
         /** ask for an explicit second tap before enabling (safety-relevant rows) */
         val confirmOnEnable: Boolean = false,
+        /** 确认框标题（不填沿用旧的高温文案，兼容老调用点） */
+        val confirmTitle: String? = null,
+        /** 确认框正文，每行一条 */
+        val confirmLines: List<String> = emptyList(),
+        /** 确认框里"为什么需要这个开关"的补充说明 */
+        val confirmNote: String? = null,
         /** optional second line under the title (live system-level state) */
         val statusText: String? = null,
         /** statusText 是否代表"正常"（决定文字颜色；"未生效"三个字里也含"已生效"，不能靠 contains 判断） */
@@ -1609,15 +2078,75 @@ class SettingsActivity : ComponentActivity() {
             }
         }
         confirmRow?.let { r ->
-            HotTempConfirmDialog(
-                onConfirm = {
-                    state[r.key] = true
-                    applyBinding(r.key, true, r.restart) { onAfterChange?.invoke() }
-                    warnMissingScopes(ctx, r.scopes)
-                    confirmRow = null
-                },
-                onDismiss = { confirmRow = null }
-            )
+            // 之前这里硬编码 HotTempConfirmDialog —— 结果"反诈""云控"这些开关点开也是
+            // 高温那套 ROOT 文案，说的完全是别的事。现在按行传入自己的标题和正文，
+            // 没传的才回落到高温文案（兼容老调用点）。
+            if (r.confirmTitle == null) {
+                HotTempConfirmDialog(
+                    onConfirm = {
+                        state[r.key] = true
+                        applyBinding(r.key, true, r.restart) { onAfterChange?.invoke() }
+                        warnMissingScopes(ctx, r.scopes)
+                        confirmRow = null
+                    },
+                    onDismiss = { confirmRow = null }
+                )
+            } else {
+                ConfirmEnableDialog(
+                    title = r.confirmTitle,
+                    lines = r.confirmLines,
+                    note = r.confirmNote,
+                    onConfirm = {
+                        state[r.key] = true
+                        applyBinding(r.key, true, r.restart) { onAfterChange?.invoke() }
+                        warnMissingScopes(ctx, r.scopes)
+                        confirmRow = null
+                    },
+                    onDismiss = { confirmRow = null }
+                )
+            }
+        }
+    }
+
+    /**
+     * 通用"开启前二次确认"对话框。
+     *
+     * 标题 + 逐行正文 + 可选的补充说明，配色和 HotTempConfirmDialog 保持一致，
+     * 只是文案由调用方给。
+     */
+    @Composable
+    private fun ConfirmEnableDialog(
+        title: String,
+        lines: List<String>,
+        note: String?,
+        onConfirm: () -> Unit,
+        onDismiss: () -> Unit
+    ) {
+        Dialog(onDismissRequest = onDismiss) {
+            Surface(shape = RoundedCornerShape(24.dp), color = MiuixTheme.colorScheme.surface) {
+                Column(Modifier.padding(18.dp)) {
+                    Text(title, fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                        color = MiuixTheme.colorScheme.onSurface)
+                    Text(
+                        lines.joinToString("\n") { "· " + it },
+                        fontSize = 13.5.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = 10.dp)
+                    )
+                    if (note != null) {
+                        Text(note, fontSize = 13.sp, color = MiuixTheme.colorScheme.primary,
+                            modifier = Modifier.padding(top = 10.dp))
+                    }
+                    Row(Modifier.fillMaxWidth().padding(top = 16.dp),
+                        horizontalArrangement = Arrangement.End) {
+                        Text("取消", fontSize = 14.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            modifier = Modifier.clickable { onDismiss() }.padding(8.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("开启", fontSize = 14.sp, fontWeight = FontWeight.Bold,
+                            color = MiuixTheme.colorScheme.primary,
+                            modifier = Modifier.clickable { onConfirm() }.padding(8.dp))
+                    }
+                }
+            }
         }
     }
 
@@ -2025,8 +2554,38 @@ class SettingsActivity : ComponentActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     /** 一次 su 会话把选中的作用域全部重启；成功后延后重读自证记录。 */
+    /** 「重启系统」的二次确认。system_server 作用域的改动只有整机重启才生效。 */
+    private fun askReboot() {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("重启系统？")
+            .setMessage("system_server（作用域显示为「系统」）的改动只有整机重启才会生效。"
+                    + "\n\n重启后会中断当前所有操作，请确认已保存内容。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("立即重启") { _, _ ->
+                Toast.makeText(this, "正在重启…", Toast.LENGTH_SHORT).show()
+                Thread {
+                    AppLog.d("scope", "重启系统")
+                    suExec("reboot")
+                }.start()
+            }
+            .show()
+    }
+
     private fun restartScopes(targets: List<ScopeTarget>) {
         if (targets.isEmpty()) return
+        // 「重启系统」必须单独走：它不能和普通进程的 killall 混在一批里执行，
+        // 而且这是不可撤销的操作，必须先弹确认。
+        if (targets.any { it.pkg == "__reboot__" }) {
+            val others = targets.filter { it.pkg != "__reboot__" }
+            if (others.isNotEmpty()) {
+                // 先重启普通进程，再单独问要不要重启整机
+                restartScopes(others)
+                mainHandler.postDelayed({ askReboot() }, 1500L)
+            } else {
+                askReboot()
+            }
+            return
+        }
         val names = targets.joinToString("、") { it.label }
         Toast.makeText(this, "正在重启：$names…", Toast.LENGTH_SHORT).show()
         Thread {
