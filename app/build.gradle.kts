@@ -14,8 +14,8 @@ android {
         applicationId = "io.github.voreulch.honoradvanced"
         minSdk = 33
         targetSdk = 35
-        versionCode = 136
-        versionName = "3.2.6"
+        versionCode = 137
+        versionName = "3.2.7"
         // keep native filter consistent with the hand-built APK (no ABI split)
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
