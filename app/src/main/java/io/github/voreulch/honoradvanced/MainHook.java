@@ -51,6 +51,23 @@ public final class MainHook implements IXposedHookLoadPackage {
             InstallerHook.init(cl, lpparam.appInfo == null ? null : lpparam.appInfo.sourceDir);
             return;
         }
+        // 反诈组件：securityserver 是 uid=system 的系统应用，采集与上报都在这个进程里。
+        if ("com.hihonor.securityserver".equals(pkg)) {
+            // 这个进程读不到模块 provider 时要能看见原因（warn 默认被过滤）
+            Diag.setEssential(true);
+            enter("securityserver", pkg, lpparam);
+            // ⚠ 必须自己 startPreload：这个分支在下面那行全局的
+            // Cfg.startPreload(false) **之前**就 return 了，不补的话 sSnapshot
+            // 永远是 null，而 isOn 对 opt-in 键在未就绪时返回 false ——
+            // 结果是钩子全挂上了、但每次回调都在 `if (!Cfg.isOn(K_NOFRAUD)) return`
+            // 那一行提前退出，**一个都拦不住**，日志里还看不出异常。
+            // false = 玻璃类 scope：快照冻结，改开关要重启本进程才生效。
+            Cfg.startPreload(false);
+            MiscHook.initSecurityServer(cl,
+                    lpparam.appInfo != null ? lpparam.appInfo.sourceDir : null);
+            return;
+        }
+
         if ("com.hihonor.powergenie".equals(pkg) || "com.hihonor.iaware".equals(pkg)) {
             // PowerGenie's own thermal engine (reads the HAL directly, so the
             // system_server status normalisation can never reach it). Its
