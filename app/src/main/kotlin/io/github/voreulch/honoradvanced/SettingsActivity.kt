@@ -149,9 +149,17 @@ class SettingsActivity : ComponentActivity() {
                 if (!ok && !on) {
                     // cannot disable the system layer without root: keep the
                     // switch ON so the UI matches what the device is doing
-                    prefs().edit().putBoolean(key, true).commit()
+                    // commit 失败（磁盘满 / 存储异常）时 prefs 会保持旧值，
+                    // 界面却已经回滚成"开" —— 下次进来会看到"关"，与实际不符。
+                    // 这种静默失败必须留痕，否则永远查不出来。
+                    val wrote = prefs().edit().putBoolean(key, true).commit()
+                    if (!wrote) AppLog.d("prefs", "回写 hottemp=true 失败（commit 返回 false）")
                     notifyCfgChanged()
-                    Toast.makeText(this, "未获得 ROOT：无法解除系统层屏蔽，开关已保持开启", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this,
+                        "关不掉：su 没执行成功。① 去 KernelSU / Magisk 管理器的「超级用户」里给本模块授权；" +
+                        "② 或在终端执行 su -c setprop persist.sys.has.hottemp 0。" +
+                        "属性现在还是 1，屏蔽仍在生效——开关保持开启是为了不骗你。" + "授权完请再点一次这个开关（重装过模块的话，UID 变了要重新授权）。",
+                        Toast.LENGTH_LONG).show()
                     onResult?.invoke(false)
                     return@syncHottempProp
                 }
@@ -179,9 +187,14 @@ class SettingsActivity : ComponentActivity() {
      *  never pin a thread, and never claims success it did not observe. */
     private fun syncHottempProp(on: Boolean, done: ((Boolean) -> Unit)? = null) {
         if (propSyncBusy) {
-            // a sync is already in flight; report the current truth instead of
-            // spawning a second su process
-            if (done != null) runOnUiThread { done(readProp(Cfg.PROP_HOTTEMP) == (if (on) "1" else "0")) }
+            // 上一次 su 还在等授权（最长 30 秒）。此时再点不能静默返回"失败"——
+            // 用户会以为点了没用，反复点。明确告诉他正在等。
+            runOnUiThread {
+                Toast.makeText(this,
+                    "正在等待 ROOT 授权…请在 KernelSU / Magisk 的弹窗或「超级用户」里点允许",
+                    Toast.LENGTH_SHORT).show()
+                done?.invoke(false)
+            }
             return
         }
         propSyncBusy = true
@@ -189,26 +202,90 @@ class SettingsActivity : ComponentActivity() {
             var ok = false
             try {
                 val want = if (on) "1" else "0"
-                if (readProp(Cfg.PROP_HOTTEMP) != want) {
-                    ok = suExecTimeout("setprop ${Cfg.PROP_HOTTEMP} $want", 8000L)
+                val before = readProp(Cfg.PROP_HOTTEMP)
+                AppLog.d("prop", "目标=" + want + " 当前=" + before)
+                if (before != want) {
+                    // 30 秒：KernelSU / Magisk 的授权是**异步**的 —— su 会一直阻塞，
+                    // 等用户切到管理器点「允许」。原来 8 秒，从点开关到切过去根本不够，
+                    // 表现就是「明明 root 了却提示未获得 ROOT」。
+                    ok = suExecTimeout("setprop ${Cfg.PROP_HOTTEMP} $want", 30000L)
                 } else {
                     ok = true
                 }
-                // trust the read-back, not the exit code alone
+                // 只认回读：exit code 为 0 不代表属性真的落地了。
+                // 早先这里写成 `(now == want) || now.isNullOrEmpty()` ——
+                // 属性读不到也当成功，等于谎报，用户以为关掉了其实还在屏蔽。
                 if (ok) {
-                    val now = readProp(Cfg.PROP_HOTTEMP)
-                    ok = (now == want) || now.isNullOrEmpty()
+                    var now = readProp(Cfg.PROP_HOTTEMP)
+                    if (now != want) {
+                        // persist.* 一般同步落地；给属性服务 250ms 再读一次
+                        try { Thread.sleep(250L) } catch (_: Throwable) {}
+                        now = readProp(Cfg.PROP_HOTTEMP)
+                    }
+                    ok = (now == want)
+                    AppLog.d("prop", "写后回读=" + now + " → " + (if (ok) "成功" else "不一致"))
+                } else {
+                    AppLog.d("prop", "写入失败，回读=" + readProp(Cfg.PROP_HOTTEMP))
                 }
             } catch (_: Throwable) { ok = false }
             propSyncBusy = false
             if (done != null) runOnUiThread { done(ok) }
-        }.start()
+        }.apply { name = "has-prop-sync" }.start()
     }
+
+    /**
+     * `su` 的候选路径。
+     *
+     * v3.0.2 加：原来只 `ProcessBuilder("su", ...)` 依赖 PATH。实测有用户的
+     * KernelSU 是**越狱模式（LKM）**，app 进程的 PATH 里没有 su，
+     * 于是 `start()` 直接抛 IOException —— 表现就是「未获得 ROOT」，
+     * 但用户其实是 root 了的，只是模块根本没找到 su 在哪。
+     *
+     * 顺序按命中概率排：PATH → Magisk/KernelSU 标准 → 老路径 → KSU 实路径。
+     */
+    private val SU_PATHS = listOf(
+        "su",
+        "/system/bin/su",
+        "/system/xbin/su",
+        "/debug_ramdisk/su",
+        "/sbin/su",
+        "/data/adb/ksu/bin/su",
+        "/data/adb/ap/bin/su",
+    )
+
+    /**
+     * 起一个 su 进程；路径全都不存在时返回 null。
+     *
+     * 注意：**拿到进程就不再换路径**。如果 su 存在但没被授权，换路径还是同一个 su，
+     * 再试只会多弹几次授权框。所以只有 IOException（路径不存在）才往下试。
+     */
+    private fun startSu(cmd: String): Process? {
+        for (path in SU_PATHS) {
+            try {
+                val p = ProcessBuilder(path, "-c", cmd).redirectErrorStream(true).start()
+                AppLog.d("su", "启动 path=$path cmd=$cmd")
+                return p
+            } catch (_: java.io.IOException) {
+                AppLog.d("su", "路径不可用 path=$path")
+            } catch (e: SecurityException) {
+                // SELinux 拦了这条路径 —— 也必须换下一条试，不能就此放弃。
+                // 早先这里掉进下面的 Throwable 分支直接 return null，
+                // 等于「一条路径被策略挡住 = 整个 root 兜底失效」。
+                AppLog.d("su", "被安全策略拒绝 path=" + path + " " + e.javaClass.simpleName)
+            } catch (_: Throwable) {
+                AppLog.d("su", "异常 path=$path")
+                return null
+            }
+        }
+        AppLog.d("su", "全部路径都起不来 cmd=$cmd")
+        return null
+    }
+
 
     /** su -c with a hard timeout (never block on an unanswered prompt). */
     private fun suExecTimeout(cmd: String, timeoutMs: Long): Boolean {
         return try {
-            val p = ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
+            val p = startSu(cmd) ?: return false
             val drain = Thread {
                 try {
                     val ins = p.inputStream
@@ -218,12 +295,20 @@ class SettingsActivity : ComponentActivity() {
             }
             drain.isDaemon = true
             drain.start()
+            val t0 = android.os.SystemClock.uptimeMillis()
             val finished = p.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            val cost = android.os.SystemClock.uptimeMillis() - t0
             if (!finished) {
+                AppLog.d("su", "超时 " + cost + " ms 已强杀")
+                // 先 destroy（SIGTERM），再补一刀 destroyForcibly —— su 是 native
+                // 进程，对 SIGTERM 不一定响应，只 destroy 会留个僵尸挂着等授权
                 try { p.destroy() } catch (_: Throwable) {}
+                try { p.destroyForcibly() } catch (_: Throwable) {}
                 false
             } else {
-                p.exitValue() == 0
+                val code = p.exitValue()
+                AppLog.d("su", "完成 exit=" + code + " 耗时=" + cost + " ms")
+                code == 0
             }
         } catch (_: Throwable) { false }
     }
@@ -234,21 +319,187 @@ class SettingsActivity : ComponentActivity() {
             .invoke(null, name, "") as? String
     } catch (_: Throwable) { null }
 
+    // ================= 诊断日志导出（v3.0.3） =================
+
+    /**
+     * 组装一份能直接发给我们看的诊断报告。
+     *
+     * 设计原则：**能自动拿到的全部自动拿，用户只需要点一下**。
+     * 上次那位「温控关不掉」的用户，光是要他说明"用的什么 root、su 在哪、
+     * 授权没授权"就来回问了好几轮 —— 这些全都可以自动收集。
+     */
+    private fun buildDiagReport(): String {
+        val sb = StringBuilder()
+        val now = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+            .format(java.util.Date())
+
+        sb.appendLine("===== 药师高级设置 诊断报告 =====")
+        sb.appendLine("生成时间: " + now)
+        sb.appendLine("应用版本: " + BuildConfig.VERSION_NAME + " (" + BuildConfig.VERSION_CODE + ")")
+        sb.appendLine("设备: " + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL
+                + " / Android " + android.os.Build.VERSION.RELEASE
+                + " (SDK " + android.os.Build.VERSION.SDK_INT + ")"
+                + " / " + android.os.Build.SUPPORTED_ABIS.firstOrNull())
+        sb.appendLine("ROM: " + (readProp("ro.build.display.id") ?: "?"))
+        sb.appendLine()
+
+        sb.appendLine("===== su 路径探测 =====")
+        for (path in SU_PATHS) {
+            val f = if (path.contains("/")) java.io.File(path) else null
+            val state = when {
+                f == null -> "(走 PATH)"
+                f.exists() && f.canExecute() -> "存在且可执行"
+                f.exists() -> "存在但不可执行"
+                else -> "不存在"
+            }
+            sb.appendLine("  " + path.padEnd(24) + " : " + state)
+        }
+        sb.appendLine()
+
+        sb.appendLine("===== root 方案痕迹 =====")
+        for (d in listOf("/data/adb/magisk", "/data/adb/ksu", "/data/adb/ap", "/data/adb/modules")) {
+            sb.appendLine("  " + d.padEnd(24) + " : " + if (java.io.File(d).exists()) "存在" else "无")
+        }
+        sb.appendLine()
+
+        sb.appendLine("===== 属性快照 =====")
+        sb.appendLine("  " + Cfg.PROP_HOTTEMP + " = " + (readProp(Cfg.PROP_HOTTEMP) ?: "(读不到)"))
+        sb.appendLine()
+
+        sb.appendLine("===== 开关快照 =====")
+        val p = prefs()
+        for (k in Cfg.KEYS) {
+            sb.appendLine("  " + k.padEnd(14) + " = " + p.getBoolean(k, false))
+        }
+        sb.appendLine()
+
+        sb.appendLine("===== 操作日志（本次会话，最近 400 条）=====")
+        sb.appendLine(AppLog.snapshot())
+        sb.appendLine()
+        sb.appendLine("===== 操作日志（历史落盘，尾部 20000 字）=====")
+        val hist = AppLog.fileText()
+        sb.appendLine(if (hist.length > 20000) hist.takeLast(20000) else hist)
+        sb.appendLine()
+
+        sb.appendLine("===== LSPosed 模块日志（尾部 300 行，需 root）=====")
+        sb.appendLine(readLsposedLogTail())
+
+        return sb.toString()
+    }
+
+    /**
+     * 用 su 读一段命令输出，带**硬超时**。
+     *
+     * 为什么不用 `readText()` + `waitFor()`：`readText()` 要读到 EOF 才返回，
+     * 而 su 卡在授权提示时永远不会 EOF —— 导出按钮就会一直转圈。
+     * 这里用「后台线程读 + 主线程 waitFor 卡超时 + 超时强杀」的组合，
+     * 任何情况下都能在 [timeoutMs] 内返回。
+     */
+    private fun suReadOutput(cmd: String, timeoutMs: Long): String? {
+        return try {
+            val p = startSu(cmd) ?: return null
+            val sb = StringBuilder()
+            val reader = Thread {
+                try {
+                    p.inputStream.bufferedReader().use { r ->
+                        var line = r.readLine()
+                        // 上限 200KB：日志尾巴用不了这么多，防极端情况下吃内存
+                        while (line != null && sb.length < 200_000) {
+                            sb.append(line).append("\n")
+                            line = r.readLine()
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            reader.isDaemon = true
+            reader.start()
+            val finished = p.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            if (!finished) {
+                try { p.destroy() } catch (_: Throwable) {}
+                try { p.destroyForcibly() } catch (_: Throwable) {}
+                AppLog.d("su", "读日志超时 " + timeoutMs + "ms，已强杀")
+                return null
+            }
+            reader.join(2000L)   // 等读线程收尾，最多再等 2 秒
+            sb.toString()
+        } catch (t: Throwable) {
+            AppLog.d("su", "读日志失败: " + t.javaClass.simpleName)
+            null
+        }
+    }
+
+    /** 用 su 读 LSPosed 的模块日志尾巴；读不到就明说，不假装成功。 */
+    private fun readLsposedLogTail(): String {
+        val out = suReadOutput("tail -n 300 /data/adb/lspd/log/*.log 2>/dev/null", 8000L)
+            ?: return "(读不到 —— su 起不来或超时。这本身就是一条诊断信息)"
+        return if (out.isBlank()) "(空)" else out
+    }
+
     private fun notifyCfgChanged() {
         try { getContentResolver().notifyChange(CfgProvider.URI, null) } catch (_: Throwable) {}
     }
 
-    private fun suExec(cmd: String): Boolean {
+    /** 写进系统「下载」目录（MediaStore，Android 10+ 免存储权限）。 */
+    private fun saveReportToDownloads(report: String): String? {
         return try {
-            val pb = ProcessBuilder("su", "-c", cmd)
-            pb.redirectErrorStream(true)
-            val p = pb.start()
-            val ins = p.inputStream
-            val buf = ByteArray(512)
-            while (ins.read(buf) >= 0) { /* drain */ }
-            p.waitFor() == 0
-        } catch (_: Throwable) { false }
+            val name = "has-diag-" + java.text.SimpleDateFormat("yyyyMMdd-HHmmss",
+                java.util.Locale.US).format(java.util.Date()) + ".txt"
+            val values = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.Downloads.DISPLAY_NAME, name)
+                put(android.provider.MediaStore.Downloads.MIME_TYPE, "text/plain")
+                put(android.provider.MediaStore.Downloads.RELATIVE_PATH,
+                    android.os.Environment.DIRECTORY_DOWNLOADS)
+            }
+            val uri = contentResolver.insert(
+                android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: return null
+            // openOutputStream 可能返回 null（存储满 / 被策略拦）。早先用了
+            // `?.use {}`，null 时静默跳过 —— 结果 Mediastore 里留下一个**空文件**，
+            // 用户拿到 0 字节的 txt，还以为是我们没写日志。
+            val os = contentResolver.openOutputStream(uri)
+            if (os == null) {
+                try { contentResolver.delete(uri, null, null) } catch (_: Throwable) {}
+                AppLog.d("export", "openOutputStream 返回 null，已删除空条目")
+                return null
+            }
+            os.use { it.write(report.toByteArray(Charsets.UTF_8)) }
+            "Download/" + name
+        } catch (t: Throwable) {
+            AppLog.d("export", "失败: " + t.javaClass.simpleName + " " + t.message)
+            null
+        }
     }
+
+    /** 导出按钮：后台组装 → 写下载目录 → 把路径告诉用户。 */
+    private fun exportDiag() {
+        Toast.makeText(this, "正在收集诊断信息…", Toast.LENGTH_SHORT).show()
+        Thread {
+            val report = try { buildDiagReport() } catch (t: Throwable) {
+                "报告生成失败: " + t
+            }
+            val saved = saveReportToDownloads(report)
+            runOnUiThread {
+                if (saved != null) {
+                    Toast.makeText(this,
+                        "已导出到 " + saved + "，可以直接把这个文件发给我们",
+                        Toast.LENGTH_LONG).show()
+                } else {
+                    Toast.makeText(this, "导出失败，请检查存储空间", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * v3.0.2 改：原来这里是 `p.waitFor()` **无超时**。
+     *
+     * 后台线程虽然不会 ANR，但 su 会一直阻塞着等用户点授权 —— 线程挂死、
+     * `runOnUiThread` 永远等不到，用户看到的就是"点了重启没有任何反应"。
+     * 统一走 [suExecTimeout]，超时按"人的操作时间"给 30 秒。
+     */
+    private fun suExec(cmd: String, timeoutMs: Long = 30000L): Boolean =
+        suExecTimeout(cmd, timeoutMs)
 
     // ---- v1.0.x -> v1.4 key migration (same mapping as CfgProvider) ----
     private fun migratePrefs() {
@@ -266,6 +517,11 @@ class SettingsActivity : ComponentActivity() {
             for (old in arrayOf("master","keyguard","kgcard","gallery","skipcheck","nonet","infocard","downgrade","hideextras")) ed.remove(old)
             dirty = true
         }
+        // v3.0.5 的高光语义迁移（旧 1=关闭 → 新 1=开启）**不在这里做**了。
+        // 它被移到 Cfg.migrateHlSemantics()，由 CfgProvider.onCreate() 调用 ——
+        // 因为那个方法只有用户打开本界面才会跑，而老用户可能升级后一直不打开界面，
+        // 那样 hook 会读到旧语义的值，四个高光开关整个反掉。
+        // 这里不再重复实现，避免两处逻辑漂移。
         for (k in Cfg.KEYS) {
             if (!p.contains(k)) {
                 // every switch defaults ON EXCEPT the opt-in ones — auto-true
@@ -321,6 +577,7 @@ class SettingsActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        AppLog.init(this)
         super.onCreate(savedInstanceState)
         // 主线程先触碰一次：Compose 的 mutableStateOf 建在工作线程的过期 snapshot
         // 上会在组合阶段抛 IllegalStateException（HonorHook 踩过同样的坑）
@@ -580,7 +837,7 @@ class SettingsActivity : ComponentActivity() {
                 }
                 item {
                     Column {
-                        SectionLabel("精细调节（100% = 原厂 · 改完重启「桌面」生效）")
+                        SectionLabel("精细调节（100% = 不改动 · 改完重启「桌面」生效）")
                         Footnote("⚠️ 这一页改完要**重启桌面**才生效（不是重启系统界面）。桌面的玻璃参数跑在桌面自己的进程里。")
                         ParamGroup("桌面卡片", "desk", openGroup, { openGroup = it }) {
                             TuneRow("模糊半径", Cfg.F_DESK_RADIUS,
@@ -601,10 +858,14 @@ class SettingsActivity : ComponentActivity() {
                 }
                 item {
                     Column {
-                        SectionLabel("精细调节（100% = 原厂 · 改完重启「系统界面」生效）")
-                        TuneSwitch("强制液态玻璃", Cfg.F_FORCE_LIQUID,
-                            "有些界面系统会自己判定成磨砂（比如通知横幅、某些卡片），你没法改。打开这个开关，强制它们也走液态折射。如果哪个界面变糊或变色，关掉即可。",
-                            onLabel = "已开启", offLabel = "已关闭")
+                        SectionLabel("精细调节（100% = 不改动 · 改完重启「系统界面」生效）")
+                        // v3.0.5：这个开关原来是裸的（直接放在 Column 里，没有卡片底），
+                        // 和下面的 ParamGroup 视觉上不齐。包一层 CardShell。
+                        CardShell {
+                            TuneSwitch("强制液态玻璃", Cfg.F_FORCE_LIQUID,
+                                "有些界面系统会自己判定成磨砂（比如通知横幅、某些卡片），你没法改。打开这个开关，强制它们也走液态折射。如果哪个界面变糊或变色，关掉即可。")
+                        }
+                        Spacer(Modifier.height(10.dp))
                         ParamGroup("通知消息卡片", "ntf", openGroup, { openGroup = it }) {
                             TuneRow("卡片底色浓度", Cfg.F_NTF_MASK, "下拉通知栏里那一条条消息卡片，背后那层暗色遮罩的浓淡。")
                             TuneRow("卡片叠加色", Cfg.F_NTF_OVL, "叠在底色上的第二层颜色，影响整体色调。")
@@ -651,12 +912,19 @@ class SettingsActivity : ComponentActivity() {
                             TuneRow("高光宽度", Cfg.F_HL_THICK, "玻璃边缘那圈亮边的粗细。")
                             TuneRow("高光亮度", Cfg.F_HL_ALPHA, "那圈亮边的透明度，越低越淡。")
                             TuneRow("高光角度", Cfg.F_HL_ANGLE, "光源方向，0 到 360 度。原厂 250，改它能让光从别的方向照过来。", rangeMax = 360, unit = "°", stepCount = 71)
-                            TuneSwitch("关闭全部高光", Cfg.F_HL_ON, "一次性关掉所有玻璃边缘的亮边。")
-                            TuneSwitch("关闭大按钮高光", Cfg.F_HL_CC, "只关工具栏方块按钮的亮边。")
-                            TuneSwitch("关闭小按钮高光", Cfg.F_HL_BTN, "只关圆形小按钮的亮边。")
-                            TuneSwitch("关闭亮度条高光", Cfg.F_HL_SL, "只关亮度/音量条的亮边。")
+                            HighlightSwitches()
+                            TuneSwitch("锁屏控制中心展开态", Cfg.F_CC_EXPAND,
+                                "强制锁屏上的控制中心按「展开」状态渲染。注意：它同时会让锁屏不再使用窗口模糊（系统里这两件事绑在一起），观感变化比较大，默认关闭。")
                         }
-                        Footnote("每个数字都是原厂值的百分比。100 = 原厂，低于 100 变弱、高于 100 变强。点右边的 ! 看这一项管什么。")
+                        ParamGroup("多层遮罩与渐变", "multimask", openGroup, { openGroup = it }) {
+                            TuneRow("多层遮罩浓度", Cfg.F_MULTI_MASK,
+                                "通知卡、按钮、滑块背后其实是**好几层**遮罩叠出来的。上面那几根「底色浓度」只管其中一层，这一根同时调所有层——想整体变透或变实，用它最直接。")
+                            TuneRow("动态卡渐变颜色", Cfg.F_DYN_GRAD_COLOR,
+                                "动态卡片（正在播放那种）的渐变遮罩浓淡。")
+                            TuneRow("动态卡渐变位置", Cfg.F_DYN_GRAD_POS,
+                                "渐变的起止位置。调低范围更窄、颜色更集中；调高更分散。")
+                        }
+                        Footnote("三层遮罩和渐变是这次新补上的——之前这些字段系统一直在用，只是模块没接。")
                     }
                 }
             } else if (subPage == "kl") {
@@ -668,7 +936,7 @@ class SettingsActivity : ComponentActivity() {
                 }
                 item {
                     Column {
-                        SectionLabel("精细调节（100% = 原厂）")
+                        SectionLabel("精细调节（100% = 不改动）")
                         Footnote("⚠️ 这一页改完**必须重启手机**才生效。只重启「系统界面」不够——锁屏上的按钮、图标、文字在系统界面刚启动的头两秒就画好了，那时设置还没读进来，会静默跳过。")
                         ParamGroup("锁屏通知卡片", "kl", openGroup, { openGroup = it }) {
                             TuneRow("卡片底色浓度", Cfg.F_KL_MASK, "锁屏界面上那几条通知卡片，背后那层暗色遮罩的浓淡。")
@@ -724,7 +992,7 @@ class SettingsActivity : ComponentActivity() {
                             TuneRow("指纹饱和度", Cfg.F_KG_FP_SAT,
                                 "锁屏指纹区域那圈玻璃的鲜艳度。原厂只有 1.3 / 1.2 两档（按通透度分），没法细调。")
                         }
-                        Footnote("这一组管的是「整块锁屏壁纸」，不是上面的卡片或按钮。三个都是乘在原厂值上，100% = 完全不动。")
+                        Footnote("这一组管的是「整块锁屏壁纸」，不是上面的卡片或按钮。三个都是乘在系统原值上，100% = 完全不动。")
                     }
                 }
             } else {
@@ -736,7 +1004,7 @@ class SettingsActivity : ComponentActivity() {
                 }
                 item {
                     Column {
-                        SectionLabel("精细调节（100% = 原厂 · 改完重启「系统界面」生效）")
+                        SectionLabel("精细调节（100% = 不改动 · 改完重启「系统界面」生效）")
                         ParamGroup("通知横幅", "bn", openGroup, { openGroup = it }) {
                             TuneRow("横幅底色浓度", Cfg.F_BN_MASK, "来通知时从屏幕顶部弹出的那条横幅，背后暗色遮罩的浓淡。")
                             TuneRow("横幅叠加色", Cfg.F_BN_OVL, "横幅的第二层叠加色。")
@@ -796,20 +1064,116 @@ class SettingsActivity : ComponentActivity() {
     }
 
     /**
-     * 开关型精细参数：原厂已开启，打开这里 = 关掉它。
-     * 值语义 0 = 跟随原厂，1 = 强制关闭。
+     * 边缘高光那一组（v3.0.5）。
+     *
+     * 语义从「关闭某某高光」翻成「某某高光」（开关打开 = 有高光，出厂就是全开）。
+     *
+     * **联动**：全局关掉时，下面三个一起关、并置灰点不动。
+     * 这样不会出现「全局关着、分项还亮着」这种自相矛盾的状态 —— 也就是用户说的
+     * "不要写打架了"。
      */
     @Composable
-    private fun TuneSwitch(label: String, key: String, tip: String = "",
-                           onLabel: String = "已关闭", offLabel: String = "原厂") {
+    private fun HighlightSwitches() {
+        var g by remember { mutableStateOf(prefs().getInt(Cfg.F_HL_ON, 1) != 0) }
+        var cc by remember { mutableStateOf(prefs().getInt(Cfg.F_HL_CC, 1) != 0) }
+        var bt by remember { mutableStateOf(prefs().getInt(Cfg.F_HL_BTN, 1) != 0) }
+        var sl by remember { mutableStateOf(prefs().getInt(Cfg.F_HL_SL, 1) != 0) }
+
+        fun put(k: String, v: Boolean) {
+            prefs().edit().putInt(k, if (v) 1 else 0).commit()
+        }
+
+        /**
+         * 分项变化后把全局同步成「三者之或」。
+         *
+         * 规则（用户定死的）：
+         *   · 开任意一个分项 -> 全局必须跟着开（否则 hook 关总闸，勾了也看不到亮边）
+         *   · 三个都关      -> 全局也关（否则 UI 显示"开"但画面全灭，自相矛盾）
+         *
+         * 所以下面每一个分项的 onChange 都是「写自己的值 -> syncGlobal()」。
+         */
+        fun syncGlobal() {
+            val any = cc || bt || sl
+            if (any != g) {
+                g = any
+                put(Cfg.F_HL_ON, any)
+            }
+        }
+
+        HlSwitchRow("全局高光", g,
+            "总闸。打开它 = 下面三个一起打开（四处亮边全有）；关掉它 = 下面三个一起关掉，一处亮边都不留。") { v ->
+            g = v
+            put(Cfg.F_HL_ON, v)
+            // 双向联动：开全局 -> 三个分项一起开；关全局 -> 三个一起关。
+            // 反过来（单独开某个分项 -> 全局自动开）在下面三行里处理。
+            cc = v; bt = v; sl = v
+            put(Cfg.F_HL_CC, v)
+            put(Cfg.F_HL_BTN, v)
+            put(Cfg.F_HL_SL, v)
+        }
+        HlSwitchRow("大按钮高光", cc,
+            "只管工具栏上的方块大按钮。打开它时全局高光会自动跟着打开。关掉它不会影响全局——小按钮和亮度条的亮边照旧，除非你把三个分项全关了，那全局才会跟着关。") { v ->
+            cc = v; put(Cfg.F_HL_CC, v); syncGlobal()
+        }
+        HlSwitchRow("小按钮高光", bt,
+            "只管工具栏上的圆形小按钮。打开它时全局高光会自动跟着打开。关掉它不会影响全局——大按钮和亮度条的亮边照旧，除非三个分项全关。") { v ->
+            bt = v; put(Cfg.F_HL_BTN, v); syncGlobal()
+        }
+        HlSwitchRow("亮度条高光", sl,
+            "只管亮度条和音量条。打开它时全局高光会自动跟着打开。关掉它不会影响全局——按钮的亮边照旧，除非三个分项全关。") { v ->
+            sl = v; put(Cfg.F_HL_SL, v); syncGlobal()
+        }
+    }
+
+    /**
+     * 高光用的开关行。
+     *
+     * **不置灰**：分项永远可点。全局关掉后分项显示为"关"，但用户随时可以打开
+     * 其中任何一个 —— 打开时上层会顺带把全局也打开（见 [HighlightSwitches]）。
+     * 早先想过"全局关就置灰分项"，但那样就点不动，用户永远没法单独开一类。
+     */
+    @Composable
+    private fun HlSwitchRow(label: String, on: Boolean,
+                            tip: String, onChange: (Boolean) -> Unit) {
+        val hv = androidx.compose.ui.platform.LocalView.current
+        Row(
+            Modifier.fillMaxWidth()
+                .clickable {
+                    hv.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
+                    onChange(!on)
+                }
+                .padding(horizontal = 18.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(label, fontSize = 15.sp, color = MiuixTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f))
+            InfoDot(tip)
+            Spacer(Modifier.width(8.dp))
+            Switch(checked = on, onCheckedChange = { onChange(it) })
+        }
+    }
+
+    /**
+     * 开关型精细参数。
+     *
+     * v3.0.4：从「点击整行 + 右侧文字」改成**真开关**。
+     * 原来那一版右边显示「已关闭 / 原厂」，用户反馈两点：
+     *   ① 看着像按钮不像开关，不知道点一下是开还是关；
+     *   ② "原厂"看不懂。
+     * 现在状态由 Switch 本身表达，不再需要文字。
+     */
+    @Composable
+    private fun TuneSwitch(label: String, key: String, tip: String = "") {
         val hv = androidx.compose.ui.platform.LocalView.current
         var on by remember { mutableStateOf(prefs().getInt(key, Cfg.fnDefPct(key)) != 0) }
+        val setOn: (Boolean) -> Unit = { v ->
+            on = v
+            hv.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
+            prefs().edit().putInt(key, if (v) 1 else 0).commit()
+        }
         Row(
-            Modifier.fillMaxWidth().clickable {
-                on = !on
-                hv.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
-                prefs().edit().putInt(key, if (on) 1 else 0).commit()
-            }.padding(horizontal = 18.dp, vertical = 10.dp),
+            Modifier.fillMaxWidth().clickable { setOn(!on) }
+                .padding(horizontal = 18.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(label, fontSize = 15.sp, color = MiuixTheme.colorScheme.onSurface,
@@ -818,8 +1182,7 @@ class SettingsActivity : ComponentActivity() {
                 InfoDot(tip)
                 Spacer(Modifier.width(8.dp))
             }
-            Text(if (on) onLabel else offLabel, fontSize = 13.sp,
-                color = MiuixTheme.colorScheme.primary)
+            Switch(checked = on, onCheckedChange = { setOn(it) })
         }
     }
 
@@ -981,6 +1344,23 @@ class SettingsActivity : ComponentActivity() {
                                 else "诊断日志已关闭",
                                 Toast.LENGTH_LONG).show()
                         })
+                    }
+                }
+            }
+            item {
+                CardShell {
+                    Row(
+                        Modifier.fillMaxWidth().clickable { exportDiag() }.padding(18.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("导出诊断报告", fontSize = 16.sp, color = MiuixTheme.colorScheme.onSurface)
+                            Spacer(Modifier.height(3.dp))
+                            Text("一键收集设备信息、root 环境、su 路径探测、属性与开关状态、模块操作记录，保存到「下载」目录。遇到问题时直接把这个文件发给我们，比截图管用得多。",
+                                fontSize = 12.5.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Text("导出", fontSize = 14.sp, color = MiuixTheme.colorScheme.primary)
                     }
                 }
             }
@@ -1448,11 +1828,16 @@ class SettingsActivity : ComponentActivity() {
                 Column(Modifier.padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     Text("隐私政策", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MiuixTheme.colorScheme.onSurface)
                     Text(
-                        "本模块完全运行于本机，不会上传任何数据：\n\n" +
-                        "· 只有您点击「检查更新」时才会访问 GitHub 公开接口查询版本号，其余时间不联网\n" +
-                        "· 开关状态仅保存在本机应用私有目录\n" +
-                        "· 仅在所声明的作用域进程内运行钩子逻辑\n" +
-                        "· 诊断日志只写入 LSPosed 的本地模块日志，不会外发",
+                        "本模块完全运行于本机，不获取、不上传任何隐私内容：\n\n" +
+                        "· 不读取通讯录、短信、通话记录、位置、相册、麦克风、摄像头、剪贴板\n" +
+                        "· 不收集设备标识（IMEI / 序列号 / Android ID / 广告 ID），不碰任何账号信息\n" +
+                        "· 没有埋点统计、没有第三方 SDK、不做用户画像\n" +
+                        "· 开关与参数只保存在本机应用私有目录，卸载即删除\n" +
+                        "· 仅在您勾选的作用域进程内运行钩子逻辑，不碰其他应用\n" +
+                        "· 只有您点击「检查更新」时才会访问 GitHub 公开接口查版本号，其余时间完全不联网\n" +
+                        "· 「诊断日志」只写入本机 LSPosed 本地日志，不会外发\n" +
+                        "· 「导出诊断报告」只在您点击时生成一个文本文件，存在本机「下载」目录；发不发、发给谁完全由您决定\n\n" +
+                        "模块申请的唯一网络权限用于「检查更新」，除此之外没有任何后台请求。",
                         fontSize = 13.5.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 10.dp, bottom = 6.dp))
                     Text("关闭", fontSize = 14.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
@@ -1645,10 +2030,12 @@ class SettingsActivity : ComponentActivity() {
         val names = targets.joinToString("、") { it.label }
         Toast.makeText(this, "正在重启：$names…", Toast.LENGTH_SHORT).show()
         Thread {
+            AppLog.d("scope", "重启: " + targets.joinToString("、") { it.label })
             val ok = suExec(targets.joinToString(" ; ") { it.cmd })
+            AppLog.d("scope", "结果=" + (if (ok) "成功" else "失败"))
             runOnUiThread {
                 Toast.makeText(this,
-                    if (ok) "已重启：$names" else "重启失败：ROOT 授权被拒绝",
+                    if (ok) "已重启：$names" else "重启失败：su 没执行成功（检查 KernelSU/Magisk 里的授权）",
                     Toast.LENGTH_LONG).show()
             }
             if (ok) {
