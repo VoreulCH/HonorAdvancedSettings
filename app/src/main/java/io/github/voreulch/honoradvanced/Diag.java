@@ -118,11 +118,30 @@ public final class Diag {
     private static int sDropped = 0;
 
     public static void log(String msg) {
-        if (msg == null || !on()) {
+        // ⚠ 这里必须和 warn() 一致，带上 sEssential。
+        // 早先只判断 on()，导致 setEssential(true) 对 log 完全无效 ——
+        // securityserver / system_server / installer 三个系统进程虽然设了
+        // essential，它们的「已拦截 xxx」这种 log 仍然一条都打不出来，
+        // 只有 note 的挂载行能看见。排查时因此误以为"钩子挂了但没生效"。
+        if (msg == null || (!on() && !sEssential)) {
             return;
         }
         long now = android.os.SystemClock.uptimeMillis();
         synchronized (LOG_LOCK) {
+            // ⚠ 跨秒检查必须放在"重复消息"判断**之前**。
+            // 早先它在后面，而重复分支是 `return` —— 一旦连续刷同一条消息，
+            // 就永远走不到跨秒那一段，被限流丢掉的条数也就永远不会被报出来
+            // （用户看到的日志像是"没丢"，其实丢了）。
+            long sec = now / 1000L;
+            if (sec != sSecAt) {
+                if (sDropped > 0) {
+                    XposedBridge.log(head("D") + "（另有 " + sDropped + " 条因限流省略）");
+                }
+                sSecAt = sec;
+                sSecCount = 0;
+                sDropped = 0;
+            }
+
             // 同一条消息：累计次数，窗口满了才补一行
             if (msg.equals(sPendingMsg)) {
                 sPendingCount++;
@@ -136,15 +155,6 @@ public final class Diag {
             }
             if (sPendingMsg != null) {
                 flushPending();
-            }
-            long sec = now / 1000L;
-            if (sec != sSecAt) {
-                if (sDropped > 0) {
-                    XposedBridge.log(head("D") + "（另有 " + sDropped + " 条因限流省略）");
-                }
-                sSecAt = sec;
-                sSecCount = 0;
-                sDropped = 0;
             }
             if (sSecCount >= MAX_PER_SEC) {
                 sDropped++;
@@ -188,6 +198,17 @@ public final class Diag {
     public static void note(String msg) {
         try {
             XposedBridge.log(head("N") + msg);
+        } catch (Throwable ignored) {
+        }
+        // v2.6.13：双通道。
+        // Vector 把 XposedBridge.log 输出成 Log.i，而 SystemUI 启动瞬间的日志洪峰
+        // 会把 info 级缓冲挤掉 —— 实测 logcat 抓了 12849 行也**找不到一条
+        // systemui 的 note**（photos 进程因为日志少反而能看到）。排查时因此
+        // 误判成"钩子没挂上"。
+        // 现在额外打一条 error 级（tag 固定 HAS-KEY）：出错级别不会被优先丢弃，
+        // grep HAS-KEY 一定能拿到每个进程的挂载结果。
+        try {
+            android.util.Log.e("HAS-KEY", head("N") + msg);
         } catch (Throwable ignored) {
         }
     }
@@ -374,7 +395,10 @@ public final class Diag {
 
     /** 开关/组件状态一行。 */
     public static void state(String name, Object value) {
-        if (!on()) {
+        // 只被调用 1 次（Cfg 快照落地时），量很小，受 essential 控制没风险。
+        // 这行在 system_server / installer 里尤其关键：只有它能证明
+        // "配置到底有没有读到"，而那几个进程恰好是最需要 essential 的地方。
+        if (!on() && !sEssential) {
             return;
         }
         XposedBridge.log(head("S") + name + " = " + value);
