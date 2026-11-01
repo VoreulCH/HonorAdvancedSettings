@@ -683,6 +683,15 @@ public final class GlassHook implements IXposedHookLoadPackage {
             XposedBridge.hookAllMethods(et, "getErode", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
+                        // sKgOn 只在 refreshProps() 里赋值；时钟是锁屏第一个渲染的元素，
+                        // 常在其它钩子之前触发，不自己刷就会拿旧的 false（调了没反应）。
+                        // 1 秒节流，避免吃光 Diag 每秒 50 条配额。
+                        if (!Cfg.isOn(Cfg.K_GLASS)) return;
+                        long t = android.os.SystemClock.uptimeMillis();
+                        if (t - sKgLastRefresh > 1000L) {
+                            sKgLastRefresh = t;
+                            refreshProps();
+                        }
                     if (!sKgOn) return;
                     Object r = param.getResult();
                     if (!(r instanceof Float)) return;
@@ -780,6 +789,17 @@ public final class GlassHook implements IXposedHookLoadPackage {
         if (ok == 0) sKgElemHooked.set(false);   // 一个都没挂上，允许下次重试
     }
 
+    /** float[] 数组：原地每个元素乘 k（用于渐变位置这类 0~1 的数组）。 */
+    private static void scaleFloatArray(Object o, String field, float k) {
+        try {
+            Object v = XposedHelpers.getObjectField(o, field);
+            if (!(v instanceof float[])) return;
+            float[] arr = (float[]) v;
+            for (int i = 0; i < arr.length; i++) arr[i] = arr[i] * k;
+        } catch (Throwable ignored) {
+        }
+    }
+
     /** 参数包里的字段是 Float 对象，乘完写回。字段不存在就静默跳过。 */
     private static void scaleKgField(Object bVar, String field, float k) {
         try {
@@ -872,6 +892,15 @@ public final class GlassHook implements IXposedHookLoadPackage {
             XposedBridge.hookAllMethods(k, "setChildBlur", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
+                        // sKgOn 只在 refreshProps() 里赋值；时钟是锁屏第一个渲染的元素，
+                        // 常在其它钩子之前触发，不自己刷就会拿旧的 false（调了没反应）。
+                        // 1 秒节流，避免吃光 Diag 每秒 50 条配额。
+                        if (!Cfg.isOn(Cfg.K_GLASS)) return;
+                        long t = android.os.SystemClock.uptimeMillis();
+                        if (t - sKgLastRefresh > 1000L) {
+                            sKgLastRefresh = t;
+                            refreshProps();
+                        }
                     if (!sKgOn) return;
                     if (param.args.length < 1 || !(param.args[0] instanceof android.view.View)) {
                         return;
@@ -919,6 +948,14 @@ public final class GlassHook implements IXposedHookLoadPackage {
                 XposedBridge.hookAllMethods(k, "getHnBlurParametersEx", new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
+                        // 壁纸/指纹在锁屏启动早期就会渲染，那时 sKgOn 可能还是初始 false。
+                        // 不自己刷的话，用户调了壁纸半径/饱和度会完全没反应。
+                        if (!Cfg.isOn(Cfg.K_GLASS)) return;
+                        long t = android.os.SystemClock.uptimeMillis();
+                        if (t - sKgLastRefresh > 1000L) {
+                            sKgLastRefresh = t;
+                            refreshProps();
+                        }
                         if (!sKgOn) return;
                         Object p = param.getResult();
                         if (p == null) return;
@@ -956,6 +993,14 @@ public final class GlassHook implements IXposedHookLoadPackage {
                 XposedBridge.hookAllMethods(k, "getFPHnBlurParameters", new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
+                        // 壁纸/指纹在锁屏启动早期就会渲染，那时 sKgOn 可能还是初始 false。
+                        // 不自己刷的话，用户调了壁纸半径/饱和度会完全没反应。
+                        if (!Cfg.isOn(Cfg.K_GLASS)) return;
+                        long t = android.os.SystemClock.uptimeMillis();
+                        if (t - sKgLastRefresh > 1000L) {
+                            sKgLastRefresh = t;
+                            refreshProps();
+                        }
                         if (!sKgOn) return;
                         Object p = param.getResult();
                         if (p == null) return;
@@ -1749,22 +1794,85 @@ public final class GlassHook implements IXposedHookLoadPackage {
                                 // 高光开关都属系统线：系统线关掉时必须原样不动。
                                 // 用 if 包裹而不是 return —— return 会跳出整个
                                 // 精细块，将来若把横幅/锁屏逻辑挪到后面会被误伤。
+                                // ===== 多层遮罩 / 动态渐变 / 锁屏控制中心（v3.1.3）=====
+                                // 这几个字段以前是"有但没接"——单根 maskColor 只是其中一层，
+                                // 真正决定观感的是这几个数组里每一层的 alpha。
                                 if (sSysOn) {
-                                    if (Cfg.getInt(Cfg.F_HL_ON, Cfg.fnDefPct(Cfg.F_HL_ON)) != 0) {
+                                    float km = fineF(Cfg.F_MULTI_MASK);
+                                    if (Math.abs(km - 1f) > 0.001f) {
+                                        // 复用已有的 scaleAlphaArray（反射 Array，支持任意数组类型），
+                                        // 别再写一份 —— 上一版就是重复实现被抓了。
+                                        try {
+                                            scaleAlphaArray(o, "multiMaskColors", km);
+                                            scaleAlphaArray(o, "multiButtonMaskColors", km);
+                                            scaleAlphaArray(o, "multiControlMaskColors", km);
+                                            scaleAlphaArray(o, "multiSliderMaskColors", km);
+                                        } catch (Throwable ignored) {
+                                        }
+                                        if (applied != null) applied.append(" mmask=x").append(km);
+                                    }
+                                    float kc = fineF(Cfg.F_DYN_GRAD_COLOR);
+                                    if (Math.abs(kc - 1f) > 0.001f) {
+                                        try {
+                                            scaleAlphaArray(o, "dynamicCardGradientMaskColor", kc);
+                                            scaleAlphaArray(o, "dynamicCardGradientMaskColorOther", kc);
+                                        } catch (Throwable ignored) {
+                                        }
+                                        if (applied != null) applied.append(" dgrad=x").append(kc);
+                                    }
+                                    float kp = fineF(Cfg.F_DYN_GRAD_POS);
+                                    if (Math.abs(kp - 1f) > 0.001f) {
+                                        scaleFloatArray(o, "dynamicCardGradientPos", kp);
+                                        scaleFloatArray(o, "dynamicCardGradientPosOther", kp);
+                                        if (applied != null) applied.append(" dpos=x").append(kp);
+                                    }
+                                    // 锁屏控制中心强制"展开态"。注意它同时会把
+                                    // isWindowBlur 顶掉（见 KeyguardBusinessDataProvider:178），
+                                    // 所以只在用户显式打开时才动。
+                                    if (Cfg.getInt(Cfg.F_CC_EXPAND, 0) != 0) {
+                                        XposedHelpers.setBooleanField(o, "isKerguardContrlCenterExpand", true);
+                                        if (applied != null) applied.append(" ccexpand");
+                                    }
+                                }
+
+                                // ===== 边缘高光（v3.0.5 语义反转 + 代码级联动）=====
+                                //
+                                // 语义：1 = 开启高光（出厂全开），0 = 关掉。
+                                //
+                                // **联动写在 hook 里，不只是 UI** ：
+                                //   ① 四个全关            -> 关总闸 isNeedHighLight =
+                                //      false，一处亮边都不留
+                                //   ② 任何一个分项开着     -> 总闸必须视为"开"，只按分项逐个关
+                                //
+                                // 为什么必须这样：UI 的 prefs 和 hook 读的快照之间有时间差
+                                // （prefs 写完要等 ContentObserver 刷新），中间可能读到
+                                // 「全局=0 但分项=1」的中间态。如果这里死板地按 hl_on==0
+                                // 就关总闸，用户明明勾着"大按钮高光"却一片死黑——正是
+                                // 他说的"打架"。按"任一开着就算开"来判断，任何中间态都
+                                // 能渲染出自洽的结果。
+                                if (sSysOn) {
+                                    boolean hlAll = Cfg.getInt(Cfg.F_HL_ON, 1) != 0;
+                                    boolean hlCc = Cfg.getInt(Cfg.F_HL_CC, 1) != 0;
+                                    boolean hlBtn = Cfg.getInt(Cfg.F_HL_BTN, 1) != 0;
+                                    boolean hlSl = Cfg.getInt(Cfg.F_HL_SL, 1) != 0;
+                                    if (!hlAll && !hlCc && !hlBtn && !hlSl) {
+                                        // 四个全关 -> 总闸关，全部亮边消失
                                         XposedHelpers.setBooleanField(o, "isNeedHighLight", false);
-                                        if (applied != null) applied.append(" hl=off");
-                                    }
-                                    if (Cfg.getInt(Cfg.F_HL_CC, Cfg.fnDefPct(Cfg.F_HL_CC)) != 0) {
-                                        XposedHelpers.setBooleanField(o, "isControlNeedHighLight", false);
-                                        if (applied != null) applied.append(" hlcc=off");
-                                    }
-                                    if (Cfg.getInt(Cfg.F_HL_BTN, Cfg.fnDefPct(Cfg.F_HL_BTN)) != 0) {
-                                        XposedHelpers.setBooleanField(o, "isButtonNeedHighLight", false);
-                                        if (applied != null) applied.append(" hlbtn=off");
-                                    }
-                                    if (Cfg.getInt(Cfg.F_HL_SL, Cfg.fnDefPct(Cfg.F_HL_SL)) != 0) {
-                                        XposedHelpers.setBooleanField(o, "sliderNeedHighLight", false);
-                                        if (applied != null) applied.append(" hlsl=off");
+                                        if (applied != null) applied.append(" hl=all-off");
+                                    } else {
+                                        // 至少有一个要亮 -> 总闸保持开，只关掉被关掉的那几类
+                                        if (!hlCc) {
+                                            XposedHelpers.setBooleanField(o, "isControlNeedHighLight", false);
+                                            if (applied != null) applied.append(" hlcc=off");
+                                        }
+                                        if (!hlBtn) {
+                                            XposedHelpers.setBooleanField(o, "isButtonNeedHighLight", false);
+                                            if (applied != null) applied.append(" hlbtn=off");
+                                        }
+                                        if (!hlSl) {
+                                            XposedHelpers.setBooleanField(o, "sliderNeedHighLight", false);
+                                            if (applied != null) applied.append(" hlsl=off");
+                                        }
                                     }
                                 }
                                 // 统一在所有改动做完之后打一条，别漏掉高光那几项。
@@ -1859,9 +1967,13 @@ public final class GlassHook implements IXposedHookLoadPackage {
                                     0.2f * fineF(Cfg.F_OPT_DISP));
                             if (sFolderLogged < 3) {
                                 sFolderLogged++;
+                                // 日志必须打印**实际写进去的值**。早先这里是
+                                // `0.62f * sThickScale`，漏了 fineF(F_OPT_THICK)，
+                                // 用户拖「玻璃厚度」时日志纹丝不动，排查时会被带偏。
                                 log("folder: liquid optics -> 0.3/0.54/"
-                                        + (0.62f * sThickScale) + "/0.2 (case="
-                                        + param.args[0] + ", thick x" + sThickScale + ")");
+                                        + (0.62f * sThickScale * fineF(Cfg.F_OPT_THICK)) + "/0.2 (case="
+                                        + param.args[0] + ", thick x" + sThickScale
+                                        + " fine x" + fineF(Cfg.F_OPT_THICK) + ")");
                             }
                         } catch (Throwable t) {
                             log("folder optics failed: " + t);
@@ -2083,8 +2195,9 @@ public final class GlassHook implements IXposedHookLoadPackage {
                 }
             });
             log("ok: ConfigurationEx.getTransparentMode FROSTED->LIQUID installed");
+            Diag.note("ok: ConfigurationEx.getTransparentMode 已接管（FROSTED->LIQUID 位）");
         } catch (Throwable t) {
-            log("skip: ConfigurationEx missing (" + t.getClass().getSimpleName() + ")");
+            Diag.note("skip: ConfigurationEx missing (" + t.getClass().getSimpleName() + ")");
         }
     }
 
@@ -2125,8 +2238,9 @@ public final class GlassHook implements IXposedHookLoadPackage {
             });
 
             log("ok: framework data-source hooks installed (minDegree=" + minDegree + ")");
+            Diag.note("ok: framework UiModeManagerEx 已接管（texture/degree）");
         } catch (Throwable t) {
-            log("skip: framework UiModeManagerEx missing ("
+            Diag.note("skip: framework UiModeManagerEx missing ("
                     + t.getClass().getSimpleName() + ")");
         }
     }
@@ -2143,8 +2257,9 @@ public final class GlassHook implements IXposedHookLoadPackage {
                 }
             });
             log("ok: getConfigTransparentModeMaterial -> 3 (LIQUID effect bit restored)");
+            Diag.note("ok: TransparencyFeatureConfig 材质位已接管（强制 3）");
         } catch (Throwable t) {
-            log("skip: TransparencyFeatureConfig missing (" + t.getClass().getSimpleName() + ")");
+            Diag.note("skip: TransparencyFeatureConfig missing (" + t.getClass().getSimpleName() + ")");
         }
     }
 
@@ -2236,9 +2351,9 @@ public final class GlassHook implements IXposedHookLoadPackage {
                     }
                 }
             });
-            log("ok: StyleType.getMaterialType FROSTED->LIQUID guard installed");
+            Diag.note("ok: StyleType.getMaterialType FROSTED->LIQUID guard installed");
         } catch (Throwable t) {
-            log("skip: StyleType missing (" + t.getClass().getSimpleName() + ")");
+            Diag.note("skip: StyleType missing (" + t.getClass().getSimpleName() + ")");
         }
     }
 
