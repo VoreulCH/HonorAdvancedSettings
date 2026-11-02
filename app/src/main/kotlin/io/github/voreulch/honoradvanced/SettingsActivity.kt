@@ -99,6 +99,10 @@ class SettingsActivity : ComponentActivity() {
             "killall com.hihonor.desktop.systemui || true"),
         ScopeTarget("com.hihonor.iaware", "温控服务", "killall com.hihonor.iaware || true"),
         ScopeTarget("com.hihonor.securityserver", "反诈服务", "killall com.hihonor.securityserver || true"),
+        // v3.2.48：反诈现在同时作用于感知服务本体（它自己有 fraud 逻辑和独立上报通道），
+        // 重启作用域时不能漏 —— 漏了的话改了反诈开关、重启完"反诈服务"还以为生效了，
+        // 实际上 awareness 那边照旧跑旧代码。
+        ScopeTarget("com.hihonor.awareness", "感知服务", "killall com.hihonor.awareness || true"),
         // 特殊项：android（system_server）作用域改不了单个进程，只能整机重启。
         // pkg 用 __reboot__ 作哨兵，restartScopes 会单独识别并弹确认。
         ScopeTarget("__reboot__", "重启系统（system_server 生效）", "reboot")
@@ -114,7 +118,10 @@ class SettingsActivity : ComponentActivity() {
     /** 安全组件里的窗口/系统级钩子都在 system_server（作用域显示为 android）。 */
     private val S_SYSTEM = listOf("android")
     /** 反诈组件在 securityserver 进程。 */
-    private val S_NOFRAUD = listOf("com.hihonor.securityserver")
+    // v3.2.48：反诈现在要两个作用域 —— 反诈服务（securityserver）+ 感知服务（awareness）。
+    // 只列前者的话，界面会显示"作用域已生效"，但 awareness 那边根本没被注入，
+    // 反诈数据照样从感知服务流出去 —— 典型的假绿灯。
+    private val S_NOFRAUD = listOf("com.hihonor.securityserver", "com.hihonor.awareness")
 
     // switch write target shared with hooks via CfgProvider
     private fun prefs() = getSharedPreferences(Cfg.PREFS_FILE, MODE_PRIVATE)
@@ -139,6 +146,17 @@ class SettingsActivity : ComponentActivity() {
         mainHandler.postDelayed(shot, 2500L)
     }
 
+    override fun onDestroy() {
+        // v3.2.36：Activity 销毁后，postDelayed 排进主队列的 Runnable **仍持有 this**。
+        // 延迟任务体里只要碰一次 UI（recreate / 强制刷新那种），轻则泄漏一整个
+        // Activity，重则 NPE 闪退。mainHandler 是实例字段，清它不会影响别的 Activity。
+        try {
+            mainHandler.removeCallbacksAndMessages(null)
+        } catch (_: Throwable) {
+        }
+        super.onDestroy()
+    }
+
     private var resumeProbeShot: Runnable? = null
 
     private fun applyBinding(key: String, on: Boolean, restart: Boolean, onResult: ((Boolean) -> Unit)? = null) {
@@ -151,7 +169,8 @@ class SettingsActivity : ComponentActivity() {
         // The write needs root, so report the real outcome instead of a blind
         // "enabled" toast; if turning it OFF fails we also revert the pref so
         // the UI never claims "off" while the system layer is still bypassing.
-        // 「清理云端配置残留」不是常驻状态，点开就执行一次删除，然后自动关回去。
+        // v3.2.33：「清理云端配置残留」已改成独立按钮（见 SecurityPage 里的
+        // NavRow + ConfirmEnableDialog），不再走开关分支 —— 它代表"动作"而不是"状态"。
         // 降级安装的 system_server 侧同样读不到 provider，也要走属性。
         if (key == Cfg.K_DOWNGRADE) {
             syncDowngradeProp(on) { ok ->
@@ -179,19 +198,9 @@ class SettingsActivity : ComponentActivity() {
             }
             return
         }
-        if (key == Cfg.K_PURGECOTA) {
-            if (!on) {
-                onResult?.invoke(true)
-                return
-            }
-            purgeCotaConfigs { ok ->
-                // 无论成败都把开关复位 —— 它代表动作，不代表状态
-                prefs().edit().putBoolean(Cfg.K_PURGECOTA, false).commit()
-                notifyCfgChanged()
-                onResult?.invoke(ok)
-            }
-            return
-        }
+        // v3.2.33：「清理云端配置残留」已从开关改成独立按钮（SecurityPage 里
+        // 的 NavRow），不再经过这里 —— 它没有"开/关"两种状态，也没有 prefs 键
+        // 需要写。Cfg.K_PURGECOTA 常量保留只为兼容旧 prefs 与 provider 快照。
         if (key == Cfg.K_HOTTEMP) {
             Toast.makeText(this, "正在写入系统属性（ROOT）…", Toast.LENGTH_SHORT).show()
             syncHottempProp(on) { ok ->
@@ -764,6 +773,29 @@ class SettingsActivity : ComponentActivity() {
      *   · 每条命令都带 `2>/dev/null`，避免 SELinux 警告污染结果
      *   · 不删其他 10 类云控（contenttransfer / compliancecontrol 等，与本功能无关）
      */
+    /**
+     * 清理云控残留（v3.2.33 重写判定逻辑）。
+     *
+     * <p>原实现有三个问题，用户实测报"清理失败：su 没执行成功"就是因为它们：
+     *
+     * <ol>
+     *   <li><b>用 `ls` 的行数当文件数</b>：{@code startSu} 开了
+     *       {@code redirectErrorStream(true)}，`ls` 对不存在文件的报错会混进 stdout，
+     *       "3 个不存在"被数成"存在 3 个"。</li>
+     *   <li><b>用 su 的退出码当成功判据</b>：`rm -f` 的目标本来就不存在时，
+     *       退出码受 shell 解析影响，会给出 exit=1；文件根本不存在这件事
+     *       被误报成"su 没授权"。</li>
+     *   <li>提示语把"没东西可删"和"没权限"混为一谈，用户以为是 root 坏了。</li>
+     * </ol>
+     *
+     * <p>现在改成：用 {@code test -e} 逐个精确列出现存文件，删完**再数一遍**，
+     * 以"还剩几个"作为唯一判据。文件不存在 = 本来就没东西可清，直接说清楚。
+     *
+     * <p>注意：这三个路径来自 HAware 反编译（{@code /data/cota/para/cpuconfig} 等），
+     * 在 MagicOS 11 / Android 17 上实测**可能压根不会生成** —— 该版本的 cota 目录
+     * 是「一个策略一个子目录」的结构。所以"本来就不存在"是完全正常的状态，
+     * 不是失败。
+     */
     private fun purgeCotaConfigs(done: (Boolean) -> Unit) {
         Thread {
             val files = listOf(
@@ -771,40 +803,56 @@ class SettingsActivity : ComponentActivity() {
                 "/data/cota/para/pg_config",
                 "/data/cota/para/thermal_config"
             )
-            // 先数一下删之前有几个
-            val before = try {
-                val out = suReadOutput("ls " + files.joinToString(" ") + " 2>/dev/null", 6000L) ?: ""
-                out.split('\n').count { it.trim().isNotEmpty() }
-            } catch (_: Throwable) { -1 }
-            AppLog.d("purgecota", "清理前存在 " + before + " 个")
+            // 用 test -e 精确判定：不存在就什么都不输出，绝不会像 ls 那样
+            // 把报错行也吐到同一个流里。
+            val probe = "for f in " + files.joinToString(" ") +
+                    "; do [ -e \"\$f\" ] && echo \"\$f\"; done"
+            fun existing(): List<String> =
+                (suReadOutput(probe, 6000L) ?: "")
+                    .lineSequence()
+                    .map { it.trim() }
+                    .filter { it.startsWith("/data/cota/") }
+                    .toList()
 
-            if (before == 0) {
+            val before = try { existing() } catch (_: Throwable) { emptyList() }
+            AppLog.d("purgecota", "清理前存在 " + before.size + " 个 " + before)
+
+            if (before.isEmpty()) {
                 runOnUiThread {
-                    Toast.makeText(this, "云端配置本来就不存在，无需清理", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this,
+                        "云端配置本来就不存在，无需清理。\n" +
+                        "（这台系统的 cota 目录是「一个策略一个子目录」结构，" +
+                        "这三个旧版路径通常不会生成 —— 不是清理失败）",
+                        Toast.LENGTH_LONG).show()
                 }
-                done(false)
+                done(true)   // 没有残留 = 目标达成，不算失败
                 return@Thread
             }
 
-            val ok = suExec("rm -f " + files.joinToString(" ") + " 2>/dev/null")
-            val after = try {
-                val out = suReadOutput("ls " + files.joinToString(" ") + " 2>/dev/null", 6000L) ?: ""
-                out.split('\n').count { it.trim().isNotEmpty() }
-            } catch (_: Throwable) { -1 }
-            AppLog.d("purgecota", "清理后剩 " + after + " 个 (su=" + ok + ")")
+            // 删的时候不带任何重定向：真出错时错误文本会被 startSu 的
+            // redirectErrorStream 收进来，便于排查
+            suExecTimeout("rm -f " + before.joinToString(" "), 8000L)
+
+            val after = try { existing() } catch (_: Throwable) { before }
+            AppLog.d("purgecota", "清理后剩 " + after.size + " 个 " + after)
 
             runOnUiThread {
                 when {
-                    !ok -> Toast.makeText(this,
-                        "清理失败：su 没执行成功（检查 KernelSU/Magisk 授权）", Toast.LENGTH_LONG).show()
-                    after == 0 -> Toast.makeText(this,
-                        "已清理 " + before + " 个云端配置文件。\n请立即重启手机，让 PowerGenie 回到内置默认策略。",
+                    after.isEmpty() -> Toast.makeText(this,
+                        "已清理 " + before.size + " 个云端配置文件。\n" +
+                        "请立即重启手机，让 PowerGenie 回到内置默认策略。",
+                        Toast.LENGTH_LONG).show()
+                    after.size < before.size -> Toast.makeText(this,
+                        "部分清理：已删 " + (before.size - after.size) +
+                        " 个，还剩 " + after.size + " 个（可能被系统占用，重启后再试）",
                         Toast.LENGTH_LONG).show()
                     else -> Toast.makeText(this,
-                        "部分清理：还剩 " + after + " 个（可能被系统占用）", Toast.LENGTH_LONG).show()
+                        "没删掉（还剩 " + after.size + " 个）：这些文件被系统占用或只读。\n" +
+                        "可用 root 终端手动执行：\nrm -f " + after.joinToString(" "),
+                        Toast.LENGTH_LONG).show()
                 }
             }
-            done(ok)
+            done(after.isEmpty())
         }.apply { name = "has-purge-cota" }.start()
     }
 
@@ -1118,7 +1166,7 @@ class SettingsActivity : ComponentActivity() {
             item { ActionCard("系统综合", "通知音量、高温限制与系统级行为的总开关集合") { go(Page.Misc) } }
             item { ActionCard("安全组件", "允许截屏 / 录屏、屏蔽云控下发、屏蔽反诈组件") { go(Page.Security) } }
             item {
-                ActionCard("重启作用域（需ROOT）", "可多选一次重启：系统界面 / 相册 / 安装器 / 桌面 / 温控服务") { requestRootThenPickScope() }
+                ActionCard("重启作用域（需ROOT）", "可多选一次重启：系统界面 / 相册 / 安装器 / 桌面 / 温控服务 / 反诈服务 / 感知服务") { requestRootThenPickScope() }
             }
         }
     }
@@ -1175,6 +1223,7 @@ class SettingsActivity : ComponentActivity() {
         "com.hihonor.desktop.systemui" -> "桌面模式"
         "com.hihonor.powergenie" -> "PowerGenie"
         "com.hihonor.iaware" -> "温控服务"
+        "com.hihonor.awareness" -> "感知服务"
         "android" -> "系统框架"
         else -> pkg
     }
@@ -1700,11 +1749,78 @@ class SettingsActivity : ComponentActivity() {
      */
     @Composable
     private fun SecurityPage(back: () -> Unit) {
+        // v3.2.33：清理云控已从「开关」改成「按钮」。
+        // 它本来就不是状态（点一次执行一次），做成开关会让用户误以为
+        // "开着就一直生效"，关着就以为没清理过。用局部状态控制确认框即可。
+        var showPurge by remember { mutableStateOf(false) }
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp),
             contentPadding = PaddingValues(top = 8.dp, bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item { BackHeader("安全组件", back) }
             item { TipText("下面每一项都会让系统变得更「不设防」。默认全部关闭，开启前会二次确认，请确认你理解它的后果。") }
+            // v3.2.47：三张独立卡片，顺序按用户要求：反诈 → 云控+清理 → 截屏。
+            // 清理**不能**单独成卡 —— 它和云控是同一件事的两半，拆开看不出因果关系。
+            item {
+                SwitchCard(listOf(
+                    SwRow("屏蔽反诈组件采集与上报",
+                        "同时作用于两个进程：**securityserver**（反诈服务）和 **awareness**（感知服务）。"
+                                + "securityserver 侧不注册检测观察者、开关一律返回关闭、云控校验不通过；"
+                                + "awareness 侧诈骗行为事件写不进存储层、连不上感知服务。"
+                                + "两边都拿不到数据，自然谈不上上报。",
+                        Cfg.K_NOFRAUD, true, false, confirmOnEnable = true, scopes = S_NOFRAUD,
+                        confirmTitle = "屏蔽反诈组件采集与上报",
+                        confirmLines = listOf(
+                            "反诈检测不再注册观察者（检测不启动）",
+                            "不再注册感知围栏：短信、剪贴板、扫码支付、位置、指纹、账号、安装/卸载、常用应用、通知等",
+                            "云控安全校验一律返回不通过",
+                            "感知服务（awareness）的诈骗行为事件写入被拦截",
+                            "作用域：securityserver（反诈服务）+ awareness（感知服务）",
+                            "",
+                            "不受影响：查找手机、云备份、本地人脸、指纹、密钥、账号同步",
+                            "会失灵：统一认证的环境判断（异地登录这类）"
+                        ),
+                        confirmNote = "两个作用域都要勾选。改完用「重启作用域」一次重启即可，那里也会重启感知服务。")
+                ))
+            }
+            item {
+                SwitchCard(
+                    rows = listOf(
+                    SwRow("屏蔽性能 / 温控策略云控下发",
+                        "云端把性能/温控策略写进 /data/cota/para/ 之后，PowerGenie 既不收重载通知，"
+                                + "也读不到那几个文件（对它们的存在性判断和打开操作一律按「不存在」处理），"
+                                + "只会用自己出厂内置的策略。和「屏蔽高温限制」互补：那个管设备已经热了别降频，"
+                                + "这个管别再推新策略。",
+                        Cfg.K_NOCLOUD, true, false, confirmOnEnable = true, scopes = S_THERMAL,
+                        confirmTitle = "屏蔽性能 / 温控策略云控下发",
+                        confirmLines = listOf(
+                            "三个下发通知（CpuCfg / PgConfig / ThermalCfgCotaUpdateReceiver）全拦下，不会触发热重载",
+                            "cpuconfig / pg_config / thermal_config 这三份配置，PowerGenie 一律看不到",
+                            "进程启动时读 /data/cota/para/ 的旧配置同样被挡",
+                            "只影响 PowerGenie / iaware；无障碍、权限、胶囊等其它 cota 配置不受影响"
+                        ),
+                        confirmNote = "文件本身可能仍会被写下来（写入方是别的进程，拦不到），但 PowerGenie 读不到 —— 效果等同于没下发。想彻底清干净，用下面的「清理云端配置残留（ROOT）」。")
+                    ),
+                    trailing = {
+                    Row(
+                        Modifier.fillMaxWidth().clickable { showPurge = true }.padding(18.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("清理云端配置残留（ROOT）", fontSize = 16.sp,
+                                color = MiuixTheme.colorScheme.onSurface)
+                            Spacer(Modifier.height(3.dp))
+                            Text("删除 /data/cota/para/ 下三份性能相关云控配置"
+                                    + "（cpuconfig / pg_config / thermal_config），让 PowerGenie "
+                                    + "回到内置默认策略。点一下执行一次，需要 ROOT。",
+                                fontSize = 12.5.sp,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Text("清理", fontSize = 14.sp, color = MiuixTheme.colorScheme.primary)
+                    }
+                    }
+                )
+            }
             item {
                 SwitchCard(listOf(
                     SwRow("允许截屏 / 录屏（ROOT）",
@@ -1739,58 +1855,35 @@ class SettingsActivity : ComponentActivity() {
                             "· 如果 su 授权失败，开关会自动拨回关闭状态"
                         ),
                         confirmNote = "首次开启会弹出 su 授权请求，请点「允许」。"),
-                    SwRow("屏蔽性能 / 温控策略云控下发",
-                        "系统收到云端下发的温控策略包后，不再让它落地（ThermalCfgCotaUpdateReceiver 被拦）。"
-                                + "本地策略保持出厂状态，不会被云端推着走。和「屏蔽高温限制」互补：那个管设备已经热了别降频，这个管别再推新策略。",
-                        Cfg.K_NOCLOUD, true, false, confirmOnEnable = true, scopes = S_THERMAL,
-                        confirmTitle = "屏蔽性能 / 温控策略云控下发",
-                        confirmLines = listOf(
-                            "云端下发的 CPU 配置（cpuconfig）不再落地",
-                            "云端下发的 PowerGenie 通用配置（pg_config）不再落地",
-                            "云端下发的温控配置（thermal_config）不再落地",
-                            "进程启动时也不会再去读 /data/cota/para/ 下的旧配置"
-                        ),
-                        confirmNote = "和「屏蔽高温限制」互补：那个管设备已经热了别降频，这个管云端别再推新策略。"),
-                    SwRow("清理云端配置残留",
-                        "删除 /data/cota/para/ 下三份**性能相关**云端配置（cpuconfig / pg_config / thermal_config）。"
-                                + "这是**一次性动作**，执行完会自动关回去。需要 ROOT。",
-                        // 不传 scopes：这个开关只是 app 内执行一次 su rm，
-                        // 跟 systemui / system_server 的作用域没有半点关系。
-                        // 传 S_SYSTEM 会让它错误地显示"系统作用域失效"。
-                        Cfg.K_PURGECOTA, false, false, confirmOnEnable = true,
-                        confirmTitle = "⚠ 清理云端配置残留（危险操作）",
-                        confirmLines = listOf(
-                            "将要删除这三个文件（不可撤销）：",
-                            "  /data/cota/para/cpuconfig      ← CPU 频率/核数策略",
-                            "  /data/cota/para/pg_config      ← PowerGenie 通用策略",
-                            "  /data/cota/para/thermal_config ← 温控策略",
-                            "",
-                            "删除后无法恢复。如果这些文件正被系统使用，",
-                            "可能出现功耗/温控策略异常（异常发热、耗电变快或降温变慢）。",
-                            "",
-                            "执行完请立即重启手机，让 PowerGenie 回到内置默认策略。",
-                            "",
-                            "⚠ 绝大多数设备上这三个文件**根本不存在**，",
-                            "不需要点这个开关。只有你确认出现过「云端下发把温控改了」",
-                            "的情况才需要清理。"
-                        ),
-                        confirmNote = "需要 ROOT。执行结果会在通知里告诉你删了几个文件。"),
-                    SwRow("屏蔽反诈组件采集与上报",
-                        "主体是系统的 securityserver（uid=system）。拦在**采集**环节而不是发送环节："
-                                + "不注册检测观察者、开关一律返回关闭、云控校验不通过 —— 数据压根不会被收集，自然也谈不上上传。"
-                                + "⚠ 发送通道（HiView/HwDdmp）是全系统共用的，不去动它，否则崩溃上报和系统诊断会一起挂掉。",
-                        Cfg.K_NOFRAUD, true, false, confirmOnEnable = true, scopes = S_NOFRAUD,
-                        confirmTitle = "屏蔽反诈组件采集与上报",
-                        confirmLines = listOf(
-                            "反诈检测不再注册观察者（检测不启动）",
-                            "不再注册感知围栏：短信、剪贴板、扫码支付、位置、指纹、账号、安装/卸载、常用应用、通知等",
-                            "云控安全校验一律返回不通过",
-                            "上述拦截**只作用于 securityserver 进程**，YOYO / 情景智能自己的感知能力不受影响"
-                        ),
-                        confirmNote = "拦在采集环节而不是发送环节 —— 发送通道（HiView/HwDdmp）是全系统共用的，动它会连崩溃上报一起挂掉。")
                 ))
             }
             item { Footnote("改完重启「系统界面」生效（这个钩子在 system_server 里，作用域要勾「android」/显示为「系统」）。") }
+        }
+
+        if (showPurge) {
+            ConfirmEnableDialog(
+                title = "⚠ 清理云端配置残留（危险操作）",
+                lines = listOf(
+                    "将要删除这三个文件（不可撤销）：",
+                    "  /data/cota/para/cpuconfig      ← CPU 频率/核数策略",
+                    "  /data/cota/para/pg_config      ← PowerGenie 通用策略",
+                    "  /data/cota/para/thermal_config ← 温控策略",
+                    "",
+                    "删除后无法恢复。如果这些文件正被系统使用，",
+                    "可能出现功耗/温控策略异常（异常发热、耗电变快或降温变慢）。",
+                    "",
+                    "执行完请立即重启手机，让 PowerGenie 回到内置默认策略。",
+                    "",
+                    "⚠ 绝大多数设备上这三个文件**本来就不存在** —— 那说明云端",
+                    "从未给这台机器下发过性能配置，属于正常状态，不是清理失败。"
+                ),
+                note = "需要 ROOT。点「清理」后立即执行一次，不会留下任何状态。",
+                onConfirm = {
+                    showPurge = false
+                    purgeCotaConfigs { /* 结果由 purgeCotaConfigs 内部 Toast 提示 */ }
+                },
+                onDismiss = { showPurge = false }
+            )
         }
     }
 
@@ -2047,13 +2140,20 @@ class SettingsActivity : ComponentActivity() {
     @Composable
     private fun InfoDot(tip: String) {
         var open by remember { mutableStateOf(false) }
+        // v3.2.36：触控区 17dp → **48dp**（Android 无障碍标准的最小触控尺寸）。
+        // 原来视觉和触控都是 17dp，手指很难点中；现在外层 48dp 只负责接收点击
+        // （无背景、无涟漪），内层 17dp 才是那个小圆点，视觉不变。
         Box(
-            Modifier.size(17.dp).clip(CircleShape)
-                .background(MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.20f))
-                .clickable { open = true },
+            Modifier.size(48.dp).clickable { open = true },
             contentAlignment = Alignment.Center
         ) {
-            Text("!", fontSize = 11.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            Box(
+                Modifier.size(17.dp).clip(CircleShape)
+                    .background(MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.20f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("!", fontSize = 11.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            }
         }
         if (open) {
             Dialog(onDismissRequest = { open = false }) {
@@ -2127,7 +2227,14 @@ class SettingsActivity : ComponentActivity() {
     )
 
     @Composable
-    private fun SwitchCard(rows: List<SwRow>, onAfterChange: (() -> Unit)? = null) {
+    private fun SwitchCard(
+        rows: List<SwRow>,
+        onAfterChange: (() -> Unit)? = null,
+        // v3.2.47：卡片尾部追加一块自定义内容（不是开关，而是一个动作行）。
+        // 用在「云控下发」那张卡：清理动作必须和它连在一起，不能被拆成两张卡片 ——
+        // 拆开会让用户以为它们是两件不相干的事。
+        trailing: (@Composable () -> Unit)? = null
+    ) {
         val ctx = LocalContext.current
         // shared state map so toggling one switch instantly reflects on the
         // other rows' UI (a per-row remember would go stale because writing
@@ -2158,6 +2265,14 @@ class SettingsActivity : ComponentActivity() {
                     Box(Modifier.fillMaxWidth().padding(start = 18.dp).height(1.dp)
                         .background(MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.08f)))
                 }
+            }
+            if (trailing != null) {
+                // 有开关行时先画分隔线；只有 trailing 的卡片不画
+                if (rows.isNotEmpty()) {
+                    Box(Modifier.fillMaxWidth().padding(start = 18.dp).height(1.dp)
+                        .background(MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.08f)))
+                }
+                trailing()
             }
         }
         confirmRow?.let { r ->
@@ -2281,6 +2396,13 @@ class SettingsActivity : ComponentActivity() {
         }
         val miss = st.missing(required)
         if (miss.isNotEmpty()) {
+            // v3.2.37：把「从没上报过」和「上报过但记录超过 3 天」分开说。
+            // 后者很可能只是很久没重启进程，不是模块坏了 —— 之前一律显示
+            // "作用域未生效"，用户会以为要重新配置，白折腾。
+            if (miss.all { st.expired(it) }) {
+                val names = miss.joinToString("、") { scopeLabel(it) }
+                return "作用域状态：${names} 的记录已超过 3 天未刷新（重启作用域即可更新，不一定是故障）" to true
+            }
             val names = miss.joinToString("、") { scopeLabel(it) + "(" + it + ")" }
             return "作用域状态：${names} 作用域未生效（勾选并重启作用域生效）" to false
         }
