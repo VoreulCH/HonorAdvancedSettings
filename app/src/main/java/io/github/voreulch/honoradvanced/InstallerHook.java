@@ -42,6 +42,14 @@ public final class InstallerHook {
     private static final String TAG = "[HAS-Purify] ";
     private static String sApk;
     private static boolean purifyOn() {
+        // v3.2.29：重启作用域后第一次安装会漏拦 —— installer 进程刚起，
+        // Cfg 快照还没从 provider 回来，而 K_PURIFY 是 opt-in（未就绪 = 关），
+        // 于是这一单的广告、推荐卡片全部放行。安装是用户主动触发的操作，
+        // 等 1.2 秒完全无感（系统本来就要解析 APK），但漏拦一次用户会记很久。
+        // 只在这一条线上等；玻璃线千万别照抄，那边是渲染线程。
+        if (!Cfg.ready()) {
+            Cfg.awaitReady(1200L);
+        }
         return Cfg.isOn(Cfg.K_PURIFY);
     }
 
@@ -91,6 +99,9 @@ public final class InstallerHook {
         hookSafeModeBannerCompatV2(cl);
         hookSafeModeCardInfoCompatV2(cl);
         hookAdRecommendCompatV2(cl);
+        // v3.2.29：推荐应用卡片走的是 PackageInstallerActivity.f(AssemblyVO)，
+        // 和上面的广告 presenter 完全无关 —— 两条都要堵。
+        hookWelfareRecommend(cl);
         hookStagingFastPathCompatV2(cl);
     }
 
@@ -1403,6 +1414,65 @@ public final class InstallerHook {
             Diag.log("[adapt] ad hooked: " + adSinks + " entry(ies)");
         } catch (Throwable t) {
             Diag.log("ad adaptive hook failed: " + t);
+        }
+    }
+
+    /**
+     * 「推荐应用」按钮（权益 / 福利推荐）—— 和广告 presenter **不是同一条链路**（v3.2.29）。
+     *
+     * <p>39.301 的真实入口：
+     * <pre>
+     *   PackageInstallerActivity.f(AssemblyVO)      // 实现接口 km1
+     *     -> this.q0 (PermissionAdapter).notifyItemInserted(2)
+     * </pre>
+     * 推荐卡片是**直接插进权限列表第 2 项**的，完全不经过
+     * {@code AbstractAdBusinessPresenter}。
+     *
+     * <p>上一版按"广告数据类型"批量拦截，匹配的是 {@code entity.resp.Ad*} /
+     * {@code rbi.Rbi*}；这里的数据类型叫 {@code AssemblyVO} —— 名字里既没有
+     * "Ad" 也没有 "Rbi"，所以那几个入口一个都没命中。这就是"推荐应用还在"的原因。
+     *
+     * <p>关于「重启作用域第一次安装必现、平时偶现」：这个方法只要有推荐数据就会
+     * 被回调，和拦截时机无关。偶现是因为云端不是每次都下发推荐位；第一次特别容易
+     * 撞上，是因为新装流程必然走权限页。
+     *
+     * <p>拦法：返回 void，直接 {@code setResult(null)} 跳过整个方法体 —— 卡片不会
+     * 被插入，安装流程也不受影响（调用方是接口回调，不读返回值）。
+     */
+    private static void hookWelfareRecommend(ClassLoader cl) {
+        try {
+            Class<?> act = cl.loadClass("com.android.packageinstaller.PackageInstallerActivity");
+            int n = 0;
+            for (Method mm : act.getDeclaredMethods()) {
+                Class<?>[] ps = mm.getParameterTypes();
+                if (ps.length != 1) {
+                    continue;
+                }
+                // 精确类名：不同版本包名不变（实体类不会被混淆），比按方法名可靠
+                if (!"com.hihonor.packageinstaller.entity.resp.AssemblyVO"
+                        .equals(ps[0].getName())) {
+                    continue;
+                }
+                if (mm.getReturnType() != void.class) {
+                    continue;
+                }
+                XposedBridge.hookMethod(mm, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (!defaultPurify()) return;
+                        param.setResult(null);
+                        Diag.log("[adapt] welfare-recommend blocked (AssemblyVO)");
+                    }
+                });
+                n++;
+                Diag.log("[adapt] welfare-recommend hooked: " + mm.getName());
+            }
+            if (n == 0) {
+                // 老版本（14.0.22.x 之前）没有这个推荐位，这里命中 0 是正常的
+                Diag.log("[adapt] welfare-recommend absent on this build, skip");
+            }
+        } catch (Throwable t) {
+            Diag.log("welfare-recommend hook failed: " + t);
         }
     }
 
