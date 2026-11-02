@@ -57,10 +57,20 @@ public final class Cfg {
     public static final String K_NOCLOUD = "nocloud";     // 屏蔽性能/温控策略的云控下发
     public static final String K_NOFRAUD = "nofraud";     // 屏蔽反诈组件的数据采集与上报
     /**
-     * 清理云端配置残留（一次性操作，不是常驻开关）。
+     * 清理云端配置残留（v3.2.0 引入，v3.2.33 起**不再是开关**）。
      *
-     * 删除 /data/cota/para/ 下三份性能相关配置（cpuconfig / pg_config / thermal_config）。
-     * 需要 ROOT。执行完 UI 会自动把它关回去 —— 它代表"动作"而不是"状态"。
+     * <p>删除 /data/cota/para/ 下三份性能相关配置（cpuconfig / pg_config / thermal_config）。
+     * 需要 ROOT。
+     *
+     * <p><b>⚠ 这个常量现在只是一个占位键</b>：
+     * <ul>
+     *   <li>界面上它已经从开关改成独立按钮（点击 → 确认框 → 执行一次 su rm），
+     *       不会读写这个 prefs 键</li>
+     *   <li>保留常量只是为了两件事：① 旧版 prefs 里可能残留这个键，KEYS 里留着
+     *       才不会在迁移时被当成孤儿删掉；② provider 快照的键集合保持稳定，
+     *       老版本 hook 读到它也不会出错</li>
+     * </ul>
+     * 任何新代码都不应该再调 {@code isOn(K_PURGECOTA)} 做门控 —— 它现在恒为 false。
      */
     public static final String K_PURGECOTA = "purgecota";
 
@@ -83,6 +93,8 @@ public final class Cfg {
             "com.hihonor.powergenie",
             "com.hihonor.iaware",
             "com.hihonor.securityserver",
+            // v3.2.42：感知服务本体（自己就有反诈逻辑和独立上报通道）
+            "com.hihonor.awareness",
             "android",
     };
 
@@ -770,6 +782,14 @@ public final class Cfg {
             // startPreload 没跑过，等多久都不会有结果 —— 直接返回，别白等。
             return false;
         }
+        // ⚠ 每个进程只真正等一次。provider 不可达时（system_server 属预期，
+        // 普通进程则是环境异常），如果没有这个标记，每一次 hook 回调都会
+        // 等满 ms —— 安装器会在一单安装里被拖出几十次 1200ms，直接卡死。
+        // 第一次等过之后一律立刻返回当前状态。
+        if (sAwaited) {
+            return false;
+        }
+        sAwaited = true;
         try {
             return sReadyLatch.await(ms, java.util.concurrent.TimeUnit.MILLISECONDS)
                     && sSnapshot != null;
@@ -780,6 +800,9 @@ public final class Cfg {
             return false;
         }
     }
+
+    /** awaitReady 是否已经等过一次（避免重复阻塞）。 */
+    private static volatile boolean sAwaited = false;
 
     /** 快照第一次可用的信号。只 countDown 一次，进程内不复位。 */
     private static final java.util.concurrent.CountDownLatch sReadyLatch =
@@ -875,17 +898,41 @@ public final class Cfg {
             @Override
             public void run() {
                 // early phase: app/binder may not be up yet — retry briefly
-                for (int i = 0; i < 30; i++) {
+                //
+                // v3.2.30：**不能只重试 15 秒**。真机实测（11-02 12:24）：
+                // 开机时用户还没解锁，模块 App 装在 CE 存储里**根本起不来**，
+                // provider 查询返回 "Unknown URL"；15 秒一到放弃之后，整个开机
+                // 周期都不会再试 —— 于是缓存永远写不上，下次开机还是失效。
+                //
+                // 现在的节奏：
+                //   0~15s   每 500ms   （覆盖正常开机；此时多半还没解锁）
+                //   15~60s  每 2s      （用户开始解锁，模块 App 变得可启动）
+                //   60s 后  每 10s     （兜底，最长到 5 分钟）
+                // 只要成功一次就会写缓存，下一次开机首帧就有正确配置。
+                long startAt = android.os.SystemClock.elapsedRealtime();
+                while (true) {
                     // 顺序不能反：先填本地副本，再查 provider。
                     // 首次 query 会触发模块 app 冷启动，能阻塞好几秒；如果等它
                     // 返回再填缓存，SystemUI 早把锁屏和材质渲染完了，等于没救。
-                    // fillFromCache 内部用 sCacheTried 挡住重复读盘，这里调 30 次
-                    // 实际只读一次。
                     fillFromCache();
                     if (loadOnce()) {
                         break;
                     }
-                    if (!sleep(500L)) {
+                    long elapsed = android.os.SystemClock.elapsedRealtime() - startAt;
+                    long wait;
+                    if (elapsed < 15000L) {
+                        wait = 500L;
+                    } else if (elapsed < 60000L) {
+                        wait = 2000L;
+                    } else {
+                        wait = 10000L;
+                    }
+                    if (elapsed > 300000L) {
+                        Diag.warn("Cfg preload gave up after 5min; "
+                                + "provider 始终不可达（缓存若已存在则功能不受影响）");
+                        break;
+                    }
+                    if (!sleep(wait)) {
                         return;
                     }
                 }
@@ -1070,23 +1117,123 @@ public final class Cfg {
     private static volatile boolean sSnapshotFromCache = false;
 
     /**
-     * 用本地副本填 sSnapshot。拿不到 Context / 文件不存在 / 格式不符都静默返回 ——
+     * 当前进程名，直接读 {@code /proc/self/cmdline}，**不依赖 Context**。
+     *
+     * <p>为什么不能用 {@link #apiContext()}：
+     * <ul>
+     *   <li>{@code AndroidAppHelper.currentApplication()} 在本回调时刻返回 null ——
+     *       Xposed 的 handleLoadPackage 发生在 {@code handleBindApplication} 里
+     *       {@code makeApplication()} **之前**，Application 还没实例化</li>
+     *   <li>{@code ActivityThread.getSystemContext()} 对**普通 app 进程**同样返回 null
+     *       —— {@code mSystemContext} 只在 {@code systemMain()} 里赋值，app 进程走的是
+     *       {@code attach(false, ...)} 那条分支，这个字段从未被写过（apiContext 的注释
+     *       「系统进程一定有」说的就是这件事）</li>
+     * </ul>
+     * 而开机读缓存**必须**在 handleLoadPackage 里同步完成，等 Context 可用时
+     * SystemUI 早就把锁屏渲染完了。所以这里绕开 Context，用进程名拼路径。
+     *
+     * <p>子进程（{@code pkg:remote}）的数据目录和主进程是同一个，冒号后缀要去掉。
+     */
+    private static String selfProcessName() {
+        java.io.FileInputStream in = null;
+        try {
+            in = new java.io.FileInputStream("/proc/self/cmdline");
+            byte[] buf = new byte[256];
+            int n = in.read(buf);
+            if (n <= 0) {
+                return null;
+            }
+            int end = 0;
+            while (end < n && buf[end] != 0) {
+                end++;
+            }
+            if (end <= 0) {
+                return null;
+            }
+            String name = new String(buf, 0, end, "UTF-8").trim();
+            int colon = name.indexOf(':');
+            if (colon > 0) {
+                name = name.substring(0, colon);
+            }
+            return name.length() == 0 ? null : name;
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (in != null) {
+                try {
+                    in.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    /** 缓存文件句柄；{@code create=true} 时顺带建目录。拿不到返回 null。 */
+    private static java.io.File cacheFile(boolean create) {
+        String pkg = selfProcessName();
+        if (pkg == null) {
+            return null;
+        }
+        // DE（device-encrypted）优先：**直接开机到解锁前这个阶段也能读**。
+        // 玻璃最要命的就是锁屏首帧，那时用户还没解锁，CE 存储根本不可用。
+        java.io.File de = cacheFileIn("/data/user_de/0/" + pkg + "/files", create);
+        // 兜底：CE 目录（/data/data 是指向 /data/user/0 的软链）
+        java.io.File ce = cacheFileIn("/data/data/" + pkg + "/files", create);
+        if (!create) {
+            // 读：**必须按"文件存在"来选，不能只看目录存在** ——
+            // DE 目录可能建得出来但缓存实际写在 CE（或反过来），
+            // 按目录选会直接读空，然后 sCacheTried 一设就再也不试了。
+            if (de != null && de.exists()) {
+                return de;
+            }
+            if (ce != null && ce.exists()) {
+                return ce;
+            }
+            return null;
+        }
+        // 写：DE 能写就写 DE（它解锁前可读），否则退回 CE
+        return de != null ? de : ce;
+    }
+
+    private static java.io.File cacheFileIn(String base, boolean create) {
+        try {
+            java.io.File dir = new java.io.File(base);
+            if (!dir.isDirectory()) {
+                if (!create) {
+                    return null;
+                }
+                dir.mkdirs();
+            }
+            if (!dir.isDirectory()) {
+                return null;
+            }
+            if (create && !dir.canWrite()) {
+                // 目录在但不可写（SELinux / 配额）：写的时候直接放弃这个候选，
+                // 读的时候无所谓 —— 读不需要写权限。
+                return null;
+            }
+            return new java.io.File(dir, CACHE_FILE);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * 用本地副本填 sSnapshot。拿不到路径 / 文件不存在 / 格式不符都静默返回 ——
      * 这只是兜底，失败不影响原有重试流程。
      */
     private static void fillFromCache() {
         if (sCacheTried || sSnapshot != null) {
             return;
         }
-        Context ctx = apiContext();
-        if (ctx == null) {
-            // 还拿不到 Context（进程刚起）：**不设** sCacheTried，
-            // 留给 preload 线程后面几轮再试。
+        java.io.File f = cacheFile(false);
+        if (f == null) {
+            // 连进程名都拿不到（极早期）：**不设** sCacheTried，留给后面几轮再试
             return;
         }
         sCacheTried = true;
         java.io.BufferedReader r = null;
         try {
-            java.io.File f = new java.io.File(ctx.getFilesDir(), CACHE_FILE);
             if (!f.exists() || f.length() <= 0L) {
                 return;
             }
@@ -1140,15 +1287,14 @@ public final class Cfg {
         if (m == null || m.isEmpty()) {
             return;
         }
-        Context ctx = apiContext();
-        if (ctx == null) {
+        java.io.File dst = cacheFile(true);
+        if (dst == null) {
+            Diag.note("Cfg cache: 拿不到可写目录，缓存未落盘（下次开机仍走重试）");
             return;
         }
         java.io.File tmp = null;
         java.io.FileOutputStream fos = null;
         try {
-            java.io.File dir = ctx.getFilesDir();
-            tmp = new java.io.File(dir, CACHE_FILE + ".tmp");
             StringBuilder sb = new StringBuilder(4096);
             sb.append(CACHE_VER).append('\n');
             for (Map.Entry<String, int[]> e : m.entrySet()) {
@@ -1157,22 +1303,36 @@ public final class Cfg {
                 }
                 sb.append(e.getKey()).append('=').append(e.getValue()[0]).append('\n');
             }
+            byte[] body = sb.toString().getBytes("UTF-8");
+            tmp = new java.io.File(dst.getParentFile(), CACHE_FILE + ".tmp");
             fos = new java.io.FileOutputStream(tmp);
-            fos.write(sb.toString().getBytes("UTF-8"));
+            fos.write(body);
             fos.flush();
             fos.getFD().sync();
             fos.close();
             fos = null;
             // 先写 .tmp 再 rename：直接覆写会在开机中途断电时留下半截文件，
             // 下次开机读到的就是残缺配置（比没有更糟）。
-            java.io.File dst = new java.io.File(dir, CACHE_FILE);
             if (!tmp.renameTo(dst)) {
                 if (!(dst.exists() && dst.delete() && tmp.renameTo(dst))) {
-                    Diag.warn("Cfg cache write: rename failed");
+                    Diag.note("Cfg cache write: rename failed (" + dst.getPath() + ")");
+                    return;
                 }
             }
+            // 校验：写出去了但读不回来（权限/SELinux/配额）等于没写。
+            // 这条日志是真机排查「为什么开机还是失效」的第一现场。
+            if (dst.length() == body.length) {
+                if (!sCacheWrote) {
+                    sCacheWrote = true;
+                    Diag.note("Cfg cache written: " + m.size() + " 项 / "
+                            + body.length + " B -> " + dst.getPath());
+                }
+            } else {
+                Diag.note("Cfg cache write: 长度不符 (expect " + body.length
+                        + ", got " + dst.length() + ")");
+            }
         } catch (Throwable t) {
-            Diag.warn("Cfg cache write failed: " + t.getClass().getSimpleName());
+            Diag.note("Cfg cache write failed: " + t.getClass().getSimpleName());
         } finally {
             if (fos != null) {
                 try {
@@ -1188,6 +1348,9 @@ public final class Cfg {
             }
         }
     }
+
+    /** 只在第一次写成功时打一条日志，避免观察者刷新时刷屏。 */
+    private static boolean sCacheWrote = false;
 
     private static boolean loadOnce() {
         Context ctx = apiContext();
