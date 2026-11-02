@@ -702,7 +702,8 @@ public final class Cfg {
      *  for glass scopes / observer-refreshed for installer scopes.
      *  Values are stored as int: switches use 0/1, DIY sliders use 0-100. */
     private static volatile Map<String, int[]> sSnapshot = null;
-    private static boolean sStarted = false;
+    /** volatile：awaitReady 在别的线程读它判断"到底有没有启动过预加载"。 */
+    private static volatile boolean sStarted = false;
 
     private Cfg() {
     }
@@ -746,6 +747,52 @@ public final class Cfg {
     /** 快照是否已从 provider 落地。未落地时 hook 只能用 baked 默认值。 */
     public static boolean ready() {
         return sSnapshot != null;
+    }
+
+    /**
+     * 等快照落地，最多 {@code ms} 毫秒（v3.2.29）。
+     *
+     * <p>给**用户主动触发**的路径用：安装器净化。重启作用域后第一次安装时，
+     * installer 进程刚起、provider 可能还没回来，而 {@code isOn(K_PURIFY)} 在
+     * 未就绪时返回 false —— 结果是这一单的广告全放行。用户点完"安装"本来就要
+     * 等系统解析 APK，多等几百毫秒无感，比漏拦强。
+     *
+     * <p><b>绝对不要</b>在玻璃线（systemui / launcher / photos）里调它：那些
+     * 回调在渲染线程上，阻塞会直接卡首帧，而且玻璃线有本地缓存兜底，不需要等。
+     *
+     * <p>返回 true = 快照可用；false = 超时或本进程压根没启动预加载。
+     */
+    public static boolean awaitReady(long ms) {
+        if (sSnapshot != null) {
+            return true;
+        }
+        if (!sStarted) {
+            // startPreload 没跑过，等多久都不会有结果 —— 直接返回，别白等。
+            return false;
+        }
+        try {
+            return sReadyLatch.await(ms, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    && sSnapshot != null;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 快照第一次可用的信号。只 countDown 一次，进程内不复位。 */
+    private static final java.util.concurrent.CountDownLatch sReadyLatch =
+            new java.util.concurrent.CountDownLatch(1);
+
+    /** 快照已落地（provider 或本地缓存任一路径）时放行所有等待者。 */
+    private static void markReady() {
+        try {
+            if (sReadyLatch.getCount() > 0L) {
+                sReadyLatch.countDown();
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     /** hook side: pure memory read — no locks, no binder, no blocking. */
@@ -815,11 +862,26 @@ public final class Cfg {
             return;
         }
         sStarted = true;
+        // v3.2.28：**同步**读本地副本，必须在起线程之前。
+        // 线程里第一次 loadOnce() 会 query provider，而 provider 属于模块 app ——
+        // 开机时那是一次冷启动，query 能阻塞好几秒。等它返回再填缓存，SystemUI
+        // 早就把锁屏和材质渲染完了，等于没救。
+        // 这里是纯文件 IO（几百字节，<5ms），放在 handleLoadPackage 里可接受。
+        try {
+            fillFromCache();
+        } catch (Throwable ignored) {
+        }
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
                 // early phase: app/binder may not be up yet — retry briefly
                 for (int i = 0; i < 30; i++) {
+                    // 顺序不能反：先填本地副本，再查 provider。
+                    // 首次 query 会触发模块 app 冷启动，能阻塞好几秒；如果等它
+                    // 返回再填缓存，SystemUI 早把锁屏和材质渲染完了，等于没救。
+                    // fillFromCache 内部用 sCacheTried 挡住重复读盘，这里调 30 次
+                    // 实际只读一次。
+                    fillFromCache();
                     if (loadOnce()) {
                         break;
                     }
@@ -981,6 +1043,152 @@ public final class Cfg {
         return null;
     }
 
+    // ==================== 快照本地副本（v3.2.28 开机失效修复） ====================
+    //
+    // 为什么需要它：provider 是**跨进程**的，开机时模块 app 还没起来，SystemUI 的
+    // 首次 query 必然失败，要重试 1~3 秒才拿到数据。而 SystemUI 在这之前就已经
+    // 把锁屏 / 通知栏 / 材质渲染完了，那段窗口里 Cfg.isOn(K_GLASS) 对 opt-in 键
+    // 返回 false（见 isOn 的注释），整条玻璃线按"开关关着"跑原厂值。
+    //
+    // 更麻烦的是**晚到的配置不会让已渲染的元素重算**：
+    //   · 玻璃线 startPreload(false) —— 快照冻结，不会二次应用
+    //   · MaterialTransparentEngine.mHnMaterial —— 建一次就缓存，参数对了也不重建
+    // 所以必须在**第一帧之前**就有正确的开关值，不能等 provider。
+    //
+    // 缓存里存的是**上一次真正生效的配置**（loadOnce 成功那一刻写盘）。它天然
+    // 等于用户当前的设置 —— 因为改开关本来就要重启 SystemUI 才生效，而每次
+    // SystemUI 成功加载都会把缓存刷新一遍。
+    //
+    // 用 filesDir 不用 cacheDir：cacheDir 会在低存储时被系统清掉，而这份数据
+    // 恰恰是"低存储/开机卡顿"时最需要的。
+    private static final String CACHE_FILE = "cfg_snapshot.txt";
+    /** 格式版本。改动缓存结构时递增，旧文件会被丢弃而不是误读。 */
+    private static final String CACHE_VER = "v1";
+    /** 只尝试读一次，避免 30 轮重试里反复读盘。 */
+    private static boolean sCacheTried = false;
+    /** 当前快照是不是从缓存来的（用于"缓存与线上不一致"的告警判据）。 */
+    private static volatile boolean sSnapshotFromCache = false;
+
+    /**
+     * 用本地副本填 sSnapshot。拿不到 Context / 文件不存在 / 格式不符都静默返回 ——
+     * 这只是兜底，失败不影响原有重试流程。
+     */
+    private static void fillFromCache() {
+        if (sCacheTried || sSnapshot != null) {
+            return;
+        }
+        Context ctx = apiContext();
+        if (ctx == null) {
+            // 还拿不到 Context（进程刚起）：**不设** sCacheTried，
+            // 留给 preload 线程后面几轮再试。
+            return;
+        }
+        sCacheTried = true;
+        java.io.BufferedReader r = null;
+        try {
+            java.io.File f = new java.io.File(ctx.getFilesDir(), CACHE_FILE);
+            if (!f.exists() || f.length() <= 0L) {
+                return;
+            }
+            r = new java.io.BufferedReader(new java.io.InputStreamReader(
+                    new java.io.FileInputStream(f), "UTF-8"));
+            String first = r.readLine();
+            if (!CACHE_VER.equals(first)) {
+                // 用 note 不走 warn：warn 在 SystemUI 里被 diag 门控吞掉，
+                // 而"缓存版本不符"正好是升级后第一次开机才会发生、必须看见的事。
+                Diag.note("Cfg cache: 版本不符(" + first + ")，已忽略");
+                return;
+            }
+            Map<String, int[]> m = new HashMap<String, int[]>();
+            String line;
+            while ((line = r.readLine()) != null) {
+                int eq = line.indexOf('=');
+                if (eq <= 0 || eq >= line.length() - 1) {
+                    continue;
+                }
+                try {
+                    m.put(line.substring(0, eq),
+                            new int[]{Integer.parseInt(line.substring(eq + 1))});
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            if (m.isEmpty()) {
+                return;
+            }
+            if (sSnapshot == null) {
+                sSnapshot = m;
+                sSnapshotFromCache = true;
+                markReady();
+                // 这行用 note 而不是 log：note 不受诊断开关控制，用户反馈
+                // "开机玻璃没了"时能直接在日志里看到首帧用的是哪份配置。
+                Diag.note("Cfg cache hit: " + m.size() + " 项（首帧用上次生效的配置）");
+            }
+        } catch (Throwable t) {
+            Diag.note("Cfg cache read failed: " + t.getClass().getSimpleName());
+        } finally {
+            if (r != null) {
+                try {
+                    r.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    /** 把一份快照写到本地副本。只在内容变化时调用（观察者会反复 loadOnce）。 */
+    private static void writeCache(Map<String, int[]> m) {
+        if (m == null || m.isEmpty()) {
+            return;
+        }
+        Context ctx = apiContext();
+        if (ctx == null) {
+            return;
+        }
+        java.io.File tmp = null;
+        java.io.FileOutputStream fos = null;
+        try {
+            java.io.File dir = ctx.getFilesDir();
+            tmp = new java.io.File(dir, CACHE_FILE + ".tmp");
+            StringBuilder sb = new StringBuilder(4096);
+            sb.append(CACHE_VER).append('\n');
+            for (Map.Entry<String, int[]> e : m.entrySet()) {
+                if (e.getKey() == null || e.getValue() == null) {
+                    continue;
+                }
+                sb.append(e.getKey()).append('=').append(e.getValue()[0]).append('\n');
+            }
+            fos = new java.io.FileOutputStream(tmp);
+            fos.write(sb.toString().getBytes("UTF-8"));
+            fos.flush();
+            fos.getFD().sync();
+            fos.close();
+            fos = null;
+            // 先写 .tmp 再 rename：直接覆写会在开机中途断电时留下半截文件，
+            // 下次开机读到的就是残缺配置（比没有更糟）。
+            java.io.File dst = new java.io.File(dir, CACHE_FILE);
+            if (!tmp.renameTo(dst)) {
+                if (!(dst.exists() && dst.delete() && tmp.renameTo(dst))) {
+                    Diag.warn("Cfg cache write: rename failed");
+                }
+            }
+        } catch (Throwable t) {
+            Diag.warn("Cfg cache write failed: " + t.getClass().getSimpleName());
+        } finally {
+            if (fos != null) {
+                try {
+                    fos.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (tmp != null && tmp.exists()) {
+                try {
+                    tmp.delete();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
     private static boolean loadOnce() {
         Context ctx = apiContext();
         if (ctx == null) {
@@ -1012,8 +1220,19 @@ public final class Cfg {
         Map<String, int[]> old = sSnapshot;
         if (old == null || !old.equals(m)) {
             Diag.state("Cfg via provider", m);
+            // 快照和本地缓存对不上 = 用户改过设置但没让 SystemUI 重新加载，
+            // 而玻璃线是冻结的、已渲染的元素不会重算。这条告警专门给排查用：
+            // 用户反馈「界面显示的设置和实际效果不一致」时，日志里能直接看到。
+            if (sSnapshotFromCache) {
+                Diag.warn("Cfg 快照与本地缓存不一致：本进程已按缓存渲染，"
+                        + "重启 SystemUI 后才会用线上值");
+            }
+            // 每次真正拿到线上值都刷新本地副本 —— 它代表"下一次开机时该用什么"。
+            writeCache(m);
         }
         sSnapshot = m;
+        sSnapshotFromCache = false;
+        markReady();
         return true;
     }
 }
