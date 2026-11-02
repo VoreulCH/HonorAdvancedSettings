@@ -141,4 +141,46 @@ public final class DexKitHelper {
             return null;
         }
     }
+
+    /**
+     * 按**类名正则**找类（v3.2.43）。
+     *
+     * <p>为什么需要这个而不继续用 {@link #findClassByStrings}：
+     * {@code MethodMatcher.usingStrings} 只匹配**方法体内 const-string 引用的字面量**。
+     * 而 {@code queryFraudCallingLatestRecordBy} 这类是**方法名**、
+     * {@code FraudCallDetectStandardData} 这类是**类名** —— 它们不在 const-string
+     * 里，所以按字符串扫一定是 0 命中（实测 awareness 里 46MB dex、2ms 返回空，就是这个原因）。
+     *
+     * <p>按类名正则匹配才是这类目标的正确工具：只要 OTA 后业务类名还带
+     * {@code Fraud} 字样就能命中，不需要知道混淆后的完整包路径。
+     *
+     * @param nameRegex 注意是**全限定类名**的正则，例如 {@code ".*[Ff]raud.*"}
+     */
+    public static java.util.List<Class<?>> findClassesByNameRegex(
+            String apkPath, ClassLoader cl, String nameRegex) {
+        java.util.List<Class<?>> out = new java.util.ArrayList<>();
+        org.luckypray.dexkit.DexKitBridge b = bridge(apkPath);
+        if (b == null) return out;
+        try {
+            org.luckypray.dexkit.query.FindClass query = org.luckypray.dexkit.query.FindClass.create()
+                    .matcher(org.luckypray.dexkit.query.matchers.ClassMatcher.create()
+                            .className(nameRegex));
+            java.util.List<org.luckypray.dexkit.result.ClassData> list = b.findClass(query);
+            if (list == null) return out;
+            for (org.luckypray.dexkit.result.ClassData cd : list) {
+                try {
+                    Class<?> c = cd.getInstance(cl);
+                    // 内部类（Foo$Bar）不作为 hook 目标：多为匿名/辅助类，
+                    // 挂上去既没意义又容易连带破坏外部类的状态
+                    if (c != null && !c.getName().contains("$")) {
+                        out.add(c);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable t) {
+            Diag.err("DexKit findClassesByNameRegex failed", t);
+        }
+        return out;
+    }
 }
