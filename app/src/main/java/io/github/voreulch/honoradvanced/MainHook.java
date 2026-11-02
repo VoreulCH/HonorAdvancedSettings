@@ -72,7 +72,30 @@ public final class MainHook implements IXposedHookLoadPackage {
             // false = 玻璃类 scope：快照冻结，改开关要重启本进程才生效。
             Cfg.startPreload(false);
             MiscHook.initSecurityServer(cl,
-                    lpparam.appInfo != null ? lpparam.appInfo.sourceDir : null);
+                    lpparam.appInfo != null ? lpparam.appInfo.sourceDir : null,
+                    // v3.2.37：securityserver 是**多 split** 应用（实测 8 个 APK：
+                    // HnSecurityServer / BioInfoSync / HnTrustCircleManager /
+                    // HnAntiTheftDetectionService / HnLocalFaceIdAuth /
+                    // HnUniKeystoreService / HnUnifiedAuthService / HnDeviceGroupAuth）。
+                    // 原来只把 sourceDir（主包）交给 DexKit 扫，分片里的类一概看不见 ——
+                    // 实测 HnUnifiedAuthService.apk 里就有 fraud_detect_* / fraudcall_*
+                    // 这些反诈相关字符串。分片里的类同样由主 ClassLoader 加载，
+                    // 只要 apkPath 传对就能扫到。
+                    lpparam.appInfo != null ? lpparam.appInfo.splitSourceDirs : null);
+            return;
+        }
+
+        // 感知服务本体（v3.2.42）：它自己不但是数据源，还有 41 处 fraud 逻辑
+        // （诈骗电话 / 诈骗应用 / 行为事件集）和独立上报通道。只拦 securityserver
+        // 等于只关了一个水龙头，这里补上第二个。
+        // ⚠ 它是可更新应用，类名随 OTA 变 → MiscHook 里全部用动态锚点。
+        if ("com.hihonor.awareness".equals(pkg)) {
+            Diag.setEssential(true);   // 首次接入，必须能看见挂载结果
+            enter("awareness", pkg, lpparam);
+            Cfg.startPreload(false);
+            MiscHook.initAwareness(cl,
+                    lpparam.appInfo != null ? lpparam.appInfo.sourceDir : null,
+                    lpparam.appInfo != null ? lpparam.appInfo.splitSourceDirs : null);
             return;
         }
 
@@ -83,6 +106,15 @@ public final class MainHook implements IXposedHookLoadPackage {
             // (dumpsys: powergenie ServiceRecord processName=com.hihonor.iaware),
             // hence both packages are scoped and routed here.
             enter("powergenie", pkg, lpparam);
+            // ⚠ v3.2.31：这个分支**一直没有 startPreload**。
+            // 后果和 v3.2.7 修的反诈分支一模一样：
+            //   sSnapshot 永远是 null → isOn(K_NOCLOUD) 对 opt-in 键返回 false
+            //   → hookCloudPolicy 的每一处拦截都在 `if (!Cfg.isOn(K_NOCLOUD)) return`
+            //     那一行提前退出 → **云控屏蔽从头到尾没生效过**。
+            // 日志里只看得见"云控拦截至 23 处"（挂载计数），看不到任何一条
+            // 实际拦截记录 —— 正好把这件事掩盖了。
+            // 走 true：用户在设置里改开关后，下一次配置读取立即按新值判定。
+            Cfg.startPreload(true);
             MiscHook.initPowerGenie(cl, lpparam.appInfo != null ? lpparam.appInfo.sourceDir : null);
             return;
         }
