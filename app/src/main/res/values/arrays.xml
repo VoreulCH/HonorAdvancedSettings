@@ -9,6 +9,12 @@
         <item>com.hihonor.powergenie</item>
         <item>com.hihonor.iaware</item>
         <item>com.hihonor.securityserver</item>
+        <!-- v3.2.42：感知服务本体。实测它自己就有 41 处 fraud 逻辑（诈骗电话 /
+             诈骗应用 / 行为事件集）和独立上报通道，不纳入作用域的话，
+             只拦 securityserver 等于只关了一个水龙头。
+             ⚠ 这是**可更新应用**（装在 /data/app），类名和字符串会随 OTA 变，
+             所以 hook 必须用动态锚点，不能硬编码类名。 -->
+        <item>com.hihonor.awareness</item>
         <!-- 模块自身也列进来：LSPosed 的「已激活」判定看的是模块 app 进程有没有被注入，
              不列进来就永远显示「未激活」（功能其实是好的，只是状态显示唬人）。
              MainHook 对自身包名是直接 return 的，注入后不会做任何事。 -->
