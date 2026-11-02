@@ -92,6 +92,10 @@ public final class MiscHook {
         // thermal-extra 永远拿不到执行机会 —— sExtraDone 的重试逻辑等于白写。
         hookThermalExtra(apkPath, cl);
         hookCloudPolicy(cl, apkPath);
+        // v3.2.34：**读取侧拦截**。三个 Receiver 只拦住"热重载通知"，
+        // 文件本身是别的进程写的，拦不住；所以还要让 PowerGenie 读不到它们。
+        // 伪造"文件不存在"→ 它回退到自己的原厂内置配置，不用我们覆盖任何内容。
+        hookCotaFileAccess();
         // Idempotent, but ONLY after a successful hook pass: the first
         // handleLoadPackage in the iaware process can arrive before HAware's
         // dex is reachable from that classloader (observed CNFE at boot,
@@ -154,6 +158,22 @@ public final class MiscHook {
     private static int sPgBlocked = 0;
     private static int sExtraBlocked = 0;
     private static boolean sCloudDone = false;
+    /**
+     * v3.2.36：已成功挂载的云控 hook 标识。
+     *
+     * <p>为什么需要它：{@code sCloudDone} 只在**三个 Receiver 全挂上**时才置 true。
+     * 第一次 handleLoadPackage 时 HAware 的 dex 可能还没就绪（多包名共进程的
+     * ClassLoader 时序），三个全失败 → sCloudDone 保持 false → 下次回调再跑一遍
+     * {@code hookCloudPolicy}，把**已经挂上的方法再挂一次**。
+     *
+     * <p>重复挂载的后果：同一个方法会触发 N 次回调。目前所有回调都是
+     * {@code setResult(...)}（幂等），所以没暴露出问题，但计数会翻倍、
+     * 日志会重复，属于必须清掉的隐患。
+     *
+     * <p>策略：挂之前先抢占，成功保留、失败移除（允许下次重试）。
+     */
+    private static final java.util.Set<String> sCloudHooked =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
     private static boolean sFraudDone = false;
     private static int sFraudBlocked = 0;
     // 温控/云控的"首次回调"判据：证明钩子真被调用到、且开关读到的是开
@@ -191,17 +211,241 @@ public final class MiscHook {
      * 属于杀敌一千自损八百。挡在源头最干净：数据压根没被收集。
      */
     /** 反诈组件的入口（securityserver 进程调用）。 */
-    public static void initSecurityServer(ClassLoader cl, String apkPath) {
-        hookAntiFraud(cl, apkPath);
+    public static void initSecurityServer(ClassLoader cl, String apkPath, String[] splitPaths) {
+        hookAntiFraud(cl, apkPath, splitPaths);
     }
 
-    private static void hookAntiFraud(ClassLoader cl, String apkPath) {
+    /**
+     * 感知服务本体的**精准**反诈拦截（v3.2.42）。
+     *
+     * <p>为什么需要单独一条：实测 {@code com.hihonor.awareness} 自己有 41 处
+     * fraud 相关逻辑（诈骗电话识别 / 诈骗应用检测 / 行为事件集）和独立上报通道
+     * （293 处 Upload、41 处 hiview，上报域名 {@code metrics-drcn.dt.hihonorcloud.com}）。
+     * 只拦 securityserver 等于只关了一个水龙头。
+     *
+     * <p><b>为什么是"精准"而不是全拦</b>：awareness 同时是人脸活体检测
+     * （{@code FaceFraudDetector} / {@code VisionFaceFraudService} / 深伪检测）的载体，
+     * 那是**人脸识别的安全防线**，拦了会让"照片/视频能否骗过人脸"这件事失去保护。
+     * 所以类名里带 {@code face} 的一律跳过。
+     *
+     * <p><b>全部用动态锚点</b>：awareness 是**可更新应用**（装在 /data/app），
+     * 类名、方法名、字符串都会随 OTA 变。锚点选的是业务语义字符串
+     * （{@code queryFraudCallingLatestRecordBy} / {@code fraudRiskAppData} …），
+     * 不是混淆后的类名 —— 这样升级后只要业务还是这套，就能继续命中。
+     *
+     * <p>保守边界：只处理 {@code boolean / int / void}。返回对象的不动，
+     * 避免调用方 NPE（这类查询方法常被链式调用）。
+     */
+    public static void initAwareness(ClassLoader cl, String apkPath, String[] splitPaths) {
+        if (sAwarenessDone) return;
+        if (apkPath == null) return;
+        final String[] apkPaths = allApkPaths(apkPath, splitPaths);
+        try {
+            // v3.2.43：改成**按类名正则**扫。
+            //
+            // 上一版用 `queryFraudCallingLatestRecordBy` 这些当锚点，结果 0 命中，
+            // 46MB 的 dex 两毫秒就返回空。原因是它们**是方法名 / 类名**，
+            // 而 DexKit 的 usingStrings 只匹配方法体里 const-string 的字面量。
+            //
+            // v3.2.44：正则扫在这个 46MB 的 APK 上**同样 0 命中**（DexKit 对它不可靠），
+            // 所以改成"真实类名 + 失败静默跳过"。类名是从 dex 里直接提取的
+            // （不是猜的），实测**没有混淆**：都在
+            // `com.hihonor.awareness.server.aisecurity.opencapacity.data` 下。
+            //
+            // 为什么只挑两个 Processor 而不是那 20 多个 Fraud*Data：
+            // `*Data` / `*StandardData` 全是 POJO（数据载体），hook 它们没有任何意义；
+            // 真正把 fraud 行为写进数据平台再往外送的是这两个 Processor。
+            int n = 0;
+            java.util.Set<String> seen = new java.util.HashSet<String>();
+            java.util.List<java.lang.reflect.Method> candidates = new java.util.ArrayList<>();
+            // 先试 DexKit 正则（万一某个版本它能工作，就自动覆盖更多）。
+            //
+            // v3.2.45：**只试一次**。这个 APK 有 46MB，实测 DexKit 在它上面
+            // 稳定返回空（bridge ready 但索引没建起来）。如果按"n==0 就重试"
+            // 的逻辑走，每次 handleLoadPackage 都会重新解析 46MB dex，
+            // 那是实打实的启动卡顿。所以用一个独立标记把 DexKit 这条路钉死。
+            if (!sAwarenessDexTried) {
+                sAwarenessDexTried = true;
+                candidates.addAll(findFraudMethods(apkPaths, cl));
+            }
+            // 再补上确定存在的两个 Processor（OTA 改名时 forName 失败，静默跳过）
+            for (String fixed : new String[]{
+                    "com.hihonor.awareness.dataplatform.storage.processor.impl."
+                            + "StandardEventDataOffFraudBehaviorProcessor",
+                    "com.hihonor.awareness.dataplatform.storage.processor.impl."
+                            + "StandardEventDataOlFraudBehaviorProcessor",
+            }) {
+                try {
+                    Class<?> c = cl.loadClass(fixed);
+                    for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                        if (m != null) {
+                            candidates.add(m);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                    // 类不在了（OTA 改名）—— 跳过，不影响其它 hook
+                }
+            }
+            for (java.lang.reflect.Method m : candidates) {
+                final String cn = m.getDeclaringClass().getName();
+                // 人脸活体检测不碰：那是人脸识别的安全防线
+                if (cn.toLowerCase(java.util.Locale.US).contains("face")) {
+                    continue;
+                }
+                final Class<?> rt = m.getReturnType();
+                final boolean isBool = rt == boolean.class;
+                final boolean isInt = rt == int.class;
+                final boolean isVoid = rt == void.class;
+                if (!isBool && !isInt && !isVoid) {
+                    continue;
+                }
+                String sig = cn + "#" + m.getName() + "/" + m.getParameterTypes().length;
+                if (!seen.add(sig)) {
+                    continue;
+                }
+                try {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!Cfg.isOn(Cfg.K_NOFRAUD)) return;
+                                if (isVoid) {
+                                    param.setResult(null);
+                                } else if (isBool) {
+                                    param.setResult(Boolean.FALSE);
+                                } else {
+                                    param.setResult(Integer.valueOf(0));
+                                }
+                                if (sAwarenessHitLog < 12) {
+                                    sAwarenessHitLog++;
+                                    Diag.note("nofraud: awareness 已拦 "
+                                            + cn + "." + m.getName());
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+                    n++;
+                    Diag.note("ok: nofraud awareness <- " + cn + "." + m.getName());
+                } catch (Throwable ignored) {
+                }
+            }
+            sAwarenessDone = n > 0;
+            Diag.note("nofraud awareness: 共接管 " + n + " 处"
+                    + (n > 0 ? "（人脸活体已排除）"
+                            : " ⚠ 一个都没命中，锚点可能随 OTA 失效"));
+        } catch (Throwable t) {
+            Diag.note("skip: nofraud awareness hook 失败 ("
+                    + t.getClass().getSimpleName() + ")");
+        }
+    }
+
+    private static volatile boolean sAwarenessDone = false;
+    /** DexKit 在 awareness 的 46MB dex 上只尝试一次（见 initAwareness 里的说明）。 */
+    private static volatile boolean sAwarenessDexTried = false;
+    private static volatile int sAwarenessHitLog = 0;
+
+    /**
+     * 把所有"类名含 fraud"的类的方法收集起来（v3.2.43）。
+     *
+     * <p>排除 `face`：{@code FaceFraudDetector} / {@code VisionFaceFraudService}
+     * 是人脸活体检测（防照片/视频攻击），属于人脸识别的安全防线，
+     * 跟"反诈数据上报"是两回事，拦了纯属自损。
+     */
+    private static java.util.List<java.lang.reflect.Method> findFraudMethods(
+            String[] apks, ClassLoader cl) {
+        java.util.List<java.lang.reflect.Method> out = new java.util.ArrayList<>();
+        for (String ap : apks) {
+            try {
+                for (Class<?> c : DexKitHelper.findClassesByNameRegex(ap, cl, ".*[Ff]raud.*")) {
+                    if (c.getName().toLowerCase(java.util.Locale.US).contains("face")) {
+                        continue;
+                    }
+                    try {
+                        java.lang.reflect.Method[] ms = c.getDeclaredMethods();
+                        for (java.lang.reflect.Method m : ms) {
+                            if (m != null) {
+                                out.add(m);
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return out;
+    }
+
+    /** 主包 + 所有 split 包去重后的列表（v3.2.37）。 */
+    private static String[] allApkPaths(String main, String[] splits) {
+        java.util.LinkedHashSet<String> set = new java.util.LinkedHashSet<String>();
+        if (main != null && main.length() > 0) {
+            set.add(main);
+        }
+        if (splits != null) {
+            for (String s : splits) {
+                if (s != null && s.length() > 0) {
+                    set.add(s);
+                }
+            }
+        }
+        return set.toArray(new String[0]);
+    }
+
+    /**
+     * 在所有 APK（主包 + split）里按锚点找方法。
+     *
+     * <p>为什么需要：securityserver 是多 split 应用，反诈相关字符串实测分布在
+     * 主包和 {@code HnUnifiedAuthService.apk} 里。只扫主包会漏掉分片里的类。
+     * 分片的类同样由主 ClassLoader 加载，所以拿到 Method 后照样能 hook。
+     */
+    private static java.util.List<java.lang.reflect.Method> findInAllApks(
+            String[] apks, ClassLoader cl, String... anchors) {
+        java.util.List<java.lang.reflect.Method> out = new java.util.ArrayList<java.lang.reflect.Method>();
+        java.util.Set<String> seen = new java.util.HashSet<String>();
+        for (String ap : apks) {
+            try {
+                java.util.List<java.lang.reflect.Method> ms =
+                        DexKitHelper.findMethodsByStrings(ap, cl, anchors);
+                if (ms == null) {
+                    continue;
+                }
+                for (java.lang.reflect.Method m : ms) {
+                    if (m == null) {
+                        continue;
+                    }
+                    String k = m.getDeclaringClass().getName() + "#" + m.getName()
+                            + "/" + m.getParameterTypes().length;
+                    if (seen.add(k)) {
+                        out.add(m);
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return out;
+    }
+
+    private static void hookAntiFraud(ClassLoader cl, String apkPath, String[] splitPaths) {
+        // v3.2.45：**总闸 / 断链 / 门面必须放在 sFraudDone 检查之前**。
+        //
+        // 这是个真实的顺序 bug：这三层各自有幂等标记（失败会复位以便重试），
+        // 但如果它们写在 `if (sFraudDone) return;` 之后，一旦逐点那部分先挂满
+        // 把 sFraudDone 置成 true，这三个就再也不会被调用 ——
+        // 其中任何一个曾经失败过，就永久失效，而且日志里看不出来。
+        hookFraudSettings();
+        hookAwarenessBind();
+        hookAwarenessClientWhole(cl);
+
         if (sFraudDone) return;
         if (apkPath == null) return;
+        final String[] apkPaths = allApkPaths(apkPath, splitPaths);
 
-        // 不需要额外的进程白名单校验：Xposed 的钩子**只在勾进作用域的进程里生效**，
-        // 而作用域声明（res/values/arrays.xml 的 xposed_scope）只列了 securityserver。
-        // 所以 awareness 那套围栏在这里被拦，YOYO / 情景智能自己的进程完全不受影响。
+        // v3.2.48：作用域**两个**进程 —— 反诈服务（securityserver）+ 感知服务（awareness）。
+        // 后者是 v3.2.42 补的：实测 awareness 自己有 41 处 fraud 逻辑和独立上报通道，
+        // 只拦 securityserver 等于只关了一个水龙头。awareness 那一侧走
+        // MainHook → initAwareness，不经过本函数。
 
         int n = 0;
         int nCtl = 0;     // SafetyCtrlService（反诈云控校验）
@@ -210,12 +454,19 @@ public final class MiscHook {
         String[][] anchors = {
                 {"antifraud", "antifraud detect state switch"},       // 开关/观察者注册
                 {"fraud_cloud", "fraud_cloud_security_check"},        // 云控校验
+                // v3.2.51：删掉了 fence_reg / fence_id / fence_hot 三组锚点。
+                // 它们实机**从未命中过一次**（加进去之后挂载数一直停在 8，一点没涨）——
+                // 原因是那些字符串睡在字段初始化和静态常量里，不在方法体内，
+                // 而 DexKit 的 usingStrings 只匹配方法内的 const-string。
+                // 留着只会让每次进程启动多扫三遍 dex，属于纯负担。
+                // 围栏这条线现在由「断链 + 门面类」两层覆盖，不需要字符串锚点。
         };
         for (String[] pair : anchors) {
             final String tag = pair[0];
+            final String[] keys = java.util.Arrays.copyOfRange(pair, 1, pair.length);
             try {
                 java.util.List<java.lang.reflect.Method> ms =
-                        DexKitHelper.findMethodsByStrings(apkPath, cl, pair[1]);
+                        findInAllApks(apkPaths, cl, keys);
                 for (final java.lang.reflect.Method m : ms) {
                     final Class<?> rt = m.getReturnType();
                     try {
@@ -252,6 +503,8 @@ public final class MiscHook {
                         });
                         n++;
                         nCtl++;
+                        sFraudHookedNames.add(m.getDeclaringClass().getSimpleName()
+                                + "." + m.getName());
                         Diag.note("ok: nofraud " + tag + " <- "
                                 + m.getDeclaringClass().getName() + "." + m.getName()
                                 + " ret=" + rt.getSimpleName());
@@ -332,6 +585,7 @@ public final class MiscHook {
                     });
                     n++;
                     nAware++;
+                    sFraudHookedNames.add("awareness." + nm);
                     Diag.note("ok: awareness <- " + nm);
                 } catch (Throwable ignored) {
                 }
@@ -374,6 +628,7 @@ public final class MiscHook {
                 });
                 n++;
                 nRecv++;
+                sFraudHookedNames.add(rn.substring(rn.lastIndexOf('.') + 1) + ".onReceive");
                 Diag.note("ok: nofraud 云参数接收器 <- "
                         + rn.substring(rn.lastIndexOf('.') + 1));
             } catch (Throwable t) {
@@ -395,7 +650,256 @@ public final class MiscHook {
         Diag.note("nofraud: 共接管 " + n + " 处（控制=" + nCtl
                 + " 感知=" + nAware + " 云参数=" + nRecv + "）"
                 + (complete ? "" : " ⚠ 有类别未命中，下次重试"));
+        // v3.2.37 正反双例自检。
+        //
+        // 正例：三类（云控校验 / 感知围栏 / 云参数接收）都有命中 —— 说明拦截点齐全。
+        // 反例：把**每一个被挂的方法名**打出来，供人工核对"挂的是不是都跟反诈有关"。
+        //   之前只报总数，看不出这几处到底挂在什么方法上 —— 万一 DexKit 锚点
+        //   命中了通用网络/上报代码，会把非反诈功能一起掐掉，而总数依旧是"8 处"。
+        Diag.note("nofraud 自检：" + (complete ? "✓ 三类齐全" : "⚠ 类别不全")
+                + "｜挂钩清单：" + (sFraudHookedNames.isEmpty()
+                        ? "(空)" : android.text.TextUtils.join("，", sFraudHookedNames)));
+        if (!complete) {
+            Diag.note("nofraud ⚠ 提示：类别不全时可能只拦住了部分链路，"
+                    + "下一次 handleLoadPackage 会重试；若长期不全请把本行日志发出来");
+        }
     }
+
+    /**
+     * **总闸拦截**（v3.2.38）—— 不再逐点堵，直接在 Settings 这一层把所有
+     * 反诈相关开关读成 0。
+     *
+     * <p>反编译实证（{@code SafetyCtrlService$e.onChange}）：
+     * <pre>
+     *   Settings.Global.getInt(resolver, "fraud_cloud_security_check", 0)
+     *     → SafetyCtrlService.y(v)          // 保存云控校验结果
+     *   Log.i(..., "antifraud detect state switch, enable " + SafetyCtrlService.u())
+     * </pre>
+     * 也就是说反诈的"开/关"是从 {@link android.provider.Settings} 读出来的。
+     * 在这个读口把值强制成 0，等于告诉整个安全服务"反诈检测是关的" ——
+     * 一处覆盖所有分支，不用再去追那 40 多个方法。
+     *
+     * <p>为什么比拦 {@code awareness.dispatch*} 更"整体"：
+     * dispatch 是数据已经采集完、准备分发时才拦；Settings 是最上游的开关，
+     * 检测压根不会启动，连采集都不会发生。
+     *
+     * <p>只处理 key 里含 fraud / antifraud 的项，其它 Settings 一概不碰 ——
+     * 这是"不误伤"的边界。
+     */
+    private static void hookFraudSettings() {
+        if (!sFraudSettingsHooked.compareAndSet(false, true)) return;
+        try {
+            XC_MethodHook gate = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!Cfg.isOn(Cfg.K_NOFRAUD)) return;
+                        // getInt(ContentResolver, String key, int def) / getInt(ContentResolver, String, int, int user)
+                        if (param.args.length < 2 || !(param.args[1] instanceof String)) return;
+                        String key = (String) param.args[1];
+                        if (!isFraudSettingKey(key)) return;
+                        param.setResult(Integer.valueOf(0));
+                        if (sFraudSettingsLog < 8) {
+                            sFraudSettingsLog++;
+                            Diag.note("nofraud: 总闸拦截 -> Settings key 强制 0："
+                                    + key + "（反诈检测视为关闭）");
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            };
+            int n = 0;
+            for (Class<?> sc : new Class<?>[]{
+                    android.provider.Settings.Global.class,
+                    android.provider.Settings.Secure.class,
+                    android.provider.Settings.System.class}) {
+                try {
+                    XposedBridge.hookAllMethods(sc, "getInt", gate);
+                    n++;
+                } catch (Throwable ignored) {
+                }
+                // 有的实现走 getString 再自己 parse
+                try {
+                    XposedBridge.hookAllMethods(sc, "getString", new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!Cfg.isOn(Cfg.K_NOFRAUD)) return;
+                                if (param.args.length < 2 || !(param.args[1] instanceof String)) return;
+                                String key = (String) param.args[1];
+                                if (!isFraudSettingKey(key)) return;
+                                param.setResult("0");
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+                } catch (Throwable ignored) {
+                }
+            }
+            Diag.note("ok: nofraud 总闸拦截已挂上（Settings.getInt/getString，"
+                    + n + " 个 provider）");
+        } catch (Throwable t) {
+            sFraudSettingsHooked.set(false);
+            Diag.note("skip: nofraud 总闸拦截失败 (" + t.getClass().getSimpleName() + ")");
+        }
+    }
+
+    /**
+     * **断链**（v3.2.39）—— 不让 securityserver 连上感知服务。
+     *
+     * <p>这是"整体拦截"里最省事的一刀：反诈的所有数据都来自
+     * {@code com.hihonor.awareness} 的围栏。围栏要工作，客户端必须先
+     * {@code bindService} 连上那个服务。**绑定直接返回失败**，后面
+     * 注册围栏、接收事件、上报数据整条链子自然全断，不用再逐个方法点去堵。
+     *
+     * <p>比拦 {@code awareness.dispatch*} 更靠上游：
+     * <ul>
+     *   <li>dispatch 拦的是"数据已经采集完、准备分发"</li>
+     *   <li>这里拦的是"连不上服务" —— **采集根本没开始**</li>
+     * </ul>
+     *
+     * <p>代价（用户已确认接受）：securityserver 进程里其它依赖感知服务的
+     * 功能（统一认证的环境风控、异地登录判断）会一起失灵。查找手机
+     * （{@code HnAntiTheftDetectionService}）实测对 awareness 零依赖，不受影响。
+     *
+     * <p>作用域：只在 securityserver 进程里生效（Xposed 作用域限制），
+     * YOYO / 情景智能在它们自己的进程里，完全不受影响。
+     */
+    private static void hookAwarenessBind() {
+        if (!sAwarenessBindHooked.compareAndSet(false, true)) return;
+        try {
+            XC_MethodHook deny = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!Cfg.isOn(Cfg.K_NOFRAUD)) return;
+                        if (param.args == null || param.args.length == 0) return;
+                        Object a0 = param.args[0];
+                        if (!(a0 instanceof android.content.Intent)) return;
+                        android.content.Intent it = (android.content.Intent) a0;
+                        String pkg = it.getPackage();
+                        android.content.ComponentName cn = it.getComponent();
+                        String cls = cn == null ? null : cn.getClassName();
+                        boolean hit = (pkg != null && pkg.contains("awareness"))
+                                || (cls != null && cls.contains("awareness"));
+                        if (!hit) return;
+                        param.setResult(Boolean.FALSE);
+                        if (!sAwarenessBindLogged) {
+                            sAwarenessBindLogged = true;
+                            Diag.note("nofraud: 已拒绝绑定感知服务 -> "
+                                    + (pkg != null ? pkg : cls)
+                                    + "（围栏注册/采集/上报整链断开）");
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            };
+            int n = 0;
+            Class<?> impl = Class.forName("android.app.ContextImpl");
+            for (String mn : new String[]{"bindService", "bindServiceAsUser",
+                    "bindServiceInstance"}) {
+                try {
+                    XposedBridge.hookAllMethods(impl, mn, deny);
+                    n++;
+                } catch (Throwable ignored) {
+                }
+            }
+            Diag.note("ok: nofraud 断链拦截已挂上（ContextImpl " + n + " 个 bind 入口）");
+        } catch (Throwable t) {
+            sAwarenessBindHooked.set(false);
+            Diag.note("skip: nofraud 断链拦截失败 (" + t.getClass().getSimpleName() + ")");
+        }
+    }
+
+    /**
+     * **门面类整体拦截**（v3.2.41）—— 把 awareness 客户端的每个入口一次性全掐掉。
+     *
+     * <p>为什么不用字符串锚点：实测 {@code REGISTER_FENCE_BY_INTENT} /
+     * {@code AWARENESS_FENCE_IDENTIFIER} / 各种围栏名这些字符串**出现在字段初始化和
+     * 静态常量里，不在方法体内**，DexKit 的 {@code usingStrings} 按方法扫一个都命中不了
+     * （加进去之后挂载数还是 8，一点没涨）。
+     *
+     * <p>所以直接按**类**来：{@code AwarenessClient} 是围栏能力的唯一门面，注册、查询、
+     * 注销全从它走。把它的 boolean/int/void 方法全部按"失败/空"处理，等于整条能力下线。
+     *
+     * <p>保守边界：**只处理 boolean / int / void** 三种返回类型。
+     * 返回对象的方法一律不动 —— 给 null 会让调用方 NPE（比如链式调用
+     * {@code client.getXxx().doYyy()}），这类崩溃比"少拦一个方法"严重得多。
+     */
+    private static void hookAwarenessClientWhole(ClassLoader cl) {
+        if (!sAwarenessClientHooked.compareAndSet(false, true)) return;
+        try {
+            Class<?> ac = cl.loadClass("com.hihonor.awareness.client.AwarenessClient");
+            int n = 0;
+            for (final java.lang.reflect.Method m : ac.getDeclaredMethods()) {
+                Class<?> rt = m.getReturnType();
+                final boolean isBool = rt == boolean.class;
+                final boolean isInt = rt == int.class;
+                final boolean isVoid = rt == void.class;
+                if (!isBool && !isInt && !isVoid) {
+                    continue;
+                }
+                try {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!Cfg.isOn(Cfg.K_NOFRAUD)) return;
+                                if (isVoid) {
+                                    param.setResult(null);
+                                } else if (isBool) {
+                                    param.setResult(Boolean.FALSE);
+                                } else {
+                                    param.setResult(Integer.valueOf(0));
+                                }
+                                if (sAwarenessClientLog < 10) {
+                                    sAwarenessClientLog++;
+                                    Diag.note("nofraud: 已掐 AwarenessClient."
+                                            + m.getName() + "() → 空/失败");
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+                    n++;
+                } catch (Throwable ignored) {
+                }
+            }
+            if (n > 0) {
+                Diag.note("ok: nofraud AwarenessClient 整体拦截已挂上（" + n + " 个入口）");
+            } else {
+                Diag.note("skip: nofraud AwarenessClient 无可挂方法");
+            }
+        } catch (Throwable t) {
+            sAwarenessClientHooked.set(false);
+            Diag.note("skip: nofraud AwarenessClient 整体拦截失败 ("
+                    + t.getClass().getSimpleName() + ")");
+        }
+    }
+
+    private static final java.util.concurrent.atomic.AtomicBoolean sAwarenessClientHooked =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static volatile int sAwarenessClientLog = 0;
+
+    private static final java.util.concurrent.atomic.AtomicBoolean sAwarenessBindHooked =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static volatile boolean sAwarenessBindLogged = false;
+
+
+    /** 只认名字里带 fraud 的 key —— 别的 Settings（亮度、超时…）一概不碰。 */
+    private static boolean isFraudSettingKey(String key) {
+        if (key == null || key.length() < 5) return false;
+        String k = key.toLowerCase(java.util.Locale.US);
+        return k.contains("fraud");
+    }
+
+    private static final java.util.concurrent.atomic.AtomicBoolean sFraudSettingsHooked =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static volatile int sFraudSettingsLog = 0;
+
+    /** 记录每一个被成功 hook 的反诈方法，用于反例核对。 */
+    private static final java.util.List<String> sFraudHookedNames =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<String>());
     private static int sCloudBlocked = 0;
 
     /**
@@ -406,8 +910,21 @@ public final class MiscHook {
      * —— "Cota" 就是云侧配置（Cloud OTA Config）更新。系统收到云端的温控策略包后，
      * 这个 Receiver 负责把它落进本地策略库，之后 PowerGenie 就按云端那套降频/限帧。
      *
-     * <p>阻断点选在 **onReceive**：直接 setResult 掉，等于"收到了但不当回事"，
-     * 本地策略保持出厂状态。比去改配置库安全得多（不碰数据，不会写坏）。
+     * <p><b>三层拦截（v3.2.36 起）</b>：
+     * <ol>
+     *   <li><b>通知层</b>：三个 {@code *CotaUpdateReceiver.onReceive} 直接 setResult，
+     *       等于"收到了但不当回事"，不会触发配置热重载</li>
+     *   <li><b>应用层</b>：{@code CloudConfigUpdateAgent.updateCloudConfigFile}（void）跳过</li>
+     *   <li><b>读取层</b>：见 {@link #hookCotaFileAccess} —— 对 cpuconfig / pg_config /
+     *       thermal_config 这三个路径，exists/isFile/length/canRead 一律返回"不存在"，
+     *       FileInputStream / FileReader / RandomAccessFile 的构造抛 FileNotFoundException，
+     *       NIO 的 Files / FileChannel 同样挡掉</li>
+     * </ol>
+     *
+     * <p>⚠ <b>文件本身是拦不住的</b>：写入方是 hnouc（OTA 组件），运行在别的进程里，
+     * 不在我们的作用域内。所以本开关的实际语义是"**写了也读不到**"——
+     * PowerGenie 拿到的永远是它自己的原厂内置配置。
+     * 想连带把已经落盘的文件清掉，用界面上的「清理云端配置残留（ROOT）」。
      *
      * <p>⚠ 这也是为什么它和「屏蔽高温限制」是两个开关：那个管的是**设备已经热了之后**
      * 别降频；这个管的是**云端别再把新的降频策略推下来**。两者互补。
@@ -429,6 +946,11 @@ public final class MiscHook {
                 "com.hihonor.powergenie.integration.eventhub.bcreceiver.ThermalCfgCotaUpdateReceiver",
         };
         for (final String rn : recv) {
+            // v3.2.36：已挂过的跳过（失败重试时不要重复挂）
+            if (!sCloudHooked.add("R:" + rn)) {
+                nRecv++;   // 计入本次统计，但不重复 hook
+                continue;
+            }
             try {
                 Class<?> rec = XposedHelpers.findClass(rn, cl);
                 XposedBridge.hookAllMethods(rec, "onReceive", new XC_MethodHook() {
@@ -464,6 +986,7 @@ public final class MiscHook {
                 nRecv++;
                 Diag.note("ok: " + rn.substring(rn.lastIndexOf('.') + 1) + " 云控下发已接管");
             } catch (Throwable t) {
+                sCloudHooked.remove("R:" + rn);   // 没挂上，允许下次重试
                 Diag.note("skip: " + rn.substring(rn.lastIndexOf('.') + 1)
                         + " (" + t.getClass().getSimpleName() + ")");
             }
@@ -502,6 +1025,14 @@ public final class MiscHook {
                     java.util.List<java.lang.reflect.Method> ms =
                             DexKitHelper.findMethodsByStrings(apkPath, cl, a2);
                     for (final java.lang.reflect.Method m : ms) {
+                        // v3.2.36：已挂过的跳过。sCloudDone 只在三个 Receiver **全成功**
+                        // 时才置位，失败重试会把同一批方法重复 hook —— 回调执行多次，
+                        // 计数翻倍。所有回调都是 setResult（幂等）所以没暴露，但必须清掉。
+                        String sigKey = "M:" + m.getDeclaringClass().getName() + "#"
+                                + m.getName() + "/" + m.getParameterTypes().length;
+                        if (!sCloudHooked.add(sigKey)) {
+                            continue;
+                        }
                         final String nm = m.getName();
                         if (nm.startsWith("on") && nm.endsWith("Receive")) continue;
                         final Class<?> rt = m.getReturnType();
@@ -555,6 +1086,7 @@ public final class MiscHook {
                                     + m.getDeclaringClass().getSimpleName()
                                     + "." + nm + " ret=" + rt.getSimpleName());
                         } catch (Throwable ignored) {
+                            sCloudHooked.remove(sigKey);   // 没挂上，允许下次重试
                         }
                     }
                 } catch (Throwable ignored) {
@@ -600,6 +1132,263 @@ public final class MiscHook {
                 + " 读取=" + nRead + "）"
                 + (complete ? "" : " ⚠ Receiver 未挂全，下次重试"));
     }
+    /**
+     * 让 PowerGenie **看不到**云控文件（v3.2.34）。
+     *
+     * <p>为什么不在解析层返回空流：反编译核查 {@code powergenie.core.f0.q} 的方法体，
+     * {@code move-exception} 出现 0 次 —— 它根本没有 try/catch。给空流会让解析失败
+     * 抛到顶层，PowerGenie 是常驻系统进程，崩了温控直接失效，比"没拦住云控"严重得多。
+     *
+     * <p>为什么伪造"不存在"是对的：这三个文件本来就可能不存在，**每一条读取路径都
+     * 必须处理这种情况**，否则原厂设备早就崩了。所以把 {@code exists/isFile/length}
+     * 改成"没有"，调用方会自然回退到**它自己的原厂内置配置** —— 我们不需要覆盖任何
+     * 配置内容，也就不会出现"把别家机型的参数套到这台机器上"的问题。
+     *
+     * <p>只对这三个路径生效，且只改返回值、不抛异常，对 PowerGenie 其它文件操作零影响。
+     */
+    private static void hookCotaFileAccess() {
+        if (!sCotaHideHooked.compareAndSet(false, true)) return;
+        try {
+            XC_MethodHook hide = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!Cfg.isOn(Cfg.K_NOCLOUD)) return;
+                        Object o = param.thisObject;
+                        if (!(o instanceof java.io.File)) return;
+                        String p = ((java.io.File) o).getPath();
+                        if (!isCotaPerfFile(p)) return;
+                        String nm = param.method.getName();
+                        if ("length".equals(nm)) {
+                            param.setResult(Long.valueOf(0L));
+                        } else if ("exists".equals(nm) || "isFile".equals(nm)
+                                || "canRead".equals(nm)) {
+                            param.setResult(Boolean.FALSE);
+                        }
+                        if (!sCotaHideLogged) {
+                            sCotaHideLogged = true;
+                            Diag.note("nocloud: 已把云控文件伪装成不存在 -> " + p
+                                    + "（PowerGenie 将回退到原厂内置配置）");
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            };
+            int n = 0;
+            for (String m : new String[]{"exists", "isFile", "length", "canRead"}) {
+                try {
+                    XposedBridge.hookAllMethods(java.io.File.class, m, hide);
+                    n++;
+                } catch (Throwable ignored) {
+                }
+            }
+            // ⚠ v3.2.35：只拦 exists/isFile/length 是**不够的**。
+            // 那 20 个读取入口里如果有直接 `new FileInputStream(file)` 的，
+            // 上面四个探测点一个都不会被调用 —— 拦截形同虚设。
+            // 所以再补构造器：命中这三个路径就抛 FileNotFoundException。
+            //
+            // 为什么敢抛：这三个文件**本来就可能不存在**，任何读取代码都必须
+            // 处理 FileNotFoundException（否则原厂设备早就崩了），这是合法分支，
+            // 不是"我们制造的新异常"。
+            int nCtor = hookCotaStreamCtors();
+            Diag.note("ok: 云控文件读取拦截已挂上（" + n + " 个 File 探测点 / "
+                    + nCtor + " 个流构造点）");
+            // 挂完立刻自证一次：有测试文件时能直接看出 hook 到底生效没
+            if (Cfg.isOn(Cfg.K_NOCLOUD)) {
+                selfCheckCotaHide();
+            } else {
+                Diag.note("nocloud 自检跳过：开关关着，拦截本就不该生效");
+            }
+        } catch (Throwable t) {
+            sCotaHideHooked.set(false);   // 允许下次重试
+            Diag.note("skip: 云控文件读取拦截失败 (" + t.getClass().getSimpleName() + ")");
+        }
+    }
+
+    /**
+     * 拦截三种最常见的"直接打开文件"方式。命中的路径一律当**文件不存在**处理。
+     *
+     * <p>返回成功挂载的数量。任何一种挂不上都不影响其它几种。
+     */
+    private static int hookCotaStreamCtors() {
+        int n = 0;
+        // 1) new FileInputStream(String) / (File)
+        try {
+            XC_MethodHook fis = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    if (!Cfg.isOn(Cfg.K_NOCLOUD)) return;
+                    String p = cotaPathOf(param);
+                    if (p == null) return;
+                    noteCotaHideHit(p);
+                    throw new java.io.FileNotFoundException(
+                            p + " (hidden by HonorAdvancedSettings)");
+                }
+            };
+            XposedBridge.hookAllConstructors(java.io.FileInputStream.class, fis);
+            n++;
+        } catch (Throwable ignored) {
+        }
+        // 2) new FileReader(String) / (File)
+        try {
+            XC_MethodHook fr = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    if (!Cfg.isOn(Cfg.K_NOCLOUD)) return;
+                    String p = cotaPathOf(param);
+                    if (p == null) return;
+                    noteCotaHideHit(p);
+                    throw new java.io.FileNotFoundException(
+                            p + " (hidden by HonorAdvancedSettings)");
+                }
+            };
+            XposedBridge.hookAllConstructors(java.io.FileReader.class, fr);
+            n++;
+        } catch (Throwable ignored) {
+        }
+        // 3) new RandomAccessFile(String, String) / (File, String)
+        try {
+            XC_MethodHook raf = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    if (!Cfg.isOn(Cfg.K_NOCLOUD)) return;
+                    String p = cotaPathOf(param);
+                    if (p == null) return;
+                    noteCotaHideHit(p);
+                    throw new java.io.FileNotFoundException(
+                            p + " (hidden by HonorAdvancedSettings)");
+                }
+            };
+            XposedBridge.hookAllConstructors(java.io.RandomAccessFile.class, raf);
+            n++;
+        } catch (Throwable ignored) {
+        }
+        // 4) java.nio.file.Files / FileChannel（v3.2.36 补）
+        //    实测 PowerGenie 那 20 个读取入口都返回 InputStream（走 FileInputStream），
+        //    但 OTA 换实现是常事 —— 真改成 NIO 的话上面三种一个都盖不到，这里兜底。
+        try {
+            XC_MethodHook nio = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    if (!Cfg.isOn(Cfg.K_NOCLOUD)) return;
+                    String p = null;
+                    try {
+                        if (param.args != null && param.args.length > 0
+                                && param.args[0] instanceof java.nio.file.Path) {
+                            p = param.args[0].toString();
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    if (!isCotaPerfFile(p)) return;
+                    noteCotaHideHit(p);
+                    throw new java.nio.file.NoSuchFileException(p);
+                }
+            };
+            int nioPoints = 0;
+            for (String mn : new String[]{"newInputStream", "newBufferedReader",
+                    "lines", "readAllBytes"}) {
+                try {
+                    XposedBridge.hookAllMethods(java.nio.file.Files.class, mn, nio);
+                    nioPoints++;
+                } catch (Throwable ignored) {
+                }
+            }
+            try {
+                XposedBridge.hookAllMethods(java.nio.channels.FileChannel.class, "open", nio);
+                nioPoints++;
+            } catch (Throwable ignored) {
+            }
+            if (nioPoints > 0) {
+                n++;
+                Diag.note("ok: 云控 NIO 兜底已挂上（" + nioPoints + " 个）");
+            }
+        } catch (Throwable ignored) {
+        }
+        return n;
+    }
+
+    /** 从构造参数里取出路径并校验是否是那三个云控文件；不是则返回 null。 */
+    private static String cotaPathOf(XC_MethodHook.MethodHookParam param) {
+        try {
+            if (param.args == null || param.args.length == 0) return null;
+            Object a0 = param.args[0];
+            String p = null;
+            if (a0 instanceof String) {
+                p = (String) a0;
+            } else if (a0 instanceof java.io.File) {
+                p = ((java.io.File) a0).getPath();
+            }
+            return isCotaPerfFile(p) ? p : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static void noteCotaHideHit(String p) {
+        if (sCotaHideLogged) return;
+        sCotaHideLogged = true;
+        Diag.note("nocloud: 已把云控文件伪装成不存在 -> " + p
+                + "（PowerGenie 将回退到原厂内置配置）");
+    }
+
+    /**
+     * **自证**：证明 File hook 真的起作用了，而不是"挂上了但没生效"。
+     *
+     * <p>做法：用 {@code File.list()} 看目录里到底有没有这个文件（list 不受我们
+     * 的 exists hook 影响），再调 {@code new File(path).exists()} 看返回值。
+     * <ul>
+     *   <li>物理存在 + exists() 返回 false → hook 生效 ✓</li>
+     *   <li>物理存在 + exists() 返回 true → hook 没生效 ⚠</li>
+     *   <li>物理不存在 → 无法区分（跳过，不打日志）</li>
+     * </ul>
+     * 这是唯一能在"云控文件没来过"的情况下证明拦截层可用的手段。
+     */
+    private static void selfCheckCotaHide() {
+        try {
+            // 【反例优先】先证明"没误伤" —— 目录本身不在这三个路径里，
+            // 它必须仍然可见。如果这里返回 false，说明 hook 匹配写得太宽，
+            // 会把 PowerGenie 其它 cota 文件（无障碍、权限、胶囊…）一起挡掉，
+            // 那是比"没拦住云控"严重得多的故障。
+            boolean dirVisible = new java.io.File("/data/cota/para").exists();
+            Diag.note("nocloud 自检：/data/cota/para 目录 "
+                    + (dirVisible ? "仍可见 ✓（未误伤其它 cota 文件）"
+                                  : "⚠ 被误伤！匹配范围过宽"));
+
+            for (String name : new String[]{"cpuconfig", "pg_config", "thermal_config"}) {
+                String path = "/data/cota/para/" + name;
+                java.io.File dir = new java.io.File("/data/cota/para");
+                String[] names = dir.list();
+                if (names == null) return;
+                boolean physically = false;
+                for (String s : names) {
+                    if (s != null && s.equals(name)) {
+                        physically = true;
+                        break;
+                    }
+                }
+                if (!physically) continue;   // 没有真文件，没法做对照实验
+                boolean seen = new java.io.File(path).exists();
+                Diag.note("nocloud 自检 [" + name + "]：文件实际存在=true，exists()=" + seen
+                        + (seen ? " → ⚠ 拦截未生效（hook 没命中）"
+                                : " → ✓ 拦截已生效（PowerGenie 看不到它）"));
+                return;
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 只认这三份性能/温控云控配置，别的 cota 文件（无障碍、权限、胶囊）一概不碰。 */
+    private static boolean isCotaPerfFile(String p) {
+        if (p == null || p.length() < 24) return false;
+        if (!p.startsWith("/data/cota/para/")) return false;
+        return p.endsWith("/cpuconfig") || p.endsWith("/pg_config")
+                || p.endsWith("/thermal_config");
+    }
+
+    private static final java.util.concurrent.atomic.AtomicBoolean sCotaHideHooked =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static volatile boolean sCotaHideLogged = false;
+
     private static boolean sExtraDone = false;
 
     /**
