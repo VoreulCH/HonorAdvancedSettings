@@ -18,6 +18,26 @@ data class ScopeReport(
 )
 
 /**
+ * 上报记录的有效期（v3.2.36）。
+ *
+ * <p>为什么需要：自证记录存在模块 app 的 prefs 里，**模块被禁用/卸载后这些记录
+ * 不会消失**。原来的 {@code has()} 只看"有没有这条记录"，于是模块早就停了，
+ * 界面还理直气壮地显示"作用域已生效" —— 典型的假阳性。
+ *
+ * <p>现在的判据：记录时间距现在超过 72 小时就当作无效。取 72 小时而不是更短，
+ * 是因为常驻进程（systemui / launcher）本来就可能好几天不重启，它们的上报时间
+ * 停留在上次启动那一刻是正常现象。真被禁用的模块不会连续三天还在上报。
+ */
+private const val STALE_AFTER_MS = 72L * 60L * 60L * 1000L
+
+/** 某条上报是否还"新鲜"（时间戳合法且不过期）。 */
+private fun ScopeReport.isFresh(): Boolean {
+    if (at <= 0L) return false
+    val age = System.currentTimeMillis() - at
+    return age in 0..STALE_AFTER_MS
+}
+
+/**
  * 模块在各作用域里的实际运行状态（v2.3.0）。
  *
  * [probed] = 至少成功读过一次 provider；false 说明还没读或读失败，
@@ -27,12 +47,26 @@ data class ModuleState(
     val reports: Map<String, ScopeReport> = emptyMap(),
     val probed: Boolean = false
 ) {
-    val running: Boolean get() = reports.isNotEmpty()
+    /** 只算"还新鲜"的记录 —— 避免模块被禁用后旧记录造成的假阳性。 */
+    val running: Boolean get() = reports.values.any { it.isFresh() }
 
-    fun has(pkg: String): Boolean = reports.containsKey(pkg)
+    fun has(pkg: String): Boolean = reports[pkg]?.isFresh() == true
 
     fun missing(required: Collection<String>): List<String> =
-        required.filter { !reports.containsKey(it) }
+        required.filter { !has(it) }
+
+    /**
+     * 上报过，但记录已经过期（v3.2.37）。
+     *
+     * <p>用来把「**从没上报过**」（模块没勾作用域 / 没重启）和「**上报过但记录太旧**」
+     * 区分开。两者的修法完全不同：
+     * <ul>
+     *   <li>从没上报 → 去 LSPosed 勾作用域并重启进程</li>
+     *   <li>记录太旧 → 只是很久没重启，重启一次就能刷新，不一定是坏了</li>
+     * </ul>
+     * 不区分的话，用户看到"作用域未生效"会以为模块坏了，白折腾一轮。
+     */
+    fun expired(pkg: String): Boolean = reports[pkg]?.let { !it.isFresh() } ?: false
 
     /** 该作用域在跑，但跑的是旧版本模块（OTA 后没重启进程）。 */
     fun stale(pkg: String): Boolean {
