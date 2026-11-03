@@ -157,8 +157,15 @@ public final class Cfg {
     /** 「高光语义」一次性迁移标记。 */
     public static final String MIG_HL_V2 = "hl_semantic_v2";
 
-    /** 锁屏按钮历史烧录值 -> 原厂等价的一次性迁移标记。 */
-    public static final String MIG_KG_BTN_V2 = "kg_btn_orig_v1";
+    /**
+     * 锁屏按钮历史烧录值 -> 原厂等价的一次性迁移标记。
+     *
+     * <p>v2：v1 的标记在「四键还不存在」时就被写成了 true（见旧实现），
+     * 之后 {@link #migrateBakedParams} 才把 50/140/110/120 写进 prefs，
+     * 于是 v1 永远提前返回，脏参数一直留在机器上（锁屏手电筒底板发白就是这么来的）。
+     * 换新标记名等于让 219 再跑一次迁移，把老用户机器上的残留值纠回来。
+     */
+    public static final String MIG_KG_BTN_V2 = "kg_btn_orig_v2";
 
     /**
      * 把历史烧录值（fn_kg_btn=50 / dep=140 / dis=110 / edge=120）重置为 100（原厂等价）。
@@ -167,19 +174,21 @@ public final class Cfg {
      * 一次性标记，避免每次启动覆盖用户后续的调整。
      */
     public static void migrateKgBtnDefaults(SharedPreferences p) {
+        if (p == null) return;
         if (p.getBoolean(MIG_KG_BTN_V2, false)) return;
-        // 只有四键**全部**等于历史配方时才整组迁移；用户改过任何一个
-        // 就完全不动，避免"恰好等于历史值"被误伤。
-        boolean allOld = p.contains(F_KG_BTN) && p.getInt(F_KG_BTN, 100) == 50
-                && p.contains(F_KG_BTN_DEP) && p.getInt(F_KG_BTN_DEP, 100) == 140
-                && p.contains(F_KG_BTN_DIS) && p.getInt(F_KG_BTN_DIS, 100) == 110
-                && p.contains(F_KG_BTN_EDGE) && p.getInt(F_KG_BTN_EDGE, 100) == 120;
-        SharedPreferences.Editor ed = p.edit().putBoolean(MIG_KG_BTN_V2, true);
-        if (allOld) {
-            ed.putInt(F_KG_BTN, 100).putInt(F_KG_BTN_DEP, 100)
-                    .putInt(F_KG_BTN_DIS, 100).putInt(F_KG_BTN_EDGE, 100);
-        }
-        ed.apply();
+        // 四键还没落地（新装 / 本次启动还没 seed）时不许打标记 —— 旧实现就在这里
+        // 提前落标记，之后 migrateBakedParams 才把历史烧录值写进 prefs，
+        // 迁移从此永远够不着，锁屏手电筒底板被这些值弄成发白。
+        if (!p.contains(F_KG_BTN) && !p.contains(F_KG_BTN_DEP)
+                && !p.contains(F_KG_BTN_DIS) && !p.contains(F_KG_BTN_EDGE)) return;
+        // 逐键核对：只有恰好等于历史烧录值的那一项回到原厂等价 100，
+        // 用户自己拖过的值原样保留。
+        SharedPreferences.Editor ed = p.edit();
+        if (p.getInt(F_KG_BTN, 100) == 50) ed.putInt(F_KG_BTN, 100);
+        if (p.getInt(F_KG_BTN_DEP, 100) == 140) ed.putInt(F_KG_BTN_DEP, 100);
+        if (p.getInt(F_KG_BTN_DIS, 100) == 110) ed.putInt(F_KG_BTN_DIS, 100);
+        if (p.getInt(F_KG_BTN_EDGE, 100) == 120) ed.putInt(F_KG_BTN_EDGE, 100);
+        ed.putBoolean(MIG_KG_BTN_V2, true).apply();
     }
 
     /**
