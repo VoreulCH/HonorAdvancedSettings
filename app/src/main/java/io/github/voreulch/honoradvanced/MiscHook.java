@@ -86,13 +86,14 @@ public final class MiscHook {
      * (Cfg.hottempOn(), readable from any process, no binder).
      */
     public static void initPowerGenie(ClassLoader cl, String apkPath) {
+        Diag.note("MiscHook 210/3.2.80 loaded (powergenie)");
         // ⚠ 必须先跑：下面那行 `if (sPgDone || sPgTries >= 3) return;` 是给
         // ThermalManager 那部分用的闸门。早先把 hookThermalExtra 放在函数末尾，
         // 结果 ThermalManager 连挂 3 次失败后整个函数直接 return，
         // thermal-extra 永远拿不到执行机会 —— sExtraDone 的重试逻辑等于白写。
         hookThermalExtra(apkPath, cl);
         hookCloudPolicy(cl, apkPath);
-        // v3.2.34：**读取侧拦截**。三个 Receiver 只拦住"热重载通知"，
+        // **读取侧拦截**。三个 Receiver 只拦住"热重载通知"，
         // 文件本身是别的进程写的，拦不住；所以还要让 PowerGenie 读不到它们。
         // 伪造"文件不存在"→ 它回退到自己的原厂内置配置，不用我们覆盖任何内容。
         hookCotaFileAccess();
@@ -159,7 +160,7 @@ public final class MiscHook {
     private static int sExtraBlocked = 0;
     private static boolean sCloudDone = false;
     /**
-     * v3.2.36：已成功挂载的云控 hook 标识。
+     * 已成功挂载的云控 hook 标识。
      *
      * <p>为什么需要它：{@code sCloudDone} 只在**三个 Receiver 全挂上**时才置 true。
      * 第一次 handleLoadPackage 时 HAware 的 dex 可能还没就绪（多包名共进程的
@@ -189,7 +190,7 @@ public final class MiscHook {
     private static boolean sFraudFirstOn = false;
 
     /**
-     * 屏蔽反诈组件的数据采集与上报（v3.2.0）。
+     * 屏蔽反诈组件的数据采集与上报。
      *
      * <p>主体是 {@code com.hihonor.securityserver}（uid=system 的系统应用）。
      * 它的类名全被混淆了，dex 里只留下三条可读线索：
@@ -216,7 +217,7 @@ public final class MiscHook {
     }
 
     /**
-     * 感知服务本体的**精准**反诈拦截（v3.2.42）。
+     * 感知服务本体的**精准**反诈拦截。
      *
      * <p>为什么需要单独一条：实测 {@code com.hihonor.awareness} 自己有 41 处
      * fraud 相关逻辑（诈骗电话识别 / 诈骗应用检测 / 行为事件集）和独立上报通道
@@ -241,99 +242,64 @@ public final class MiscHook {
         if (apkPath == null) return;
         final String[] apkPaths = allApkPaths(apkPath, splitPaths);
         try {
-            // v3.2.43：改成**按类名正则**扫。
-            //
-            // 上一版用 `queryFraudCallingLatestRecordBy` 这些当锚点，结果 0 命中，
-            // 46MB 的 dex 两毫秒就返回空。原因是它们**是方法名 / 类名**，
-            // 而 DexKit 的 usingStrings 只匹配方法体里 const-string 的字面量。
-            //
-            // v3.2.44：正则扫在这个 46MB 的 APK 上**同样 0 命中**（DexKit 对它不可靠），
-            // 所以改成"真实类名 + 失败静默跳过"。类名是从 dex 里直接提取的
+            // 用真实类名定位 Fraud Processor。类名是从 dex 里直接提取的
             // （不是猜的），实测**没有混淆**：都在
             // `com.hihonor.awareness.server.aisecurity.opencapacity.data` 下。
+            //
+            // DexKit 的 usingStrings 只匹配方法体里 const-string 的字面量，拿方法名 /
+            // 类名当锚点会 0 命中；46MB 的 APK 上正则扫描同样不可靠，所以两者都不用。
             //
             // 为什么只挑两个 Processor 而不是那 20 多个 Fraud*Data：
             // `*Data` / `*StandardData` 全是 POJO（数据载体），hook 它们没有任何意义；
             // 真正把 fraud 行为写进数据平台再往外送的是这两个 Processor。
-            int n = 0;
+            int nFraud = 0;
             java.util.Set<String> seen = new java.util.HashSet<String>();
-            java.util.List<java.lang.reflect.Method> candidates = new java.util.ArrayList<>();
-            // 先试 DexKit 正则（万一某个版本它能工作，就自动覆盖更多）。
-            //
-            // v3.2.45：**只试一次**。这个 APK 有 46MB，实测 DexKit 在它上面
-            // 稳定返回空（bridge ready 但索引没建起来）。如果按"n==0 就重试"
-            // 的逻辑走，每次 handleLoadPackage 都会重新解析 46MB dex，
-            // 那是实打实的启动卡顿。所以用一个独立标记把 DexKit 这条路钉死。
+            java.util.List<java.lang.reflect.Method> fraudCandidates = new java.util.ArrayList<>();
+            int fraudDynamic = 0;
+            // DexKit 只试一次：46MB APK 不能每次 handleLoadPackage 重解析。
+            // 只扫描反诈 Fraud Processor，不再扫描/挂载 Subject。
             if (!sAwarenessDexTried) {
                 sAwarenessDexTried = true;
-                candidates.addAll(findFraudMethods(apkPaths, cl));
-            }
-            // 再补上确定存在的两个 Processor（OTA 改名时 forName 失败，静默跳过）
-            for (String fixed : new String[]{
-                    "com.hihonor.awareness.dataplatform.storage.processor.impl."
-                            + "StandardEventDataOffFraudBehaviorProcessor",
-                    "com.hihonor.awareness.dataplatform.storage.processor.impl."
-                            + "StandardEventDataOlFraudBehaviorProcessor",
-            }) {
-                try {
-                    Class<?> c = cl.loadClass(fixed);
-                    for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
-                        if (m != null) {
-                            candidates.add(m);
-                        }
+                String proc = currentProcessName();
+                // awareness 有主进程 + :dp.ofdb 等子进程；动态扫描只在主进程跑，
+                // 子进程（含 :dp.ofdb）直接硬编码，避免 46MB dex 再多扫一遍。
+                if (!"com.hihonor.awareness".equals(proc)) {
+                    Diag.note("DexKit dynamic skipped (proc=" + proc + ")，subprocess 走硬编码");
+                } else {
+                    long t0 = android.os.SystemClock.elapsedRealtime();
+                    String baseApk = apkPaths.length > 0 ? apkPaths[0] : apkPath;
+                    int dexNum = DexKitHelper.dexNum(baseApk);
+                    boolean canProcessor = DexKitHelper.hasClassExact(baseApk,
+                            "com.hihonor.awareness.dataplatform.storage.processor.impl."
+                                    + "StandardEventDataOffFraudBehaviorProcessor");
+                    boolean canPojo = DexKitHelper.hasClassExact(baseApk,
+                            "com.hihonor.awareness.server.aisecurity.opencapacity.data.FraudAppUsageData");
+                    boolean canBase = DexKitHelper.hasClassExact(baseApk, "baseplugin.ej.f");
+                    Diag.note("DexKit canary: dexNum=" + dexNum
+                            + " processor=" + canProcessor + " fraudPojo=" + canPojo
+                            + " base=" + canBase);
+                    if (dexNum == 1) {
+                        Diag.note("warn: DexKit 只索引 1 个 dex，动态扫描会漏 classes2+；硬编码兜底");
                     }
-                } catch (Throwable ignored) {
-                    // 类不在了（OTA 改名）—— 跳过，不影响其它 hook
+                    fraudCandidates.addAll(findProcessorMethods(apkPaths, cl, "Fraud"));
+                    fraudDynamic = fraudCandidates.size();
+                    long cost = android.os.SystemClock.elapsedRealtime() - t0;
+                    if (fraudDynamic == 0 || cost > 5000L) {
+                        Diag.note("warn: DexKit 动态扫描 fraud=" + fraudDynamic
+                                + " cost=" + cost + "ms，降级为硬编码 Processor");
+                    } else {
+                        Diag.note("DexKit 动态候选: fraud=" + fraudDynamic
+                                + " / " + cost + "ms");
+                    }
                 }
             }
-            for (java.lang.reflect.Method m : candidates) {
-                final String cn = m.getDeclaringClass().getName();
-                // 人脸活体检测不碰：那是人脸识别的安全防线
-                if (cn.toLowerCase(java.util.Locale.US).contains("face")) {
-                    continue;
-                }
-                final Class<?> rt = m.getReturnType();
-                final boolean isBool = rt == boolean.class;
-                final boolean isInt = rt == int.class;
-                final boolean isVoid = rt == void.class;
-                if (!isBool && !isInt && !isVoid) {
-                    continue;
-                }
-                String sig = cn + "#" + m.getName() + "/" + m.getParameterTypes().length;
-                if (!seen.add(sig)) {
-                    continue;
-                }
-                try {
-                    XposedBridge.hookMethod(m, new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            try {
-                                if (!Cfg.isOn(Cfg.K_NOFRAUD)) return;
-                                if (isVoid) {
-                                    param.setResult(null);
-                                } else if (isBool) {
-                                    param.setResult(Boolean.FALSE);
-                                } else {
-                                    param.setResult(Integer.valueOf(0));
-                                }
-                                if (sAwarenessHitLog < 12) {
-                                    sAwarenessHitLog++;
-                                    Diag.note("nofraud: awareness 已拦 "
-                                            + cn + "." + m.getName());
-                                }
-                            } catch (Throwable ignored) {
-                            }
-                        }
-                    });
-                    n++;
-                    Diag.note("ok: nofraud awareness <- " + cn + "." + m.getName());
-                } catch (Throwable ignored) {
-                }
-            }
-            sAwarenessDone = n > 0;
-            Diag.note("nofraud awareness: 共接管 " + n + " 处"
-                    + (n > 0 ? "（人脸活体已排除）"
-                            : " ⚠ 一个都没命中，锚点可能随 OTA 失效"));
+            // 硬编码基线：只保留反诈专用的 2 个 Fraud Processor。
+            fraudCandidates.addAll(loadProcessorMethods(cl, AWARENESS_FRAUD_PROCESSORS));
+            nFraud = hookAwarenessList(fraudCandidates, Cfg.K_NOFRAUD, seen, "fraud");
+            sAwarenessDone = nFraud > 0;
+            Diag.note("nofraud: fraud " + nFraud
+                    + "（动态候选 fraud=" + fraudDynamic + "）"
+                    + (sAwarenessDone ? "" : " ⚠ 一个都没命中，锚点可能随 OTA 失效"));
         } catch (Throwable t) {
             Diag.note("skip: nofraud awareness hook 失败 ("
                     + t.getClass().getSimpleName() + ")");
@@ -344,31 +310,53 @@ public final class MiscHook {
     /** DexKit 在 awareness 的 46MB dex 上只尝试一次（见 initAwareness 里的说明）。 */
     private static volatile boolean sAwarenessDexTried = false;
     private static volatile int sAwarenessHitLog = 0;
+    /**
+     * 反诈专用硬编码 Processor（写 ofFraudBehaviorEventSet / FraudBehaviorEventSet）。
+     * 只有这两个受 K_NOFRAUD 控制。
+     */
+    private static final String[] AWARENESS_FRAUD_PROCESSORS = new String[]{
+            "com.hihonor.awareness.dataplatform.storage.processor.impl."
+                    + "StandardEventDataOffFraudBehaviorProcessor",
+            "com.hihonor.awareness.dataplatform.storage.processor.impl."
+                    + "StandardEventDataOlFraudBehaviorProcessor",
+    };
 
     /**
-     * 把所有"类名含 fraud"的类的方法收集起来（v3.2.43）。
-     *
-     * <p>排除 `face`：{@code FaceFraudDetector} / {@code VisionFaceFraudService}
-     * 是人脸活体检测（防照片/视频攻击），属于人脸识别的安全防线，
-     * 跟"反诈数据上报"是两回事，拦了纯属自损。
+     * 动态发现 Processor。Contains("Fraud") 只负责圈类，
+     * 真正的过滤条件在这里：
+     *   1) 不是 face 相关类；
+     *   2) 继承 {@code baseplugin.ej.f}（如果基类能加载）；
+     *   3) 只收 {@code insert(...)} 方法（POJO 的 getter/setter 全部排除）。
      */
-    private static java.util.List<java.lang.reflect.Method> findFraudMethods(
-            String[] apks, ClassLoader cl) {
+    private static java.util.List<java.lang.reflect.Method> findProcessorMethods(
+            String[] apks, ClassLoader cl, String keyword) {
         java.util.List<java.lang.reflect.Method> out = new java.util.ArrayList<>();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        Class<?> base = null;
+        try { base = cl.loadClass("baseplugin.ej.f"); } catch (Throwable ignored) { }
+        // 基类加载不到时直接放弃动态扫描，只走硬编码；
+        // 不再退化成"只看 insert 名字"的宽松匹配，避免 OTA 改名后误收 POJO。
+        if (base == null) return out;
         for (String ap : apks) {
             try {
-                for (Class<?> c : DexKitHelper.findClassesByNameRegex(ap, cl, ".*[Ff]raud.*")) {
+                for (Class<?> c : DexKitHelper.findClassesByNameContains(ap, cl, keyword)) {
                     if (c.getName().toLowerCase(java.util.Locale.US).contains("face")) {
                         continue;
                     }
-                    try {
-                        java.lang.reflect.Method[] ms = c.getDeclaredMethods();
-                        for (java.lang.reflect.Method m : ms) {
-                            if (m != null) {
-                                out.add(m);
-                            }
+                    if (!base.isAssignableFrom(c)) {
+                        continue;
+                    }
+                    for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                        if (m == null || !"insert".equals(m.getName())
+                                || m.getParameterTypes().length != 1) {
+                            continue;
                         }
-                    } catch (Throwable ignored) {
+                        if (!"com.hihonor.awareness.dataplatform.data.IStandardEventData"
+                                .equals(m.getParameterTypes()[0].getName())) {
+                            continue;
+                        }
+                        String k = c.getName() + "#insert/" + m.getParameterTypes()[0].getName();
+                        if (seen.add(k)) out.add(m);
                     }
                 }
             } catch (Throwable ignored) {
@@ -377,7 +365,82 @@ public final class MiscHook {
         return out;
     }
 
-    /** 主包 + 所有 split 包去重后的列表（v3.2.37）。 */
+    /** 硬编码 Processor 清单：只取 insert(...) 形状，POJO 不会进来。 */
+    private static java.util.List<java.lang.reflect.Method> loadProcessorMethods(
+            ClassLoader cl, String[] names) {
+        java.util.List<java.lang.reflect.Method> out = new java.util.ArrayList<>();
+        for (String fixed : names) {
+            try {
+                Class<?> c = cl.loadClass(fixed);
+                for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                    if (m != null && "insert".equals(m.getName())
+                            && m.getParameterTypes().length == 1
+                            && "com.hihonor.awareness.dataplatform.data.IStandardEventData"
+                            .equals(m.getParameterTypes()[0].getName())) {
+                        out.add(m);
+                    }
+                }
+            } catch (Throwable ignored) {
+                // 类不在了（OTA 改名）—— 跳过，不影响其它 hook
+            }
+        }
+        return out;
+    }
+
+    /** 挂一组 Processor；gate 是 K_NOFRAUD。 */
+    private static int hookAwarenessList(java.util.List<java.lang.reflect.Method> methods,
+                                         String gate, java.util.Set<String> seen, String label) {
+        int n = 0;
+        for (final java.lang.reflect.Method m : methods) {
+            final String cn = m.getDeclaringClass().getName();
+            if (cn.toLowerCase(java.util.Locale.US).contains("face")) continue;
+            final Class<?> rt = m.getReturnType();
+            final boolean isBool = rt == boolean.class;
+            final boolean isInt = rt == int.class;
+            final boolean isVoid = rt == void.class;
+            if (!isBool && !isInt && !isVoid) continue;
+            String sig = cn + "#insert/" + m.getParameterTypes().length;
+            if (!seen.add(sig)) continue;
+            try {
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            if (!Cfg.isOn(gate)) return;
+                            if (isVoid) param.setResult(null);
+                            else if (isBool) param.setResult(Boolean.FALSE);
+                            else param.setResult(Integer.valueOf(0));
+                            if (sAwarenessHitLog < 12) {
+                                sAwarenessHitLog++;
+                                Diag.note("nofraud: awareness " + label + " 已拦 "
+                                        + cn + "." + m.getName());
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                n++;
+                Diag.note("ok: nofraud awareness " + label + " <- " + cn + "." + m.getName());
+            } catch (Throwable ignored) {
+            }
+        }
+        return n;
+    }
+
+    /** 读 /proc/self/cmdline，区分 awareness 主进程与 :dp.ofdb 子进程。 */
+    private static String currentProcessName() {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(new java.io.FileInputStream("/proc/self/cmdline"))) ) {
+            String s = r.readLine();
+            if (s == null) return "?";
+            int nul = s.indexOf('\0');
+            return nul >= 0 ? s.substring(0, nul) : s;
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
+    /** 主包 + 所有 split 包去重后的列表。 */
     private static String[] allApkPaths(String main, String[] splits) {
         java.util.LinkedHashSet<String> set = new java.util.LinkedHashSet<String>();
         if (main != null && main.length() > 0) {
@@ -428,7 +491,7 @@ public final class MiscHook {
     }
 
     private static void hookAntiFraud(ClassLoader cl, String apkPath, String[] splitPaths) {
-        // v3.2.45：**总闸 / 断链 / 门面必须放在 sFraudDone 检查之前**。
+        // **总闸 / 断链 / 门面必须放在 sFraudDone 检查之前**。
         //
         // 这是个真实的顺序 bug：这三层各自有幂等标记（失败会复位以便重试），
         // 但如果它们写在 `if (sFraudDone) return;` 之后，一旦逐点那部分先挂满
@@ -442,8 +505,8 @@ public final class MiscHook {
         if (apkPath == null) return;
         final String[] apkPaths = allApkPaths(apkPath, splitPaths);
 
-        // v3.2.48：作用域**两个**进程 —— 反诈服务（securityserver）+ 感知服务（awareness）。
-        // 后者是 v3.2.42 补的：实测 awareness 自己有 41 处 fraud 逻辑和独立上报通道，
+        // 作用域**两个**进程 —— 反诈服务（securityserver）+ 感知服务（awareness）。
+        // 后者是感知服务补上的：实测 awareness 自己有 41 处 fraud 逻辑和独立上报通道，
         // 只拦 securityserver 等于只关了一个水龙头。awareness 那一侧走
         // MainHook → initAwareness，不经过本函数。
 
@@ -454,7 +517,7 @@ public final class MiscHook {
         String[][] anchors = {
                 {"antifraud", "antifraud detect state switch"},       // 开关/观察者注册
                 {"fraud_cloud", "fraud_cloud_security_check"},        // 云控校验
-                // v3.2.51：删掉了 fence_reg / fence_id / fence_hot 三组锚点。
+                // 删掉了 fence_reg / fence_id / fence_hot 三组锚点。
                 // 它们实机**从未命中过一次**（加进去之后挂载数一直停在 8，一点没涨）——
                 // 原因是那些字符串睡在字段初始化和静态常量里，不在方法体内，
                 // 而 DexKit 的 usingStrings 只匹配方法内的 const-string。
@@ -544,7 +607,7 @@ public final class MiscHook {
                 // 这四类一起挡，反诈才真的拿不到东西。
                 // 拦截范围：**只拦语义明确的"注册/采集/发送"**。
                 //
-                // 刻意排除两类（v3.2.5 第 4 轮复查）：
+                // 刻意排除两类：
                 //   · *Snapshot       —— checkSnapshot 语义可能是"验证快照有效"，
                 //                        返回 false 等于"无效"，会触发宿主禁用逻辑，
                 //                        而不是"停止采集"。拦错语义比不拦更危险。
@@ -650,7 +713,7 @@ public final class MiscHook {
         Diag.note("nofraud: 共接管 " + n + " 处（控制=" + nCtl
                 + " 感知=" + nAware + " 云参数=" + nRecv + "）"
                 + (complete ? "" : " ⚠ 有类别未命中，下次重试"));
-        // v3.2.37 正反双例自检。
+        // 正反双例自检。
         //
         // 正例：三类（云控校验 / 感知围栏 / 云参数接收）都有命中 —— 说明拦截点齐全。
         // 反例：把**每一个被挂的方法名**打出来，供人工核对"挂的是不是都跟反诈有关"。
@@ -666,8 +729,7 @@ public final class MiscHook {
     }
 
     /**
-     * **总闸拦截**（v3.2.38）—— 不再逐点堵，直接在 Settings 这一层把所有
-     * 反诈相关开关读成 0。
+     * **总闸拦截** —— 直接在 Settings 这一层把所有反诈相关开关读成 0。
      *
      * <p>反编译实证（{@code SafetyCtrlService$e.onChange}）：
      * <pre>
@@ -745,7 +807,7 @@ public final class MiscHook {
     }
 
     /**
-     * **断链**（v3.2.39）—— 不让 securityserver 连上感知服务。
+     * **断链**—— 不让 securityserver 连上感知服务。
      *
      * <p>这是"整体拦截"里最省事的一刀：反诈的所有数据都来自
      * {@code com.hihonor.awareness} 的围栏。围栏要工作，客户端必须先
@@ -812,7 +874,7 @@ public final class MiscHook {
     }
 
     /**
-     * **门面类整体拦截**（v3.2.41）—— 把 awareness 客户端的每个入口一次性全掐掉。
+     * **门面类整体拦截**—— 把 awareness 客户端的每个入口一次性全掐掉。
      *
      * <p>为什么不用字符串锚点：实测 {@code REGISTER_FENCE_BY_INTENT} /
      * {@code AWARENESS_FENCE_IDENTIFIER} / 各种围栏名这些字符串**出现在字段初始化和
@@ -903,14 +965,14 @@ public final class MiscHook {
     private static int sCloudBlocked = 0;
 
     /**
-     * 屏蔽**性能/温控策略的云控下发**（v3.2.0）。
+     * 屏蔽**性能/温控策略的云控下发**。
      *
      * <p>来源：反编译 HAware 时挖到的
      * {@code com.hihonor.powergenie.integration.eventhub.bcreceiver.ThermalCfgCotaUpdateReceiver}
      * —— "Cota" 就是云侧配置（Cloud OTA Config）更新。系统收到云端的温控策略包后，
      * 这个 Receiver 负责把它落进本地策略库，之后 PowerGenie 就按云端那套降频/限帧。
      *
-     * <p><b>三层拦截（v3.2.36 起）</b>：
+     * <p><b>三层拦截</b>：
      * <ol>
      *   <li><b>通知层</b>：三个 {@code *CotaUpdateReceiver.onReceive} 直接 setResult，
      *       等于"收到了但不当回事"，不会触发配置热重载</li>
@@ -946,7 +1008,7 @@ public final class MiscHook {
                 "com.hihonor.powergenie.integration.eventhub.bcreceiver.ThermalCfgCotaUpdateReceiver",
         };
         for (final String rn : recv) {
-            // v3.2.36：已挂过的跳过（失败重试时不要重复挂）
+            // 已挂过的跳过（失败重试时不要重复挂）
             if (!sCloudHooked.add("R:" + rn)) {
                 nRecv++;   // 计入本次统计，但不重复 hook
                 continue;
@@ -957,6 +1019,7 @@ public final class MiscHook {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         try {
+                            // 单开关：开着就三份都挡。
                             boolean on = Cfg.isOn(Cfg.K_NOCLOUD);
                             if (!sCloudFirstSeen) {
                                 sCloudFirstSeen = true;
@@ -969,7 +1032,8 @@ public final class MiscHook {
                             if (!sCloudFirstBlocked) {
                                 sCloudFirstBlocked = true;
                                 Diag.note("nocloud: 首次拦截 "
-                                        + rn.substring(rn.lastIndexOf('.') + 1) + "（真的拦下了）");
+                                        + rn.substring(rn.lastIndexOf('.') + 1)
+                                        + "（真的拦下了）");
                             }
                             if (sCloudBlocked < 8) {
                                 sCloudBlocked++;
@@ -995,7 +1059,7 @@ public final class MiscHook {
         // 1b) 读取入口也要堵：即便 Receiver 被拦，进程启动时若已经读过
         //     /data/cota/para/ 下的旧配置，照样会按云端那套跑。
         if (apkPath != null) {
-            // 锚点用**文件路径**而不是日志文案（v3.2.5 第 5 轮）。
+            // 锚点用**文件路径**而不是日志文案（第 5 轮）。
             //
             // 反编译后发现读 /data/cota/para/ 的方法有 8 个，分布在三处：
             //   powergenie.core.f0.q
@@ -1025,10 +1089,12 @@ public final class MiscHook {
                     java.util.List<java.lang.reflect.Method> ms =
                             DexKitHelper.findMethodsByStrings(apkPath, cl, a2);
                     for (final java.lang.reflect.Method m : ms) {
-                        // v3.2.36：已挂过的跳过。sCloudDone 只在三个 Receiver **全成功**
-                        // 时才置位，失败重试会把同一批方法重复 hook —— 回调执行多次，
+                        // 已挂过的跳过。sCloudDone 只在三个 Receiver **全成功**
+                        // 时才置位，失败重试会把同一批方法重复 hook —— 回调执行多次、
                         // 计数翻倍。所有回调都是 setResult（幂等）所以没暴露，但必须清掉。
-                        String sigKey = "M:" + m.getDeclaringClass().getName() + "#"
+                        // key 不带锚点前缀，主锚点/兜底锚点共用同一个，
+                        // 否则同一方法会被两条路径各挂一次。
+                        String sigKey = m.getDeclaringClass().getName() + "#"
                                 + m.getName() + "/" + m.getParameterTypes().length;
                         if (!sCloudHooked.add(sigKey)) {
                             continue;
@@ -1046,7 +1112,7 @@ public final class MiscHook {
                                         else if (rt == void.class) param.setResult(null);
                                         else if (rt == int.class) param.setResult(Integer.valueOf(0));
                                         else if (java.io.InputStream.class.isAssignableFrom(rt)) {
-                                            // ⚠ 返回流的方法**不改返回值，只记录**（v3.2.5 第 6 轮）。
+                                            // ⚠ 返回流的方法**不改返回值，只记录**（第 6 轮）。
                                             //
                                             // 之前给空流，本想"让解析失败退回默认策略"。但反编译核查
                                             // powergenie.core.f0.q 的方法体：**move-exception 出现 0 次**
@@ -1105,19 +1171,45 @@ public final class MiscHook {
                             // 已经按类名挂过的跳过（同方法重复挂会触发两次）
                             continue;
                         }
-                        XposedBridge.hookMethod(m, new XC_MethodHook() {
-                            @Override
-                            protected void beforeHookedMethod(MethodHookParam param) {
-                                try {
-                                    if (!Cfg.isOn(Cfg.K_NOCLOUD)) return;
-                                    param.setResult(null);
-                                } catch (Throwable ignored) {
+                        // 兜底锚点也必须复用 sCloudHooked 去重，并且
+                        // 只能对可安全改写的返回类型 setResult；对象/集合返回
+                        // 置 null 会让 powergenie/iaware 在调用方 NPE。
+                        // 与主锚点共用无前缀 key，避免同一方法双挂。
+                        String sigKey = m.getDeclaringClass().getName() + "#"
+                                + m.getName() + "/" + m.getParameterTypes().length;
+                        if (!sCloudHooked.add(sigKey)) {
+                            continue;
+                        }
+                        final Class<?> rt = m.getReturnType();
+                        if (rt != void.class && rt != boolean.class
+                                && rt != int.class && rt != long.class) {
+                            Diag.note("skip: 云控兜底锚点 " + anchor2 + " -> "
+                                    + m.getDeclaringClass().getSimpleName() + "." + m.getName()
+                                    + " ret=" + rt.getSimpleName() + "（非安全类型，不 hook）");
+                            sCloudHooked.remove(sigKey); // 允许下次以新策略重试
+                            continue;
+                        }
+                        try {
+                            XposedBridge.hookMethod(m, new XC_MethodHook() {
+                                @Override
+                                protected void beforeHookedMethod(MethodHookParam param) {
+                                    try {
+                                        if (!Cfg.isOn(Cfg.K_NOCLOUD)) return;
+                                        if (rt == void.class) param.setResult(null);
+                                        else if (rt == boolean.class) param.setResult(Boolean.FALSE);
+                                        else if (rt == int.class) param.setResult(Integer.valueOf(0));
+                                        else if (rt == long.class) param.setResult(Long.valueOf(0L));
+                                    } catch (Throwable ignored) {
+                                    }
                                 }
-                            }
-                        });
-                        n++;
-                        Diag.note("ok: 云控兜底锚点 " + anchor2 + " -> "
-                                + m.getDeclaringClass().getSimpleName() + "." + m.getName());
+                            });
+                            n++;
+                            Diag.note("ok: 云控兜底锚点 " + anchor2 + " -> "
+                                    + m.getDeclaringClass().getSimpleName() + "." + m.getName()
+                                    + " ret=" + rt.getSimpleName());
+                        } catch (Throwable t) {
+                            sCloudHooked.remove(sigKey);
+                        }
                     }
                 } catch (Throwable ignored) {
                 }
@@ -1133,7 +1225,7 @@ public final class MiscHook {
                 + (complete ? "" : " ⚠ Receiver 未挂全，下次重试"));
     }
     /**
-     * 让 PowerGenie **看不到**云控文件（v3.2.34）。
+     * 让 PowerGenie **看不到**云控文件。
      *
      * <p>为什么不在解析层返回空流：反编译核查 {@code powergenie.core.f0.q} 的方法体，
      * {@code move-exception} 出现 0 次 —— 它根本没有 try/catch。给空流会让解析失败
@@ -1141,7 +1233,7 @@ public final class MiscHook {
      *
      * <p>为什么伪造"不存在"是对的：这三个文件本来就可能不存在，**每一条读取路径都
      * 必须处理这种情况**，否则原厂设备早就崩了。所以把 {@code exists/isFile/length}
-     * 改成"没有"，调用方会自然回退到**它自己的原厂内置配置** —— 我们不需要覆盖任何
+     * 返回"没有"，调用方会自然回退到**它自己的原厂内置配置** —— 我们不需要覆盖任何
      * 配置内容，也就不会出现"把别家机型的参数套到这台机器上"的问题。
      *
      * <p>只对这三个路径生效，且只改返回值、不抛异常，对 PowerGenie 其它文件操作零影响。
@@ -1157,13 +1249,17 @@ public final class MiscHook {
                         Object o = param.thisObject;
                         if (!(o instanceof java.io.File)) return;
                         String p = ((java.io.File) o).getPath();
-                        if (!isCotaPerfFile(p)) return;
+                        if (!isCotaBlockedPath(p)) return;
                         String nm = param.method.getName();
                         if ("length".equals(nm)) {
                             param.setResult(Long.valueOf(0L));
                         } else if ("exists".equals(nm) || "isFile".equals(nm)
-                                || "canRead".equals(nm)) {
+                                || "canRead".equals(nm) || "isDirectory".equals(nm)) {
                             param.setResult(Boolean.FALSE);
+                        } else if ("list".equals(nm) || "listFiles".equals(nm)) {
+                            // 目录枚举也要伪装成不存在，否则调用方
+                            // 先 list() 再逐个 exists() 时仍能发现文件。
+                            param.setResult(null);
                         }
                         if (!sCotaHideLogged) {
                             sCotaHideLogged = true;
@@ -1175,14 +1271,15 @@ public final class MiscHook {
                 }
             };
             int n = 0;
-            for (String m : new String[]{"exists", "isFile", "length", "canRead"}) {
+            for (String m : new String[]{"exists", "isFile", "length", "canRead",
+                    "isDirectory", "list", "listFiles"}) {
                 try {
                     XposedBridge.hookAllMethods(java.io.File.class, m, hide);
                     n++;
                 } catch (Throwable ignored) {
                 }
             }
-            // ⚠ v3.2.35：只拦 exists/isFile/length 是**不够的**。
+            // ⚠ 只拦 exists/isFile/length 是**不够的**。
             // 那 20 个读取入口里如果有直接 `new FileInputStream(file)` 的，
             // 上面四个探测点一个都不会被调用 —— 拦截形同虚设。
             // 所以再补构造器：命中这三个路径就抛 FileNotFoundException。
@@ -1191,10 +1288,11 @@ public final class MiscHook {
             // 处理 FileNotFoundException（否则原厂设备早就崩了），这是合法分支，
             // 不是"我们制造的新异常"。
             int nCtor = hookCotaStreamCtors();
-            Diag.note("ok: 云控文件读取拦截已挂上（" + n + " 个 File 探测点 / "
-                    + nCtor + " 个流构造点）");
-            // 挂完立刻自证一次：有测试文件时能直接看出 hook 到底生效没
-            if (Cfg.isOn(Cfg.K_NOCLOUD)) {
+            Diag.note("云控文件读取拦截：File 探测点=" + n + " / 流构造点=" + nCtor);
+            // 没挂上就**不许打 ✓**；挂上了才做三份对照自检。
+            if (n == 0) {
+                Diag.note("⚠ 云控文件拦截未挂上（File 探测点=0），不判定为生效");
+            } else if (Cfg.isOn(Cfg.K_NOCLOUD)) {
                 selfCheckCotaHide();
             } else {
                 Diag.note("nocloud 自检跳过：开关关着，拦截本就不该生效");
@@ -1263,7 +1361,7 @@ public final class MiscHook {
             n++;
         } catch (Throwable ignored) {
         }
-        // 4) java.nio.file.Files / FileChannel（v3.2.36 补）
+        // 4) java.nio.file.Files / FileChannel（补）
         //    实测 PowerGenie 那 20 个读取入口都返回 InputStream（走 FileInputStream），
         //    但 OTA 换实现是常事 —— 真改成 NIO 的话上面三种一个都盖不到，这里兜底。
         try {
@@ -1279,7 +1377,7 @@ public final class MiscHook {
                         }
                     } catch (Throwable ignored) {
                     }
-                    if (!isCotaPerfFile(p)) return;
+                    if (!isCotaBlockedPath(p)) return;
                     noteCotaHideHit(p);
                     throw new java.nio.file.NoSuchFileException(p);
                 }
@@ -1318,7 +1416,7 @@ public final class MiscHook {
             } else if (a0 instanceof java.io.File) {
                 p = ((java.io.File) a0).getPath();
             }
-            return isCotaPerfFile(p) ? p : null;
+            return isCotaBlockedPath(p) ? p : null;
         } catch (Throwable t) {
             return null;
         }
@@ -1345,20 +1443,38 @@ public final class MiscHook {
      */
     private static void selfCheckCotaHide() {
         try {
-            // 【反例优先】先证明"没误伤" —— 目录本身不在这三个路径里，
-            // 它必须仍然可见。如果这里返回 false，说明 hook 匹配写得太宽，
-            // 会把 PowerGenie 其它 cota 文件（无障碍、权限、胶囊…）一起挡掉，
-            // 那是比"没拦住云控"严重得多的故障。
+            // 【反例优先】先证明"没误伤"：根目录必须仍然可见。
             boolean dirVisible = new java.io.File("/data/cota/para").exists();
             Diag.note("nocloud 自检：/data/cota/para 目录 "
                     + (dirVisible ? "仍可见 ✓（未误伤其它 cota 文件）"
                                   : "⚠ 被误伤！匹配范围过宽"));
-
+            String[] names = new java.io.File("/data/cota/para").list();
+            if (names == null) {
+                Diag.note("nocloud 自检：目录列表读不到，三份文件无法对照");
+                return;
+            }
+            // 【反例】子目录同名文件必须放行（精确 equals 的证明）。
+            String sub = "/data/cota/para/backup/cpuconfig";
+            java.io.File sf = new java.io.File(sub);
+            if (sf.exists()) {
+                boolean blocked = isCotaBlockedPath(sub);
+                String content = "read-fail";
+                try {
+                    java.io.BufferedReader br = new java.io.BufferedReader(
+                            new java.io.FileReader(sf));
+                    try {
+                        content = br.readLine();
+                    } finally {
+                        br.close();
+                    }
+                } catch (Throwable t) {
+                    content = "read-error:" + t.getClass().getSimpleName();
+                }
+                Diag.note("nocloud 自检 [子目录同名 backup/cpuconfig]：isCotaBlockedPath="
+                        + blocked + "（应为 false），读取=" + content);
+            }
+            // 三份逐项打结果，不"第一个通了就 return"。
             for (String name : new String[]{"cpuconfig", "pg_config", "thermal_config"}) {
-                String path = "/data/cota/para/" + name;
-                java.io.File dir = new java.io.File("/data/cota/para");
-                String[] names = dir.list();
-                if (names == null) return;
                 boolean physically = false;
                 for (String s : names) {
                     if (s != null && s.equals(name)) {
@@ -1366,23 +1482,37 @@ public final class MiscHook {
                         break;
                     }
                 }
-                if (!physically) continue;   // 没有真文件，没法做对照实验
-                boolean seen = new java.io.File(path).exists();
-                Diag.note("nocloud 自检 [" + name + "]：文件实际存在=true，exists()=" + seen
+                if (!physically) {
+                    Diag.note("nocloud 自检 [" + name + "]：物理不存在，跳过对照");
+                    continue;
+                }
+                boolean seen = new java.io.File("/data/cota/para/" + name).exists();
+                Diag.note("nocloud 自检 [" + name + "]：物理存在=true，exists()=" + seen
                         + (seen ? " → ⚠ 拦截未生效（hook 没命中）"
                                 : " → ✓ 拦截已生效（PowerGenie 看不到它）"));
-                return;
             }
         } catch (Throwable ignored) {
         }
     }
 
-    /** 只认这三份性能/温控云控配置，别的 cota 文件（无障碍、权限、胶囊）一概不碰。 */
-    private static boolean isCotaPerfFile(String p) {
-        if (p == null || p.length() < 24) return false;
-        if (!p.startsWith("/data/cota/para/")) return false;
-        return p.endsWith("/cpuconfig") || p.endsWith("/pg_config")
-                || p.endsWith("/thermal_config");
+    /**
+     * 路径是否属于本开关覆盖的三份 legacy 文件。
+     *
+     * <p>开关关 -> 一律 false；开关开 -> 三份都挡。
+     */
+    private static boolean isCotaBlockedPath(String p) {
+        if (p == null || p.length() < 18) return false;
+        if (!Cfg.isOn(Cfg.K_NOCLOUD)) return false;
+        try {
+            p = new java.io.File(p).getCanonicalPath();
+        } catch (Throwable ignored) {
+        }
+        // 精确匹配三份 legacy 文件。以前用 endsWith，会把
+        // /data/cota/para/backup/cpuconfig 这类子目录同名文件一起误挡；
+        // 只认规范路径本身，子目录同名文件必须放行。
+        return "/data/cota/para/cpuconfig".equals(p)
+                || "/data/cota/para/pg_config".equals(p)
+                || "/data/cota/para/thermal_config".equals(p);
     }
 
     private static final java.util.concurrent.atomic.AtomicBoolean sCotaHideHooked =
@@ -1576,7 +1706,7 @@ public final class MiscHook {
         hookSecureFlag(cl);
     }
 
-    // ==================== 安全组件：屏蔽截图/录屏限制（v3.2.0） ====================
+    // ==================== 安全组件：屏蔽截图/录屏限制 ====================
 
     /**
      * 去掉窗口的 FLAG_SECURE，让原本禁止截图/录屏的页面可以被正常截图。
@@ -1631,6 +1761,23 @@ public final class MiscHook {
                                 android.view.WindowManager.LayoutParams lp =
                                         (android.view.WindowManager.LayoutParams) a;
                                 if ((lp.flags & FLAG_SECURE) != 0) {
+                                    // 系统隐私窗口不动。
+                                    // NotificationShade 的 FLAG_SECURE 参与通知智能显示/
+                                    // 锁屏隐私判定；清掉它会让“智能显示通知内容”卡在
+                                    // 一直隐藏或完全不隐藏（用户 181 版实测日志明确
+                                    // 出现 nosecure: 已清除 FLAG_SECURE (NotificationShade)）。
+                                    // 只清普通 app 窗口，保留系统窗口的原厂行为。
+                                    CharSequence titleCs = lp.getTitle();
+                                    String title = titleCs == null ? null : titleCs.toString();
+                                    if (isSystemPrivacyWindow(lp)) {
+                                        if (sSecureSkipLogged < 4) {
+                                            sSecureSkipLogged++;
+                                            Diag.note("nosecure: 保留系统隐私窗口 \""
+                                                    + title + "\" (pkg=" + lp.packageName
+                                                    + " type=" + lp.type + ") 的 FLAG_SECURE");
+                                        }
+                                        return;
+                                    }
                                     lp.flags &= ~FLAG_SECURE;
                                     if (!sSecureFirstBlocked) {
                                         sSecureFirstBlocked = true;
@@ -1689,16 +1836,49 @@ public final class MiscHook {
                                     Diag.note("nosecure: 首次回调命中 setWindowFlags | 开关=" + on0);
                                 }
                                 if (!Cfg.nosecureOn()) return;
-                                if (param.args.length <= fi) return;
-                                Object o = param.args[fi];
-                                if (!(o instanceof Integer)) return;
-                                int f = (Integer) o;
-                                if ((f & FLAG_SECURE) != 0) {
-                                    param.args[fi] = f & ~FLAG_SECURE;
-                                    if (!sSecureFirstBlocked) {
-                                        sSecureFirstBlocked = true;
-                                        Diag.note("nosecure: 首次拦截 —— setWindowFlags 清掉 FLAG_SECURE");
+                                // 先尽量从参数里拿 LayoutParams / WindowState.mAttrs
+                                // （有的版本第三个参数就是 WindowState）。拿得到就按
+                                // type + 包名精确过滤，拿不到才跳过 —— 不再一律放弃。
+                                android.view.WindowManager.LayoutParams lp = null;
+                                for (Object a : param.args) {
+                                    lp = layoutParamsOf(a, 2);
+                                    if (lp != null) break;
+                                }
+                                if (lp == null) {
+                                    if (!sSecureSetFlagsSkipped) {
+                                        sSecureSetFlagsSkipped = true;
+                                        Diag.note("nosecure: setWindowFlags 无窗口信息，跳过（宁可不清理）");
                                     }
+                                    return;
+                                }
+                                if (isSystemPrivacyWindow(lp)) {
+                                    if (!sSecureSetFlagsSkipped) {
+                                        sSecureSetFlagsSkipped = true;
+                                        Diag.note("nosecure: setWindowFlags 命中系统隐私窗口 "
+                                                + lp.packageName + "/" + lp.type + "，跳过");
+                                    }
+                                    return;
+                                }
+                                // flags/mask 两个 int：清 FLAG_SECURE，并保证 mask
+                                // 覆盖这一位（否则改动不会落到 mAttrs）。
+                                int flagsIdx2 = fi;
+                                param.args[flagsIdx2] = ((Integer) param.args[flagsIdx2])
+                                        & ~android.view.WindowManager.LayoutParams.FLAG_SECURE;
+                                int maskIdx = -1;
+                                for (int i = 0; i < param.args.length; i++) {
+                                    if (i != flagsIdx2 && param.args[i] instanceof Integer) {
+                                        maskIdx = i;
+                                        break;
+                                    }
+                                }
+                                if (maskIdx >= 0) {
+                                    param.args[maskIdx] = ((Integer) param.args[maskIdx])
+                                            | android.view.WindowManager.LayoutParams.FLAG_SECURE;
+                                }
+                                if (!sSecureSetFlagsCleared) {
+                                    sSecureSetFlagsCleared = true;
+                                    Diag.note("nosecure: setWindowFlags 按 attrs 过滤，清理 "
+                                            + lp.packageName + "/" + lp.type);
                                 }
                             } catch (Throwable t) {
                                 Diag.err("nosecure setFlags error", t);
@@ -1725,6 +1905,63 @@ public final class MiscHook {
         } catch (Throwable t) {
             Diag.note("skip: WindowManagerService 找不到 (" + t.getClass().getSimpleName() + ")");
         }
+    }
+
+    /**
+     * 系统隐私/通知/锁屏窗口：这些窗口的 FLAG_SECURE 不能清。
+     *
+     * <p>NotificationShade（通知面板/横幅宿主）的 FLAG_SECURE 参与
+     * “智能显示通知内容”的隐私判定，清掉会让智能显示卡死。Keyguard/StatusBar/
+     * SystemUI 同理。普通 app（银行/支付/阅读）不在此列，截图解锁功能保留。
+     */
+    private static boolean isSystemPrivacyWindow(android.view.WindowManager.LayoutParams lp) {
+        if (lp == null) return false;
+        // 按 packageName + type 判定，不用窗口标题子串 ——
+        // HeadsupCardListWindow 之类的标题会漏，且标题可被改。
+        if ("com.android.systemui".equals(lp.packageName)) return true;
+        switch (lp.type) {
+            case 2000: // STATUS_BAR
+            case 2009: // KEYGUARD_DIALOG
+            case 2011: // INPUT_METHOD
+            case 2019: // NAVIGATION_BAR
+            case 2040: // NOTIFICATION_SHADE
+            case 2041: // STATUS_BAR_SUB_PANEL (HeadsupCardListWindow)
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static int sSecureSkipLogged = 0;
+    private static boolean sSecureSetFlagsSkipped = false;
+    private static boolean sSecureSetFlagsCleared = false;
+
+    /** 从对象本身或其 1~depth 层字段里找 LayoutParams（WindowState.mAttrs 等）。 */
+    private static android.view.WindowManager.LayoutParams layoutParamsOf(Object o, int depth) {
+        if (o == null || depth < 0) return null;
+        if (o instanceof android.view.WindowManager.LayoutParams) {
+            return (android.view.WindowManager.LayoutParams) o;
+        }
+        Class<?> c = o.getClass();
+        if (c.isPrimitive() || o instanceof String || o instanceof android.os.IBinder) return null;
+        for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+            try {
+                if (f.getType() == android.view.WindowManager.LayoutParams.class) {
+                    f.setAccessible(true);
+                    Object v = f.get(o);
+                    if (v instanceof android.view.WindowManager.LayoutParams) {
+                        return (android.view.WindowManager.LayoutParams) v;
+                    }
+                } else if (depth > 0 && !f.getType().isPrimitive()
+                        && !f.getType().isArray()) {
+                    f.setAccessible(true);
+                    android.view.WindowManager.LayoutParams r = layoutParamsOf(f.get(o), depth - 1);
+                    if (r != null) return r;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
     }
 
     /** 找 WindowManager.LayoutParams 在参数列表里的下标，没有返回 -1。 */
