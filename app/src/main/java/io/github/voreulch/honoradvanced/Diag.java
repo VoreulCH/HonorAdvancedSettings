@@ -59,8 +59,9 @@ public final class Diag {
         }
         boolean v = false;
         try {
-            // 用 diagOn() 而不是 isOn()——后者在快照未就绪时默认 true，
-            // 诊断日志绝不能在还没确认的时候自己打开。
+            // 用 diagOn() 而不是 isOn()——isOn 对 opt-in 键（如 K_DIAG）在
+            // 快照未就绪时返回 false；对普通键才返回 true。诊断日志绝不能在
+            // 还没确认的时候自己打开。
             v = Cfg.diagOn();
         } catch (Throwable ignored) {
         }
@@ -98,7 +99,7 @@ public final class Diag {
     /**
      * 诊断信息：仅在开关打开时输出。
      *
-     * <p>压缩策略（v2.3.0，用户要求）：同一条消息连续重复时**不再逐条刷**，
+     * <p>压缩策略：同一条消息连续重复时不逐条刷，
      * 而是累计到 [FLUSH_MS] 窗口结束（或下一条不同消息到来）时补一行
      * {@code 原消息   *N}，N 是这轮出现的总次数。玻璃线的高频回调
      * （每个图标、每次半径计算）因此从每秒几十行压成一行。
