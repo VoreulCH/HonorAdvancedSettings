@@ -14,8 +14,8 @@ android {
         applicationId = "io.github.voreulch.honoradvanced"
         minSdk = 33
         targetSdk = 35
-        versionCode = 181
-        versionName = "3.2.51"
+        versionCode = 214
+        versionName = "3.2.84"
         // keep native filter consistent with the hand-built APK (no ABI split)
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
@@ -58,12 +58,19 @@ android {
             keyAlias = "voreulch"
             keyPassword = props.getProperty("KEY_PASS")
                 ?: throw GradleException("KEY_PASS missing in local.properties")
+            // v3.2.59：审核要求 v2 + v3 双方案都必须校验通过。
+            enableV1Signing = false
+            enableV2Signing = true
+            enableV3Signing = true
         }
     }
 
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("release")
+            // 正常构建用 release 签名；-PunsignedBuild 时产出未签名包，
+            // 供 apksigner 同时写 v2+v3（AGP 在 minSdk 33 下只保留 v3）。
+            signingConfig = if (project.hasProperty("unsignedBuild"))
+                null else signingConfigs.getByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -77,6 +84,13 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
             excludes += "/META-INF/INDEX.LIST"
+            // v3.2.59：androidx 各依赖带进 5 份**字节完全相同**的 Apache-2.0
+            // LICENSE.txt（同一 SHA256 809FA1ED…）。保留 annotation 那一份作为
+            // 法律声明，其余 4 份只是重复副本，排除后不改变声明完整性。
+            excludes += "/META-INF/androidx/collection/collection-ktx/LICENSE.txt"
+            excludes += "/META-INF/androidx/collection/collection/LICENSE.txt"
+            excludes += "/META-INF/androidx/lifecycle/lifecycle-common-java8/LICENSE.txt"
+            excludes += "/META-INF/androidx/lifecycle/lifecycle-common/LICENSE.txt"
         }
     }
 }
