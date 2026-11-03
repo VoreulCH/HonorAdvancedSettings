@@ -99,7 +99,7 @@ class SettingsActivity : ComponentActivity() {
             "killall com.hihonor.desktop.systemui || true"),
         ScopeTarget("com.hihonor.iaware", "温控服务", "killall com.hihonor.iaware || true"),
         ScopeTarget("com.hihonor.securityserver", "反诈服务", "killall com.hihonor.securityserver || true"),
-        // v3.2.48：反诈现在同时作用于感知服务本体（它自己有 fraud 逻辑和独立上报通道），
+        // 反诈现在同时作用于感知服务本体（它自己有 fraud 逻辑和独立上报通道），
         // 重启作用域时不能漏 —— 漏了的话改了反诈开关、重启完"反诈服务"还以为生效了，
         // 实际上 awareness 那边照旧跑旧代码。
         ScopeTarget("com.hihonor.awareness", "感知服务", "killall com.hihonor.awareness || true"),
@@ -114,14 +114,25 @@ class SettingsActivity : ComponentActivity() {
     private val S_PHOTOS = listOf("com.hihonor.photos")
     private val S_LAUNCHER = listOf("com.hihonor.android.launcher")
     private val S_INSTALLER = listOf("com.android.packageinstaller")
-    private val S_THERMAL = listOf("com.android.systemui", "com.hihonor.iaware")
+    // 温控的真实状态分三处 —— iaware / powergenie（同一进程的两个
+    // 包名）+ system_server（无法自证，用 persist.sys.has.sysprobe 属性判定）。
+    private val S_THERMAL = listOf(
+        "com.hihonor.iaware", "com.hihonor.powergenie", "android"
+    )
     /** 安全组件里的窗口/系统级钩子都在 system_server（作用域显示为 android）。 */
     private val S_SYSTEM = listOf("android")
     /** 反诈组件在 securityserver 进程。 */
-    // v3.2.48：反诈现在要两个作用域 —— 反诈服务（securityserver）+ 感知服务（awareness）。
+    // 反诈现在要两个作用域 —— 反诈服务（securityserver）+ 感知服务（awareness）。
     // 只列前者的话，界面会显示"作用域已生效"，但 awareness 那边根本没被注入，
     // 反诈数据照样从感知服务流出去 —— 典型的假绿灯。
     private val S_NOFRAUD = listOf("com.hihonor.securityserver", "com.hihonor.awareness")
+
+    /** 首页"已加载"要求的 7 个作用域；缺一个就不算全部生效。powergenie 与 iaware 同进程，只列 iaware（判定时 OR）。 */
+    private val S_HOME = listOf(
+        "com.android.systemui", "com.hihonor.android.launcher", "com.hihonor.photos",
+        "com.android.packageinstaller", "com.hihonor.iaware",
+        "com.hihonor.securityserver", "com.hihonor.awareness"
+    )
 
     // switch write target shared with hooks via CfgProvider
     private fun prefs() = getSharedPreferences(Cfg.PREFS_FILE, MODE_PRIVATE)
@@ -138,16 +149,22 @@ class SettingsActivity : ComponentActivity() {
         // 再补一次 2.5s 后的强制读：用户很可能刚在 LSPosed 里重启完进程，
         // 那时 Application 还没上报，第一次读拿到的还是旧记录。
         try { FrameworkProbe.refresh(this) } catch (_: Throwable) {}
-        resumeProbeShot?.let { mainHandler.removeCallbacks(it) }
-        val shot = Runnable {
-            try { FrameworkProbe.refresh(this, true) } catch (_: Throwable) {}
+        // 开机窗口期 provider 冷启动很慢：本机实测 iaware 要 try 32（约 16 秒），
+        // 用户设备更慢。只补一次 2.5s 不够，界面会一直停在"未收到回执"。
+        // 2.5s / 10s / 30s 各强制读一次，probe 一到就自动转成"已生效"。
+        resumeProbeShots.forEach { mainHandler.removeCallbacks(it) }
+        val probeDelays = longArrayOf(2500L, 10000L, 30000L)
+        val shots = probeDelays.map {
+            Runnable {
+                try { FrameworkProbe.refresh(this, true) } catch (_: Throwable) {}
+            }
         }
-        resumeProbeShot = shot
-        mainHandler.postDelayed(shot, 2500L)
+        resumeProbeShots = shots
+        shots.forEachIndexed { i, r -> mainHandler.postDelayed(r, probeDelays[i]) }
     }
 
     override fun onDestroy() {
-        // v3.2.36：Activity 销毁后，postDelayed 排进主队列的 Runnable **仍持有 this**。
+        // Activity 销毁后，postDelayed 排进主队列的 Runnable **仍持有 this**。
         // 延迟任务体里只要碰一次 UI（recreate / 强制刷新那种），轻则泄漏一整个
         // Activity，重则 NPE 闪退。mainHandler 是实例字段，清它不会影响别的 Activity。
         try {
@@ -157,10 +174,53 @@ class SettingsActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    private var resumeProbeShot: Runnable? = null
+    private var resumeProbeShots: List<Runnable> = emptyList()
 
     private fun applyBinding(key: String, on: Boolean, restart: Boolean, onResult: ((Boolean) -> Unit)? = null) {
         try { window.decorView.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK) } catch (_: Throwable) {}
+        // 玻璃线开关走"先 epoch、再提交、再清缓存"的串行事务。
+        // epoch 写不进去就整笔中止，绝不出现"开关改了、批次号没跟上"。
+        if (glassSwitchKeys().contains(key)) {
+            Thread {
+                var fail: String? = null
+                var commitOk = false
+                var state = CacheCleanState.UNKNOWN
+                synchronized(glassEpochLock) {
+                    val ep = bumpGlassEpochProp()
+                    if (ep == null) {
+                        fail = "无法更新配置批次号，开关未生效（请检查 ROOT / 属性服务）"
+                    } else {
+                        commitOk = prefs().edit().putBoolean(key, on).commit()
+                        if (!commitOk) {
+                            fail = "写入失败（存储异常），开关未生效"
+                        } else {
+                            notifyCfgChanged()
+                            state = invalidateGlassSnapshotsBlocking()
+                        }
+                    }
+                }
+                runOnUiThread {
+                    if (fail != null) {
+                        Toast.makeText(this, fail, Toast.LENGTH_LONG).show()
+                        onResult?.invoke(false)
+                    } else {
+                        val head = if (on) "已开启" else "已关闭"
+                        val tail = when (state) {
+                            CacheCleanState.GONE ->
+                                "，缓存已清理，重启系统界面后生效"
+                            CacheCleanState.REMAIN ->
+                                "，但缓存清理失败，建议重启系统界面"
+                            CacheCleanState.UNKNOWN ->
+                                "，但无法确认缓存是否清理，建议重启系统界面"
+                        }
+                        Toast.makeText(this, head + tail, Toast.LENGTH_LONG).show()
+                        // 开关本身已经落盘；缓存问题只影响下次启动，不把 UI 拨回去。
+                        onResult?.invoke(true)
+                    }
+                }
+            }.apply { name = "has-glass-switch" }.start()
+            return
+        }
         prefs().edit().putBoolean(key, on).commit()
         notifyCfgChanged()
         // the thermal bypass also lives in system_server, which can never read
@@ -169,8 +229,8 @@ class SettingsActivity : ComponentActivity() {
         // The write needs root, so report the real outcome instead of a blind
         // "enabled" toast; if turning it OFF fails we also revert the pref so
         // the UI never claims "off" while the system layer is still bypassing.
-        // v3.2.33：「清理云端配置残留」已改成独立按钮（见 SecurityPage 里的
-        // NavRow + ConfirmEnableDialog），不再走开关分支 —— 它代表"动作"而不是"状态"。
+        // 「清理云端配置残留」是独立按钮（见 SecurityPage 里的
+        // NavRow + ConfirmEnableDialog），不走开关分支 —— 它代表"动作"而不是"状态"。
         // 降级安装的 system_server 侧同样读不到 provider，也要走属性。
         if (key == Cfg.K_DOWNGRADE) {
             syncDowngradeProp(on) { ok ->
@@ -198,9 +258,9 @@ class SettingsActivity : ComponentActivity() {
             }
             return
         }
-        // v3.2.33：「清理云端配置残留」已从开关改成独立按钮（SecurityPage 里
-        // 的 NavRow），不再经过这里 —— 它没有"开/关"两种状态，也没有 prefs 键
-        // 需要写。Cfg.K_PURGECOTA 常量保留只为兼容旧 prefs 与 provider 快照。
+        // 「清理云端配置残留」是独立按钮（SecurityPage 里的 NavRow），
+        // 不经过这里 —— 它没有"开/关"两种状态，也没有 prefs 键
+        // 需要写。Cfg.K_PURGECOTA 常量保留只为兼容历史 prefs 与 provider 快照。
         if (key == Cfg.K_HOTTEMP) {
             Toast.makeText(this, "正在写入系统属性（ROOT）…", Toast.LENGTH_SHORT).show()
             syncHottempProp(on) { ok ->
@@ -264,7 +324,7 @@ class SettingsActivity : ComponentActivity() {
                 AppLog.d("prop", "目标=" + want + " 当前=" + before)
                 if (before != want) {
                     // 30 秒：KernelSU / Magisk 的授权是**异步**的 —— su 会一直阻塞，
-                    // 等用户切到管理器点「允许」。原来 8 秒，从点开关到切过去根本不够，
+                    // 等用户切到管理器点「允许」。8 秒不够，从点开关到切过去根本来不及，
                     // 表现就是「明明 root 了却提示未获得 ROOT」。
                     ok = suExecTimeout("setprop ${Cfg.PROP_HOTTEMP} $want", 30000L)
                 } else {
@@ -294,7 +354,7 @@ class SettingsActivity : ComponentActivity() {
     /**
      * `su` 的候选路径。
      *
-     * v3.0.2 加：原来只 `ProcessBuilder("su", ...)` 依赖 PATH。实测有用户的
+     * 只靠 `ProcessBuilder("su", ...)` 依赖 PATH 不够：实测有用户的
      * KernelSU 是**越狱模式（LKM）**，app 进程的 PATH 里没有 su，
      * 于是 `start()` 直接抛 IOException —— 表现就是「未获得 ROOT」，
      * 但用户其实是 root 了的，只是模块根本没找到 su 在哪。
@@ -462,9 +522,17 @@ class SettingsActivity : ComponentActivity() {
      * 这里用「后台线程读 + 主线程 waitFor 卡超时 + 超时强杀」的组合，
      * 任何情况下都能在 [timeoutMs] 内返回。
      */
-    private fun suReadOutput(cmd: String, timeoutMs: Long): String? {
+    private data class SuRun(val exit: Int?, val out: String?)
+
+    /**
+     * 跑一段 su 命令，同时拿退出码和输出。
+     *
+     * 空输出不等于成功。调用方必须再检查哨兵串与退出码，
+     * 见 [rootOk]。
+     */
+    private fun suRun(cmd: String, timeoutMs: Long): SuRun {
         return try {
-            val p = startSu(cmd) ?: return null
+            val p = startSu(cmd) ?: return SuRun(null, null)
             val sb = StringBuilder()
             val reader = Thread {
                 try {
@@ -486,15 +554,22 @@ class SettingsActivity : ComponentActivity() {
                 try { p.destroy() } catch (_: Throwable) {}
                 try { p.destroyForcibly() } catch (_: Throwable) {}
                 AppLog.d("su", "读日志超时 " + timeoutMs + "ms，已强杀")
-                return null
+                return SuRun(null, sb.toString())
             }
             reader.join(2000L)   // 等读线程收尾，最多再等 2 秒
-            sb.toString()
+            SuRun(p.exitValue(), sb.toString())
         } catch (t: Throwable) {
             AppLog.d("su", "读日志失败: " + t.javaClass.simpleName)
-            null
+            SuRun(null, null)
         }
     }
+
+    /** 关键 root 操作只认：退出码 0 + 看到哨兵。空输出、无哨兵、exit!=0 全判失败。 */
+    private fun rootOk(r: SuRun, sentinel: String): Boolean =
+        r.exit == 0 && r.out != null && r.out.contains(sentinel)
+
+    private fun suReadOutput(cmd: String, timeoutMs: Long): String? =
+        suRun(cmd, timeoutMs).out
 
     /** 用 su 读 LSPosed 的模块日志尾巴；读不到就明说，不假装成功。 */
     private fun readLsposedLogTail(): String {
@@ -505,6 +580,203 @@ class SettingsActivity : ComponentActivity() {
 
     private fun notifyCfgChanged() {
         try { getContentResolver().notifyChange(CfgProvider.URI, null) } catch (_: Throwable) {}
+    }
+
+    /**
+     * 玻璃配置的「防回写」双保险。
+     *
+     * <p>宿主的 cfg_snapshot 是进程级冻结的；只改 prefs/provider 不够 —— 下一次
+     * 启动仍会先读旧缓存，旧进程还可能把旧快照写回磁盘。所以每次恢复 / 导入 /
+     * 线开关变更都做两件事：
+     * <ol>
+     *   <li>推进系统属性里的 epoch（**唯一来源**）：先写属性并回读，成功才继续。
+     *       新进程读缓存时发现 ep 不符，整份丢弃、回退 provider。</li>
+     *   <li>用 root 删四个宿主的 CE/DE 缓存，并逐路径做 EXIST/GONE/UNKNOWN 三态复核。</li>
+     * </ol>
+     * 两者是"与"关系：epoch 负责逻辑上拒收旧值，删除负责物理上少读一次盘。
+     * 删除失败必须由调用方原样告诉用户，不能静默。
+     */
+
+    /** 四个玻璃宿主的 CE/DE 小抄路径（DE 主路径 + CE 回退，两个都清）。 */
+    private fun glassCachePaths(): List<String> = listOf(
+        "/data/user_de/0/com.android.systemui/files/cfg_snapshot.txt",
+        "/data/user_de/0/com.hihonor.android.launcher/files/cfg_snapshot.txt",
+        "/data/user_de/0/com.hihonor.photos/files/cfg_snapshot.txt",
+        "/data/user_de/0/com.hihonor.desktop.systemui/files/cfg_snapshot.txt",
+        "/data/user/0/com.android.systemui/files/cfg_snapshot.txt",
+        "/data/user/0/com.hihonor.android.launcher/files/cfg_snapshot.txt",
+        "/data/user/0/com.hihonor.photos/files/cfg_snapshot.txt",
+        "/data/user/0/com.hihonor.desktop.systemui/files/cfg_snapshot.txt"
+    )
+
+    /** 缓存清理的三态：只有 GONE 能报成功；UNKNOWN 必须说"无法确认"。 */
+    private enum class CacheCleanState { GONE, REMAIN, UNKNOWN }
+
+    /** 云控探测三态：探测失败单独处理，绝不混进"不存在/已清理"。 */
+    private enum class PurgeProbe { FOUND, GONE, UNKNOWN }
+
+    // ================= 云控清理白名单 =================
+    //
+    // 产品口径：
+    //   · 一级：默认勾选；二级 / 三级：默认不勾；
+    //   · 三级：默认不勾、红字风险提示，但用户勾了**真的会删** —— 有整批备份兜底；
+    //   · 备份是硬前提：下载目录不可写 / 备份不完整 -> 整批中止，一个都不删。
+    // rel 相对 /data/cota/para；isDir=false 表示只清一个明确文件。
+
+    /** 云控清理条目。key 只用于界面/备份目录名，rel 才是真正路径。 */
+    private data class CotaEntry(
+        val key: String,
+        val level: Int,
+        val title: String,
+        val rel: String,
+        val isDir: Boolean
+    )
+
+    private val cotaEntries = listOf(
+        // 一级（默认全选）：原二级那批。
+        CotaEntry("power", 1, "power（充电 / 性能策略）", "power", true),
+        CotaEntry("iaware", 1, "iaware（智能调度）", "iaware", true),
+        // 二级（可以清理，默认不选）：原一级那批。
+        CotaEntry("behaviorurl", 2, "behaviorurl（行为 URL 名单）", "behaviorurl", true),
+        CotaEntry("hpcc_ads", 2, "hpcc/BlockAdsPolicy.json（广告策略）",
+            "hpcc/BlockAdsPolicy.json", false),
+        CotaEntry("onetouch", 2, "onetouch（一键触达）", "onetouch", true),
+        CotaEntry("capsulenotification", 2, "capsulenotification（胶囊通知）",
+            "capsulenotification", true),
+        CotaEntry("contenttransfer", 2, "contenttransfer（内容流转）", "contenttransfer", true),
+        CotaEntry("intelligentdiagnosis", 2, "intelligentdiagnosis（智能诊断规则）",
+            "intelligentdiagnosis", true),
+        // 三级：UI 红字标风险，默认不勾；勾选后照常执行（备份兜底）。
+        CotaEntry("compliancecontrol", 3, "compliancecontrol（合规控制）",
+            "compliancecontrol", true),
+        CotaEntry("hpcc_attest", 3, "hpcc/remote_attest_policy.json（远程证明）",
+            "hpcc/remote_attest_policy.json", false),
+        CotaEntry("permissionmanager", 3, "permissionmanager（权限管理）",
+            "permissionmanager", true),
+        CotaEntry("activityintercept", 3, "activityintercept（活动拦截）",
+            "activityintercept", true),
+        CotaEntry("accessibilitypolicy", 3, "accessibilitypolicy（无障碍策略）",
+            "accessibilitypolicy", true),
+        CotaEntry("behaviorcontrolpolicy", 3, "behaviorcontrolpolicy（行为控制）",
+            "behaviorcontrolpolicy", true)
+    )
+
+    private val cotaRoot = "/data/cota/para"
+
+    /** 备份落在下载目录（用户可自己拷出来留底）；su 下用完整路径 + init ns 写入。 */
+    private val cotaBackupRoot = "/storage/emulated/0/Download/has_cota_backup"
+
+    /** 单个条目的扫描结果：路径存在与否 + 具体文件清单/大小（删除与恢复只认这份清单）。 */
+    private data class CotaScan(
+        val entry: CotaEntry,
+        val state: PurgeProbe,
+        val files: List<String>,
+        val sizes: Map<String, Long> = emptyMap()
+    )
+
+    private data class CotaScanResult(
+        val scans: List<CotaScan>,
+        val error: String? = null,
+        /** 预览时预生成的备份时间戳，确认后沿用同一个目录名。 */
+        val backupTs: String? = null
+    ) {
+        val files: List<String> get() = scans.flatMap { it.files }
+        val totalBytes: Long get() = scans.sumOf { it.sizes.values.sum() }
+        val hasUnknown: Boolean get() = scans.any { it.state == PurgeProbe.UNKNOWN }
+        val hasExist: Boolean get() = scans.any { it.state == PurgeProbe.FOUND }
+        val allGone: Boolean get() = scans.isNotEmpty() && scans.all { it.state == PurgeProbe.GONE }
+        val highRiskCount: Int get() = scans.count {
+            it.state == PurgeProbe.FOUND && it.entry.level == 3
+        }
+    }
+
+    /** 备份列表里的一项。 */
+    private data class CotaBackup(val ts: String, val entries: Int, val files: Int)
+
+    /** epoch 的读-改-写必须串行，否则连续两次点击会拿到同一个旧值。 */
+    private val glassEpochLock = Any()
+
+    /**
+     * 唯一权威来源：`persist.sys.has.glass_epoch`。
+     *
+     * <p>先读当前值 → +1 → setprop → **回读一致**才返回新值。任何一步失败
+     * 返回 null，调用方必须整笔中止（不改 prefs、不删缓存、不报成功）。
+     * 因为没有第二份 epoch，失败不会造成"prefs 前进、属性没前进"的永久分叉。
+     */
+    private fun bumpGlassEpochProp(): Int? = synchronized(glassEpochLock) {
+        val cur = Cfg.glassEpoch()
+        if (cur == Cfg.EPOCH_UNKNOWN) {
+            AppLog.d("prop", "glass_epoch 读取失败，拒绝执行（不改任何配置）")
+            return null
+        }
+        val next = if (cur == Int.MAX_VALUE) 1 else cur + 1
+        val want = next.toString()
+        // root 调用同样要哨兵：空输出/exit!=0 一律失败。
+        val wr = suRun("setprop ${Cfg.PROP_GLASS_EPOCH} $want && echo __NS_DONE__", 8000L)
+        if (!rootOk(wr, "__NS_DONE__")) {
+            AppLog.d("prop", "glass_epoch 写入失败，拒绝执行（exit=" + wr.exit +
+                    " out=" + (wr.out?.trim()?.take(160) ?: "(null)") + "）")
+            return null
+        }
+        var now = readProp(Cfg.PROP_GLASS_EPOCH)?.trim()
+        if (now != want) {
+            try { Thread.sleep(250L) } catch (_: Throwable) {}
+            now = readProp(Cfg.PROP_GLASS_EPOCH)?.trim()
+        }
+        if (now != want) {
+            AppLog.d("prop", "glass_epoch 回读不一致：目标=$want 实际=$now，拒绝执行")
+            return null
+        }
+        AppLog.d("prop", "glass_epoch $cur→$next 成功")
+        next
+    }
+
+    /**
+     * 删缓存并做**三态复核**。
+     *
+     * <p>空输出不等于成功。命令必须满足：
+     * <ol>
+     *   <li>最后看到哨兵 `__NS_DONE__`；</li>
+     *   <li>su 退出码 0；</li>
+     *   <li>每条路径都有明确结果（EXIST / GONE / UNKNOWN）。</li>
+     * </ol>
+     * 任一条不满足 → UNKNOWN。`test -e` 在权限被拒时也会返回 false，
+     * 所以用 `ls -ld` 再区分"真的不存在"和"看不见"。
+     */
+    private fun invalidateGlassSnapshotsBlocking(): CacheCleanState {
+        val paths = glassCachePaths()
+        val joined = paths.joinToString(" ")
+        // ⚠ 实测：模块 app 的 su 子进程跑在应用自己的 mount namespace，
+        // 看不到 /data/user_de/0/<别的应用>/；必须 nsenter 到 init 的命名空间。
+        val inner = "rm -f $joined; for f in $joined; do " +
+                "if [ -e \"\$f\" ]; then echo \"EXIST:\$f\"; " +
+                "else if ls -ld \"\$f\" 2>&1 | grep -q \"No such file\"; " +
+                "then echo \"GONE:\$f\"; else echo \"UNKNOWN:\$f\"; fi; fi; done"
+        val r = suRun("nsenter -t 1 -m -- sh -c '$inner' && echo __NS_DONE__", 8000L)
+        if (!rootOk(r, "__NS_DONE__")) {
+            AppLog.d("cache", "invalidate glass snapshots UNKNOWN（哨兵/退出码不通过）" +
+                    " exit=" + r.exit + " out=" + (r.out?.trim()?.take(200) ?: "(null)"))
+            return CacheCleanState.UNKNOWN
+        }
+        var exist = 0
+        var gone = 0
+        var unknown = 0
+        for (line in (r.out ?: "").lineSequence()) {
+            when {
+                line.startsWith("EXIST:") -> exist++
+                line.startsWith("GONE:") -> gone++
+                line.startsWith("UNKNOWN:") -> unknown++
+            }
+        }
+        val state = when {
+            unknown > 0 || exist + gone != paths.size -> CacheCleanState.UNKNOWN
+            exist > 0 -> CacheCleanState.REMAIN
+            gone == paths.size -> CacheCleanState.GONE
+            else -> CacheCleanState.UNKNOWN
+        }
+        AppLog.d("cache", "invalidate glass snapshots " + state +
+                " exist=" + exist + " gone=" + gone + " unknown=" + unknown)
+        return state
     }
 
     // ================= 液态玻璃参数导出 / 导入（v3.1.4） =================
@@ -538,7 +810,6 @@ class SettingsActivity : ComponentActivity() {
         val params = org.json.JSONObject()
         for (k in Cfg.FN_KEYS) params.put(k, p.getInt(k, Cfg.fnDefPct(k)))
         root.put("params", params)
-
         return root.toString(2)
     }
 
@@ -569,12 +840,14 @@ class SettingsActivity : ComponentActivity() {
      * 导入：读 JSON → 校验 → 写 prefs。
      *
      * 校验规则：只认**允许列表内**的键（防手改 JSON 塞奇怪的东西），
-     * 数值夹到 0..1000。导入完提示重启系统界面。
+     * 数值夹到各滑条真实上限（普通 200，高光角度 360）。导入完提示重启系统界面。
      */
     private fun importGlassConfig(uri: android.net.Uri) {
         Thread {
             var okCount = 0
             var err: String? = null
+            var hadNocloudDirs = false
+            var cacheState = CacheCleanState.UNKNOWN
             try {
                 // 上限 1MB：一份完整配置不到 8KB，超过这个数一定是选错文件了。
                 // 不设限的话 readBytes() 会把整个文件读进内存，选了个几百 MB 的
@@ -597,29 +870,43 @@ class SettingsActivity : ComponentActivity() {
                 if (root.optString("kind") != "glass-config") {
                     throw IllegalStateException("这不是液态玻璃配置（缺少 kind 标记）")
                 }
-                val ed = prefs().edit()
-                val sw = root.optJSONObject("switches")
-                if (sw != null) {
-                    for (k in glassSwitchKeys()) {
-                        if (sw.has(k)) {
-                            ed.putBoolean(k, sw.optBoolean(k, true))
-                            okCount++
+                // 旧版导出里可能带 nocloudDirs（多选云控）。它不属于玻璃参数，
+                // 这里不导入，但要在结果里明确告诉用户，不能静默丢掉。
+                hadNocloudDirs = root.has("nocloudDirs")
+                        || root.optJSONObject("nocloud") != null
+                // epoch 是唯一来源。先 setprop+回读，失败就整笔中止；
+                // 成功才提交 prefs；然后清缓存并三态复核。全程与开关/恢复串行。
+                synchronized(glassEpochLock) {
+                    if (bumpGlassEpochProp() == null) {
+                        throw IllegalStateException(
+                            "无法更新配置批次号（ROOT / 属性服务异常），未导入")
+                    }
+                    val ed = prefs().edit()
+                    val sw = root.optJSONObject("switches")
+                    if (sw != null) {
+                        for (k in glassSwitchKeys()) {
+                            if (sw.has(k)) {
+                                ed.putBoolean(k, sw.optBoolean(k, true))
+                                okCount++
+                            }
                         }
                     }
-                }
-                val ps = root.optJSONObject("params")
-                if (ps != null) {
-                    for (k in Cfg.FN_KEYS) {
-                        if (ps.has(k)) {
-                            val v = ps.optInt(k, Cfg.fnDefPct(k)).coerceIn(0, 1000)
-                            ed.putInt(k, v)
-                            okCount++
+                    val ps = root.optJSONObject("params")
+                    if (ps != null) {
+                        for (k in Cfg.FN_KEYS) {
+                            if (ps.has(k)) {
+                                val v = ps.optInt(k, Cfg.fnDefPct(k))
+                                    .coerceIn(0, glassParamMax(k))
+                                ed.putInt(k, v)
+                                okCount++
+                            }
                         }
                     }
+                    if (okCount == 0) throw IllegalStateException("文件里没有任何可识别的参数")
+                    if (!ed.commit()) throw IllegalStateException("写入失败（存储异常）")
+                    AppLog.d("glasscfg", "导入成功 " + okCount + " 项")
+                    cacheState = invalidateGlassSnapshotsBlocking()
                 }
-                if (okCount == 0) throw IllegalStateException("文件里没有任何可识别的参数")
-                if (!ed.commit()) throw IllegalStateException("写入失败（存储异常）")
-                AppLog.d("glasscfg", "导入成功 " + okCount + " 项")
             } catch (t: Throwable) {
                 err = t.message ?: t.javaClass.simpleName
                 AppLog.d("glasscfg", "导入失败: " + err)
@@ -627,10 +914,19 @@ class SettingsActivity : ComponentActivity() {
             runOnUiThread {
                 if (err == null) {
                     notifyCfgChanged()
-                    Toast.makeText(this,
-                        "已导入 " + okCount + " 项。"
-                                + "\n液态玻璃效果需要重启「系统界面」才会生效（锁屏/桌面要重启手机/桌面）",
-                        Toast.LENGTH_LONG).show()
+                    val msg = when (cacheState) {
+                        CacheCleanState.GONE ->
+                            "已导入 " + okCount + " 项。缓存已清理，" +
+                                    "重启「系统界面」后生效（锁屏/桌面要重启手机/桌面）"
+                        CacheCleanState.REMAIN ->
+                            "已导入 " + okCount + " 项，但缓存清理失败，建议重启系统界面"
+                        CacheCleanState.UNKNOWN ->
+                            "已导入 " + okCount + " 项，但无法确认缓存是否清理，建议重启系统界面"
+                    }
+                    val extra = if (hadNocloudDirs) {
+                        "\n旧的多选云控配置已废弃，本次只导入玻璃参数"
+                    } else ""
+                    Toast.makeText(this, msg + extra, Toast.LENGTH_LONG).show()
                     // 关键：所有 TuneRow 的值都缓存在 remember 里，光写 prefs 界面不会变。
                     // recreate() 让整个 Activity 重建，重新从 prefs 读一遍 —— 这才是
                     // 用户说的「导入后 UI 要立刻生效」。
@@ -642,35 +938,62 @@ class SettingsActivity : ComponentActivity() {
         }.apply { name = "has-glass-import" }.start()
     }
 
+    /** 各滑条的真实上限：默认 200，高光角度 360；导入时按这个夹，不许拉极端值。 */
+    private fun glassParamMax(key: String): Int =
+        if (Cfg.F_HL_ANGLE == key) 360 else 200
+
     /**
-     * 恢复官方原始参数：把 75 项精细调节全部写回**系统原厂值**。
+     * 恢复官方原始参数（真·出厂语义）：
      *
-     * <p>注意用的是 {@link Cfg#factoryDefPct} 而不是 {@code fnDefPct} ——
-     * 后者是本品的**烧录配方**（主人调好的观感），不是原厂。用户想要的是"回到原厂"，
+     * <ol>
+     *   <li>75 项精细调节写回 {@link Cfg#factoryDefPct}（100 = 不改动，角度 250）</li>
+     *   <li>6 个玻璃线开关一并写为关闭 —— 只回参数、不关线，用户看到的仍然是
+     *       "玻璃还在"，这正是上一轮误判的来源</li>
+     *   <li>推进 epoch 并同步属性，然后删缓存 + 逐路径复核</li>
+     * </ol>
+     *
+     * <p>注意用的是 {@code factoryDefPct} 而不是 {@code fnDefPct}：后者是本品的
+     * **烧录配方**（主人调好的观感），不是原厂。用户点"恢复出厂"要的是原厂，
      * 不是"回到我的配方"。
-     *
-     * <p>线开关不动：用户点这个通常只是想清掉参数，不想把整条线关掉。
      */
     private fun restoreFactoryParams() {
         Thread {
-            var ok = false
+            var err: String? = null
+            var state = CacheCleanState.UNKNOWN
             try {
-                val ed = prefs().edit()
-                for (k in Cfg.FN_KEYS) ed.putInt(k, Cfg.factoryDefPct(k))
-                ok = ed.commit()
-                AppLog.d("glasscfg", "恢复原厂参数 " + (if (ok) "成功" else "失败"))
+                synchronized(glassEpochLock) {
+                    if (bumpGlassEpochProp() == null) {
+                        throw IllegalStateException(
+                            "无法更新配置批次号（ROOT / 属性服务异常），未恢复")
+                    }
+                    val ed = prefs().edit()
+                    for (k in Cfg.FN_KEYS) ed.putInt(k, Cfg.factoryDefPct(k))
+                    // 真·出厂语义：六条玻璃线全部关闭。
+                    for (k in glassSwitchKeys()) ed.putBoolean(k, false)
+                    // 恢复出厂同时关闭云控屏蔽（默认关）。
+                    ed.putBoolean(Cfg.K_NOCLOUD, false)
+                    if (!ed.commit()) throw IllegalStateException("写入失败（存储异常）")
+                    AppLog.d("glasscfg", "恢复原厂参数 成功")
+                    state = invalidateGlassSnapshotsBlocking()
+                }
             } catch (t: Throwable) {
-                AppLog.d("glasscfg", "恢复原厂参数异常: " + t.javaClass.simpleName)
+                err = t.message ?: t.javaClass.simpleName
+                AppLog.d("glasscfg", "恢复原厂参数失败: " + err)
             }
             runOnUiThread {
-                if (ok) {
+                if (err == null) {
                     notifyCfgChanged()
+                    val tail = when (state) {
+                        CacheCleanState.GONE -> "缓存已清理，重启「系统界面」后生效"
+                        CacheCleanState.REMAIN -> "但缓存清理失败，建议重启系统界面"
+                        CacheCleanState.UNKNOWN -> "但无法确认缓存是否清理，建议重启系统界面"
+                    }
                     Toast.makeText(this,
-                        "已恢复官方原始参数。重启「系统界面」后液态玻璃生效",
+                        "已恢复官方原始参数，关闭全部玻璃线，并关闭云控屏蔽，$tail",
                         Toast.LENGTH_LONG).show()
                     window.decorView.postDelayed({ try { recreate() } catch (_: Throwable) {} }, 1200)
                 } else {
-                    Toast.makeText(this, "恢复失败，请检查存储空间", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "恢复失败：$err", Toast.LENGTH_LONG).show()
                 }
             }
         }.apply { name = "has-factory-restore" }.start()
@@ -765,95 +1088,426 @@ class SettingsActivity : ComponentActivity() {
     }
 
     /**
-     * 删除 /data/cota/para/ 下三份性能相关的云端配置。
+     * 云控清理执行层。
      *
-     * 设计上刻意保守：
-     *   · 只删这三个明确已知的文件，不做通配（`rm -rf` 太危险）
-     *   · 删之前先判断存不存在，不存在就如实告诉用户"本来就干净"
-     *   · 每条命令都带 `2>/dev/null`，避免 SELinux 警告污染结果
-     *   · 不删其他 10 类云控（contenttransfer / compliancecontrol 等，与本功能无关）
-     */
-    /**
-     * 清理云控残留（v3.2.33 重写判定逻辑）。
-     *
-     * <p>原实现有三个问题，用户实测报"清理失败：su 没执行成功"就是因为它们：
-     *
+     * <p>产品裁决：一级默认勾选；二级 / 三级默认不勾；三级红字标风险，但勾选后**照常删除**
+     * （有整批备份兜底）。唯一硬约束是「备份必须成功」，否则一个都不删。
+     * 流程：
      * <ol>
-     *   <li><b>用 `ls` 的行数当文件数</b>：{@code startSu} 开了
-     *       {@code redirectErrorStream(true)}，`ls` 对不存在文件的报错会混进 stdout，
-     *       "3 个不存在"被数成"存在 3 个"。</li>
-     *   <li><b>用 su 的退出码当成功判据</b>：`rm -f` 的目标本来就不存在时，
-     *       退出码受 shell 解析影响，会给出 exit=1；文件根本不存在这件事
-     *       被误报成"su 没授权"。</li>
-     *   <li>提示语把"没东西可删"和"没权限"混为一谈，用户以为是 root 坏了。</li>
+     *   <li>只读扫描（init mount namespace），列具体文件清单；</li>
+     *   <li>整批备份到下载目录 has_cota_backup/&lt;时间戳&gt;/，
+     *       下载目录不可写或回读校验不一致就**整批中止、一个都不删**；</li>
+     *   <li>逐路径 rm -f 明确文件名（不用 glob），空目录单独 rmdir；</li>
+     *   <li>三态复核 EXIST / GONE / UNKNOWN，失败如实报。</li>
      * </ol>
      *
-     * <p>现在改成：用 {@code test -e} 逐个精确列出现存文件，删完**再数一遍**，
-     * 以"还剩几个"作为唯一判据。文件不存在 = 本来就没东西可清，直接说清楚。
-     *
-     * <p>注意：这三个路径来自 HAware 反编译（{@code /data/cota/para/cpuconfig} 等），
-     * 在 MagicOS 11 / Android 17 上实测**可能压根不会生成** —— 该版本的 cota 目录
-     * 是「一个策略一个子目录」的结构。所以"本来就不存在"是完全正常的状态，
-     * 不是失败。
+     * <p>模块 app 自己起的 su 子进程跑在应用的 mount namespace 里，
+     * 看不到 /data/cota 全局视图，所以扫描、备份、删除、复核全部走
+     * {@code nsenter -t 1 -m}，并用 {@code __NS_DONE__} 哨兵 + 退出码判成功。
      */
-    private fun purgeCotaConfigs(done: (Boolean) -> Unit) {
+
+    /** 只接受 /data/cota/para 下、不含 shell 元字符的路径（文件来自 find，必须校验）。 */
+    private fun cotaSafePath(p: String): Boolean {
+        if (!p.startsWith(cotaRoot + "/")) return false
+        return p.none {
+            it == '\'' || it == '"' || it == ' ' || it == '\n'
+                    || it == '\r' || it == '$' || it == '`' || it == '\\'
+        }
+    }
+
+    /** 只读扫描。返回每个条目的具体文件清单；删除只认这份清单。 */
+    private fun scanCota(entries: List<CotaEntry>): CotaScanResult {
+        val script = StringBuilder()
+        for (e in entries) {
+            val abs = "$cotaRoot/${e.rel}"
+            if (!cotaSafePath(abs)) {
+                return CotaScanResult(
+                    entries.map { CotaScan(it, PurgeProbe.UNKNOWN, emptyList()) },
+                    "条目路径含不允许的字符：$abs")
+            }
+            script.append("echo \"BEGIN:${e.key}\"; ")
+            if (e.isDir) {
+                script.append("if [ -d \"$abs\" ]; then echo \"DIR:${e.key}\"; ")
+                script.append("find \"$abs\" -type f 2>/dev/null | while read f; do " +
+                        "echo \"FILE:${e.key}|\$f|\$(wc -c < \"\$f\")\"; done; ")
+                script.append("elif ls -ld \"$abs\" 2>&1 | grep -q \"No such file\"; " +
+                        "then echo \"GONE:${e.key}\"; ")
+                script.append("else echo \"UNKNOWN:${e.key}\"; fi; ")
+            } else {
+                script.append("if [ -f \"$abs\" ]; then " +
+                        "echo \"FILE:${e.key}|$abs|\$(wc -c < \"$abs\")\"; ")
+                script.append("elif ls -ld \"$abs\" 2>&1 | grep -q \"No such file\"; " +
+                        "then echo \"GONE:${e.key}\"; ")
+                script.append("else echo \"UNKNOWN:${e.key}\"; fi; ")
+            }
+        }
+        val r = suRun("nsenter -t 1 -m -- sh -c '$script' && echo __NS_DONE__", 15000L)
+        if (!rootOk(r, "__NS_DONE__")) {
+            AppLog.d("purgecota", "扫描失败：exit=" + r.exit +
+                    " out=" + (r.out?.trim()?.take(300) ?: "(null)"))
+            return CotaScanResult(
+                entries.map { CotaScan(it, PurgeProbe.UNKNOWN, emptyList()) },
+                "扫描命令没有正常返回（exit=${r.exit}）")
+        }
+        val dirs = HashSet<String>()
+        val gone = HashSet<String>()
+        val unknown = HashSet<String>()
+        val files = HashMap<String, MutableList<String>>()
+        val sizes = HashMap<String, MutableMap<String, Long>>()
+        for (line in (r.out ?: "").lineSequence()) {
+            when {
+                line.startsWith("DIR:") -> dirs.add(line.substring(4).trim())
+                line.startsWith("FILE:") -> {
+                    val parts = line.substring(5).split('|')
+                    if (parts.size >= 3) {
+                        val k = parts[0]
+                        val p = parts[1]
+                        val sz = parts[2].trim().toLongOrNull() ?: -1L
+                        if (p.isNotEmpty() && sz >= 0) {
+                            files.getOrPut(k) { mutableListOf() }.add(p)
+                            sizes.getOrPut(k) { mutableMapOf() }[p] = sz
+                        }
+                    }
+                }
+                line.startsWith("GONE:") -> gone.add(line.substring(5).trim())
+                line.startsWith("UNKNOWN:") -> unknown.add(line.substring(8).trim())
+            }
+        }
+        val scans = entries.map { e ->
+            val f = files[e.key].orEmpty().filter { cotaSafePath(it) }
+            val sz = sizes[e.key].orEmpty().filterKeys { cotaSafePath(it) }
+            val state = when {
+                unknown.contains(e.key) -> PurgeProbe.UNKNOWN
+                f.isNotEmpty() || dirs.contains(e.key) -> PurgeProbe.FOUND
+                gone.contains(e.key) -> PurgeProbe.GONE
+                else -> PurgeProbe.UNKNOWN
+            }
+            CotaScan(e, state, f, sz)
+        }
+        AppLog.d("purgecota", "扫描结果 " + scans.joinToString {
+            it.entry.key + "=" + it.state + "(" + it.files.size + ")"
+        })
+        return CotaScanResult(scans)
+    }
+
+    /**
+     * 整批备份到下载目录。返回备份目录；null = 失败（调用方必须放弃删除）。
+     *
+     * <p>路径固定 /storage/emulated/0/Download/has_cota_backup/&lt;ts&gt;/：
+     * 下载目录不可写就如实失败，**绝不换地方偷偷存**。
+     * 每个备份目录保留原始子目录结构，manifest.txt 逐文件记录
+     * 「相对原路径 / 原绝对路径 / 备份内路径 / 字节数」，另有一行 E 记录条目。
+     * 备份后逐文件回读大小并累计文件数/总大小，必须与源完全一致，否则整批中止。
+     */
+    private fun backupCota(scans: List<CotaScan>, ts: String): String? {
+        val dir = "$cotaBackupRoot/$ts"
+        var expectN = 0
+        var expectS = 0L
+        val sb = StringBuilder()
+        sb.append("set -e; B=\"$dir\"; mkdir -p \"\$B\"; : > \"\$B/manifest.txt\"; ")
+        sb.append("echo \"# has_cota_backup $ts\" >> \"\$B/manifest.txt\"; ")
+        sb.append("N=0; S=0; ")
+        for (s in scans) {
+            if (s.state != PurgeProbe.FOUND) continue
+            val e = s.entry
+            val abs = "$cotaRoot/${e.rel}"
+            if (!cotaSafePath(abs)) continue
+            val kind = if (e.isDir) "dir" else "file"
+            val total = s.sizes.values.sum()
+            sb.append("mkdir -p \"\$B/${e.key}\"; ")
+            sb.append("echo \"E|${e.key}|$abs|$kind|${s.files.size}|$total\" " +
+                    ">> \"\$B/manifest.txt\"; ")
+            for (f in s.files) {
+                if (!cotaSafePath(f)) continue
+                val size = s.sizes[f] ?: continue
+                val rel = f.removePrefix("$cotaRoot/")
+                val bpath = if (e.isDir) rel.removePrefix(e.rel + "/")
+                else f.substringAfterLast('/')
+                if (bpath.isEmpty() || bpath.contains('|')) continue
+                if (bpath.contains('/')) {
+                    sb.append("mkdir -p \"\$B/${e.key}/${bpath.substringBeforeLast('/')}\"; ")
+                }
+                sb.append("cp -a \"$f\" \"\$B/${e.key}/$bpath\"; ")
+                sb.append("sz1=\$(wc -c < \"$f\"); sz2=\$(wc -c < \"\$B/${e.key}/$bpath\"); ")
+                sb.append("[ \"\$sz1\" = \"\$sz2\" ] || exit 9; ")
+                sb.append("echo \"F|$rel|$f|${e.key}/$bpath|\$sz2\" >> \"\$B/manifest.txt\"; ")
+                sb.append("N=\$((N+1)); S=\$((S+sz2)); ")
+                expectN++
+                expectS += size
+            }
+        }
+        sb.append("echo \"COUNTS:\$N:\$S\"; echo __BAK_OK__")
+        val r = suRun("nsenter -t 1 -m -- sh -c '$sb' && echo __NS_DONE__", 45000L)
+        val out = r.out ?: ""
+        if (!rootOk(r, "__NS_DONE__") || !out.contains("__BAK_OK__") ||
+            !out.contains("COUNTS:$expectN:$expectS")) {
+            AppLog.d("purgecota", "备份失败：exit=" + r.exit +
+                    " expect=$expectN/$expectS out=" + out.trim().take(400))
+            return null
+        }
+        AppLog.d("purgecota", "备份完成：$dir（$expectN 个文件 / $expectS 字节）")
+        return dir
+    }
+
+    /** 执行清理：硬校验 → 扫描 → 备份 → 逐文件删除 → 三态复核。 */
+    private fun purgeCotaEntries(entries: List<CotaEntry>, ts: String, done: (Boolean) -> Unit) {
         Thread {
-            val files = listOf(
-                "/data/cota/para/cpuconfig",
-                "/data/cota/para/pg_config",
-                "/data/cota/para/thermal_config"
-            )
-            // 用 test -e 精确判定：不存在就什么都不输出，绝不会像 ls 那样
-            // 把报错行也吐到同一个流里。
-            val probe = "for f in " + files.joinToString(" ") +
-                    "; do [ -e \"\$f\" ] && echo \"\$f\"; done"
-            fun existing(): List<String> =
-                (suReadOutput(probe, 6000L) ?: "")
-                    .lineSequence()
-                    .map { it.trim() }
-                    .filter { it.startsWith("/data/cota/") }
-                    .toList()
-
-            val before = try { existing() } catch (_: Throwable) { emptyList() }
-            AppLog.d("purgecota", "清理前存在 " + before.size + " 个 " + before)
-
-            if (before.isEmpty()) {
+            // 0) 只允许白名单条目；三级高风险也允许（有整批备份兜底）。
+            var rejected: String? = null
+            for (e in entries) {
+                if (cotaEntries.none { it.key == e.key && it.rel == e.rel }) {
+                    rejected = e.rel + "（不在清理白名单）"
+                    break
+                }
+            }
+            if (rejected != null) {
+                AppLog.d("purgecota", "拒绝删除：$rejected 不在白名单，未做任何改动")
                 runOnUiThread {
                     Toast.makeText(this,
-                        "云端配置本来就不存在，无需清理。\n" +
-                        "（这台系统的 cota 目录是「一个策略一个子目录」结构，" +
-                        "这三个旧版路径通常不会生成 —— 不是清理失败）",
+                        "拒绝删除：$rejected 不在清理白名单，未做任何改动。",
                         Toast.LENGTH_LONG).show()
                 }
-                done(true)   // 没有残留 = 目标达成，不算失败
+                done(false)
                 return@Thread
             }
 
-            // 删的时候不带任何重定向：真出错时错误文本会被 startSu 的
-            // redirectErrorStream 收进来，便于排查
-            suExecTimeout("rm -f " + before.joinToString(" "), 8000L)
+            val before = try { scanCota(entries) } catch (t: Throwable) {
+                CotaScanResult(entries.map { CotaScan(it, PurgeProbe.UNKNOWN, emptyList()) },
+                    t.javaClass.simpleName)
+            }
+            if (before.error != null || before.hasUnknown) {
+                runOnUiThread {
+                    Toast.makeText(this,
+                        "无法确认云控文件状态（ROOT / nsenter 探测失败），未执行删除。\n" +
+                        (before.error ?: "有路径在当前命名空间看不到"),
+                        Toast.LENGTH_LONG).show()
+                }
+                done(false)
+                return@Thread
+            }
+            if (before.allGone) {
+                runOnUiThread {
+                    Toast.makeText(this, "所选目录本来就没有可清理的文件。",
+                        Toast.LENGTH_LONG).show()
+                }
+                done(false)
+                return@Thread
+            }
 
-            val after = try { existing() } catch (_: Throwable) { before }
-            AppLog.d("purgecota", "清理后剩 " + after.size + " 个 " + after)
+            // 1) 备份是硬前提；下载目录不可写 / 回读校验不一致 -> 整批中止。
+            val backupDir = try { backupCota(before.scans, ts) } catch (_: Throwable) { null }
+            if (backupDir == null) {
+                runOnUiThread {
+                    Toast.makeText(this,
+                        "备份失败，停止清理（未改动任何文件）。\n" +
+                        "请确认下载目录可写、存储空间充足后重试。\n" +
+                        "备份位置：$cotaBackupRoot/$ts/",
+                        Toast.LENGTH_LONG).show()
+                }
+                done(false)
+                return@Thread
+            }
 
+            // 2) 逐路径删明确文件（不用 glob），空目录单独 rmdir。
+            val sb = StringBuilder()
+            for (s in before.scans) {
+                if (s.state != PurgeProbe.FOUND) continue
+                for (f in s.files) {
+                    if (cotaSafePath(f)) sb.append("rm -f -- \"$f\"; ")
+                }
+                if (s.entry.isDir) {
+                    val abs = "$cotaRoot/${s.entry.rel}"
+                    if (cotaSafePath(abs)) {
+                        sb.append("find \"$abs\" -depth -type d -exec rmdir {} \\; 2>/dev/null; ")
+                    }
+                }
+            }
+            sb.append("true")
+            val rm = suRun("nsenter -t 1 -m -- sh -c '$sb' && echo __NS_DONE__", 20000L)
+            AppLog.d("purgecota", "删除 " +
+                    (if (rootOk(rm, "__NS_DONE__")) "ok" else "失败") +
+                    " exit=" + rm.exit +
+                    " out=" + (rm.out?.trim()?.take(300) ?: "(null)"))
+
+            // 3) 三态复核。
+            val after = try { scanCota(entries) } catch (t: Throwable) {
+                CotaScanResult(entries.map { CotaScan(it, PurgeProbe.UNKNOWN, emptyList()) },
+                    t.javaClass.simpleName)
+            }
+            val allGone = after.scans.isNotEmpty() &&
+                    after.scans.all { it.state == PurgeProbe.GONE }
+            val left = after.scans.map { it.files.size }.sum()
+            AppLog.d("purgecota", "清理后 " + after.scans.joinToString {
+                it.entry.key + "=" + it.state + "(" + it.files.size + ")"
+            })
             runOnUiThread {
                 when {
-                    after.isEmpty() -> Toast.makeText(this,
-                        "已清理 " + before.size + " 个云端配置文件。\n" +
-                        "请立即重启手机，让 PowerGenie 回到内置默认策略。",
+                    after.hasUnknown -> Toast.makeText(this,
+                        "删除命令已执行，但无法确认结果（探测失败）。备份：$backupDir",
                         Toast.LENGTH_LONG).show()
-                    after.size < before.size -> Toast.makeText(this,
-                        "部分清理：已删 " + (before.size - after.size) +
-                        " 个，还剩 " + after.size + " 个（可能被系统占用，重启后再试）",
+                    allGone -> Toast.makeText(this,
+                        "已清理 ${before.files.size} 个文件（${entries.size} 个条目）。\n" +
+                        "备份：$backupDir\n请重启手机，让相关服务回到内置策略。",
                         Toast.LENGTH_LONG).show()
                     else -> Toast.makeText(this,
-                        "没删掉（还剩 " + after.size + " 个）：这些文件被系统占用或只读。\n" +
-                        "可用 root 终端手动执行：\nrm -f " + after.joinToString(" "),
+                        "部分清理：还剩 $left 个文件（" +
+                        after.scans.filter { it.state == PurgeProbe.FOUND }
+                            .joinToString { it.entry.key } +
+                        " 仍为 EXIST，可能被系统占用）。\n备份：$backupDir",
                         Toast.LENGTH_LONG).show()
                 }
             }
-            done(after.isEmpty())
+            done(allGone)
         }.apply { name = "has-purge-cota" }.start()
+    }
+
+    /** 列出下载目录下的备份（时间倒序）。 */
+    private fun listCotaBackups(): List<CotaBackup> {
+        val script = "for d in $cotaBackupRoot/*/; do " +
+                "[ -f \"\$d/manifest.txt\" ] || continue; " +
+                "e=\$(grep -c \"^E|\" \"\$d/manifest.txt\" 2>/dev/null); " +
+                "f=\$(grep -c \"^F|\" \"\$d/manifest.txt\" 2>/dev/null); " +
+                "echo \"BAK:\$(basename \"\$d\"):\$e:\$f\"; " +
+                "done; true"
+        val r = suRun("nsenter -t 1 -m -- sh -c '$script' && echo __NS_DONE__", 10000L)
+        if (!rootOk(r, "__NS_DONE__")) {
+            AppLog.d("purgecota", "列出备份失败：exit=" + r.exit +
+                    " out=" + (r.out?.trim()?.take(200) ?: "(null)"))
+            return emptyList()
+        }
+        val out = mutableListOf<CotaBackup>()
+        for (line in (r.out ?: "").lineSequence()) {
+            if (!line.startsWith("BAK:")) continue
+            val parts = line.substring(4).split(":")
+            if (parts.size < 3) continue
+            val ts = parts[0].trim()
+            val entries = parts[1].trim().toIntOrNull() ?: continue
+            val files = parts[2].trim().toIntOrNull() ?: continue
+            out.add(CotaBackup(ts, entries, files))
+        }
+        return out.sortedByDescending { it.ts }
+    }
+
+    /**
+     * 从下载目录的备份整批恢复。
+     *
+     * <p>manifest.txt 两种行：
+     * <pre>
+     *   E|key|abs|dir|file|n|bytes
+     *   F|rel|abs|bpath|bytes
+     * </pre>
+     * 恢复前校验所有路径仍在云控白名单内；恢复时逐文件 cp 并回读大小；
+     * 恢复后重新扫描做 EXIST / GONE / UNKNOWN 三态复核 + 文件大小比对。
+     */
+    private fun restoreCotaBackup(ts: String, done: (Boolean) -> Unit) {
+        Thread {
+            if (!ts.matches(Regex("\\d{8}-\\d{6}-\\d{3}"))) {
+                runOnUiThread {
+                    Toast.makeText(this, "备份名不合法：$ts", Toast.LENGTH_LONG).show()
+                }
+                done(false)
+                return@Thread
+            }
+            val dir = "$cotaBackupRoot/$ts"
+            val mf = suRun("nsenter -t 1 -m -- sh -c 'cat \"$dir/manifest.txt\"'" +
+                    " && echo __NS_DONE__", 8000L)
+            if (!rootOk(mf, "__NS_DONE__")) {
+                runOnUiThread {
+                    Toast.makeText(this, "备份清单读取失败（备份可能不完整），未恢复。",
+                        Toast.LENGTH_LONG).show()
+                }
+                done(false)
+                return@Thread
+            }
+            val rows = (mf.out ?: "").lineSequence()
+                .map { it.trim() }
+                .filter { it.isNotEmpty() && it.contains('|') }
+                .map { it.split('|') }
+                .toList()
+            val entryRows = rows.filter { it.size >= 6 && it[0] == "E" }
+            val fileRows = rows.filter { it.size >= 5 && it[0] == "F" }
+            fun known(p: String): Boolean = cotaEntries.any { e ->
+                val base = "$cotaRoot/${e.rel}"
+                p == base || p.startsWith("$base/")
+            }
+            val bad = entryRows.firstOrNull { it[2].isNotEmpty() && !known(it[2]) }
+                ?: fileRows.firstOrNull { it[1].isNotEmpty() && !known("$cotaRoot/${it[1]}") }
+                ?: fileRows.firstOrNull { it[2].isNotEmpty() && !known(it[2]) }
+            if (bad != null) {
+                AppLog.d("purgecota", "恢复拒绝：清单含非白名单路径 $bad")
+                runOnUiThread {
+                    Toast.makeText(this,
+                        "备份清单包含非白名单路径，已拒绝恢复：${bad.joinToString("|")}",
+                        Toast.LENGTH_LONG).show()
+                }
+                done(false)
+                return@Thread
+            }
+            val keys = entryRows.map { it[1] }.distinct()
+            val expected = fileRows.mapNotNull { row ->
+                val rel = row[1]
+                val size = row[4].trim().toLongOrNull() ?: return@mapNotNull null
+                "$cotaRoot/$rel" to size
+            }.toMap()
+            val script = "set -e; B=\"$dir\"; " +
+                    "while IFS=\"|\" read -r tag key abs kind n b; do " +
+                    "if [ \"\$tag\" = \"E\" ] && [ \"\$kind\" = \"dir\" ]; then " +
+                    "mkdir -p \"\$abs\"; fi; " +
+                    "done < \"\$B/manifest.txt\"; " +
+                    "while IFS=\"|\" read -r tag rel abs bpath sz; do " +
+                    "if [ \"\$tag\" = \"F\" ]; then " +
+                    "mkdir -p \"\$(dirname \"\$abs\")\"; " +
+                    "cp -a \"\$B/\$bpath\" \"\$abs\"; " +
+                    "s1=\$(wc -c < \"\$B/\$bpath\"); s2=\$(wc -c < \"\$abs\"); " +
+                    "[ \"\$s1\" = \"\$s2\" ] || exit 8; fi; " +
+                    "done < \"\$B/manifest.txt\"; echo __RESTORE_OK__"
+            val r = suRun("nsenter -t 1 -m -- sh -c '$script' && echo __NS_DONE__", 45000L)
+            if (!rootOk(r, "__NS_DONE__") || !(r.out ?: "").contains("__RESTORE_OK__")) {
+                AppLog.d("purgecota", "恢复失败：exit=" + r.exit +
+                        " out=" + (r.out?.trim()?.take(300) ?: "(null)"))
+                runOnUiThread {
+                    Toast.makeText(this,
+                        "恢复失败（cp / 大小校验未通过），请检查下载目录与存储空间。",
+                        Toast.LENGTH_LONG).show()
+                }
+                done(false)
+                return@Thread
+            }
+            val restored = cotaEntries.filter { e -> keys.contains(e.key) }
+            val after = try { scanCota(restored) } catch (t: Throwable) {
+                CotaScanResult(restored.map { CotaScan(it, PurgeProbe.UNKNOWN, emptyList()) },
+                    t.javaClass.simpleName)
+            }
+            val got = after.scans.flatMap { s -> s.sizes.entries }
+                .associate { it.key to it.value }
+            val mismatch = expected.entries.firstOrNull { (abs, size) -> got[abs] != size }
+            val allFound = after.scans.isNotEmpty() &&
+                    after.scans.all { it.state == PurgeProbe.FOUND }
+            val okAll = allFound && mismatch == null && !after.hasUnknown
+            AppLog.d("purgecota", "恢复后 " + after.scans.joinToString {
+                it.entry.key + "=" + it.state + "(" + it.files.size + ")"
+            } + " mismatch=" + (mismatch?.key ?: "none"))
+            runOnUiThread {
+                when {
+                    after.hasUnknown -> Toast.makeText(this,
+                        "恢复命令已执行，但有路径无法确认（UNKNOWN）。备份：$dir",
+                        Toast.LENGTH_LONG).show()
+                    okAll -> Toast.makeText(this,
+                        "已从备份 $ts 整批恢复 ${restored.size} 个条目，" +
+                        "复核 EXIST 且文件大小一致。\n请重启手机生效。",
+                        Toast.LENGTH_LONG).show()
+                    mismatch != null -> Toast.makeText(this,
+                        "恢复不完整：${mismatch.key} 期望 ${mismatch.value} 字节，" +
+                        "实际 ${got[mismatch.key] ?: "不存在"}。备份：$dir",
+                        Toast.LENGTH_LONG).show()
+                    else -> Toast.makeText(this,
+                        "恢复后复核未全部通过（" +
+                        after.scans.joinToString { it.entry.key + "=" + it.state } +
+                        "）。备份：$dir", Toast.LENGTH_LONG).show()
+                }
+            }
+            done(okAll)
+        }.apply { name = "has-cota-restore" }.start()
     }
 
     /** 通用：把文本写进「下载」目录。 */
@@ -932,7 +1586,7 @@ class SettingsActivity : ComponentActivity() {
     }
 
     /**
-     * v3.0.2 改：原来这里是 `p.waitFor()` **无超时**。
+     * 所有 su 命令都走带超时的实现，不能直接 `p.waitFor()`。
      *
      * 后台线程虽然不会 ANR，但 su 会一直阻塞着等用户点授权 —— 线程挂死、
      * `runOnUiThread` 永远等不到，用户看到的就是"点了重启没有任何反应"。
@@ -988,12 +1642,11 @@ class SettingsActivity : ComponentActivity() {
                 dirty = true
             }
         }
-        // v2.6.3: 通用孤儿键清理。
-        // 精细调节（fn_*）和粗调（tune_*）的键以前是手写进 stale 列表的，
-        // 每删一个参数就要记得补一条 —— 漏一次，旧值就留在 prefs 里静默生效
-        // （v2.6.3 删 fn_winblur 时正好撞上：hook 里已经不信这个键了，但用户
-        // 之前存的值还在，将来哪天同名键复活就会"诈尸"）。
-        // 现在按白名单统一扫：凡是以 fn_/tune_ 开头、又不在当前定义里的键，
+        // 通用孤儿键清理。
+        // 精细调节（fn_*）和粗调（tune_*）的键不能手写进 stale 列表 ——
+        // 每删一个参数就要记得补一条，漏一次，旧值就留在 prefs 里静默生效
+        // （hook 里已经不信这个键了，但用户之前存的值还在，将来哪天同名键复活就会"诈尸"）。
+        // 按白名单统一扫：凡是以 fn_/tune_ 开头、又不在当前定义里的键，
         // 一律清掉。以后增删参数不用再动这里。
         run {
             val known = HashSet<String>()
@@ -1026,6 +1679,18 @@ class SettingsActivity : ComponentActivity() {
         // keep the system-property bridge in sync with the stored switch
         // (first run after install, or after the pref was changed elsewhere)
         try { syncHottempProp(prefs().getBoolean(Cfg.K_HOTTEMP, false)) } catch (_: Throwable) {}
+        // 降级属性在启动时对齐（首次安装 / pm clear / 属性被外部改过）。
+        // 缺省 true：没有这个键（新装、pm clear）一律写 1；老用户 prefs 里显式
+        // 写了 false 的保持 0，不覆盖人家的选择。
+        // 写失败时 syncDowngradeProp 会弹失败提示，不假装成功。
+        try {
+            val desired = prefs().getBoolean(Cfg.K_DOWNGRADE, true)
+            syncDowngradeProp(desired) { ok ->
+                AppLog.d("downgrade", "onCreate 同步 " + (if (ok) "成功" else "失败"))
+            }
+        } catch (t: Throwable) {
+            AppLog.d("downgrade", "onCreate 同步异常: " + t.javaClass.simpleName)
+        }
         // transparent bars, edge-to-edge; dark icons in light theme
         try {
             val ic = window.getInsetsController()
@@ -1166,7 +1831,9 @@ class SettingsActivity : ComponentActivity() {
             item { ActionCard("系统综合", "通知音量、高温限制与系统级行为的总开关集合") { go(Page.Misc) } }
             item { ActionCard("安全组件", "允许截屏 / 录屏、屏蔽云控下发、屏蔽反诈组件") { go(Page.Security) } }
             item {
-                ActionCard("重启作用域（需ROOT）", "可多选一次重启：系统界面 / 相册 / 安装器 / 桌面 / 温控服务 / 反诈服务 / 感知服务") { requestRootThenPickScope() }
+                ActionCard("重启作用域（需ROOT）",
+                    "可多选一次重启：" + scopeTargets.filter { it.pkg != "__reboot__" }
+                        .joinToString(" / ") { it.label }) { requestRootThenPickScope() }
             }
         }
     }
@@ -1175,27 +1842,65 @@ class SettingsActivity : ComponentActivity() {
     @Composable
     private fun FrameworkCard() {
         val st = FrameworkProbe.state
-        val ok = st.running
+        // system_server 用 persist.sys.has.sysprobe 自证：属性存在但版本旧 / boot_id 不符，
+        // 说明系统框架跑的还是旧代码，首页必须一起变红，不能只报 7 个可自证进程。
+        // 属性完全读不到（没 root / 首次安装）时不算失败，避免无 root 用户被误报。
+        val sysRaw = readProp("persist.sys.has.sysprobe")
+        val sysKnown = !sysRaw.isNullOrBlank()
+        val sysOk = sysKnown && sysprobeBootMatches()
+                && sysprobeCode() >= BuildConfig.VERSION_CODE
+        // 只认本次 boot_id + 心跳新鲜的记录：旧 key 不进"已加载"，缺哪个列哪个。
+        // iaware / powergenie 同进程，任一新新鲜即算 —— 与开关状态行使用同一 OR 判据。
+        fun homeFresh(pkg: String): Boolean = when (pkg) {
+            "com.hihonor.iaware" -> st.has("com.hihonor.iaware") || st.has("com.hihonor.powergenie")
+            else -> st.has(pkg)
+        }
+        fun homeAlive(pkg: String): Boolean = when (pkg) {
+            "com.hihonor.iaware" -> st.alive("com.hihonor.iaware") || st.alive("com.hihonor.powergenie")
+            else -> st.alive(pkg)
+        }
+        val missing = S_HOME.filter { !homeFresh(it) }
+        val missingAlive = S_HOME.filter { !homeAlive(it) }
+        val ok = missing.isEmpty() && (!sysKnown || sysOk)
+        // 深休眠 / Doze 后心跳可能还没恢复：只要本次开机都上报过，就只算"心跳暂停"
+        // （黄色），等 probe 下一次心跳自动转绿，不报红。
+        val sleeping = !ok && missingAlive.isEmpty() && (!sysKnown || sysOk)
         val title = when {
             !st.probed -> "正在检测模块状态…"
             ok -> "模块已生效"
+            sleeping -> "模块已加载（心跳暂停）"
             else -> "模块未生效"
         }
         val sub = when {
             !st.probed -> "读取作用域运行记录"
             ok -> {
-                // powergenie 与 iaware 是同一个进程的两个包名，列表里只留一个
-                val names = st.reports.keys
-                    .filter { it != "com.hihonor.powergenie" }
-                    .joinToString(" / ") { scopeLabel(it) }
-                val at = st.reports.values.maxOfOrNull { it.at } ?: 0L
+                val names = S_HOME.filter { homeFresh(it) }.joinToString(" / ") { scopeLabel(it) }
+                val at = st.reports.values.filter { it.at > 0L }.maxOfOrNull { it.at } ?: 0L
                 "已加载 $names · ${FrameworkProbe.ago(at)}上报"
             }
-            else -> "请在 LSPosed 中启用本模块、勾选作用域，然后重启作用域或手机"
+            sleeping -> {
+                "本次开机已上报，心跳超过 5 分钟未刷新（深休眠/Doze 后属正常，解锁后会自动恢复）：" +
+                    missing.joinToString("、") { scopeLabel(it) }
+            }
+            else -> {
+                val bits = mutableListOf<String>()
+                if (sysKnown && !sysOk) {
+                    bits += "系统框架（system_server 未注入或仍是旧版本，需重启手机）"
+                }
+                if (missing.isNotEmpty()) {
+                    bits += "未上报：" + missing.joinToString("、") { scopeLabel(it) }
+                }
+                if (bits.isEmpty()) {
+                    "请在 LSPosed 中启用本模块、勾选作用域，然后重启作用域或手机"
+                } else {
+                    bits.joinToString("；")
+                }
+            }
         }
         val accent = when {
             !st.probed -> MiuixTheme.colorScheme.onSurfaceVariantSummary
             ok -> Color(0xFF2FBF6B)
+            sleeping -> Color(0xFFE8A33D)
             else -> Color(0xFFE5484D)
         }
         Card(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp), cornerRadius = 16.dp) {
@@ -1209,7 +1914,7 @@ class SettingsActivity : ComponentActivity() {
                     Text(sub, fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 3.dp))
                 }
-                Text(when { !st.probed -> "…"; ok -> "正常"; else -> "异常" },
+                Text(when { !st.probed -> "…"; ok -> "正常"; sleeping -> "待刷新"; else -> "异常" },
                     fontSize = 13.sp, color = accent)
             }
         }
@@ -1246,7 +1951,8 @@ class SettingsActivity : ComponentActivity() {
                 title = "恢复官方原始参数",
                 lines = listOf(
                     "把 75 项精细调节全部重置为系统原厂值（100 = 不改动）",
-                    "线开关（总开关 / 系统 / 锁屏 / 横幅 / 桌面 / 相册）保持不变",
+                    "会同时关闭全部玻璃线（总开关 / 系统 / 锁屏 / 横幅 / 桌面 / 相册），玻璃效果完全停止",
+                    "会同时关闭云控屏蔽（K_NOCLOUD，默认关）",
                     "你烧录或自己调过的观感会被清掉"
                 ),
                 note = "这个操作不可撤销，建议先「导出液态玻璃参数」备份一份。",
@@ -1335,8 +2041,7 @@ class SettingsActivity : ComponentActivity() {
                 item {
                     Column {
                         SectionLabel("精细调节（100% = 不改动 · 改完重启「系统界面」生效）")
-                        // v3.0.5：这个开关原来是裸的（直接放在 Column 里，没有卡片底），
-                        // 和下面的 ParamGroup 视觉上不齐。包一层 CardShell。
+                        // 这个开关要包一层 CardShell，和下面的 ParamGroup 视觉对齐。
                         CardShell {
                             TuneSwitch("强制液态玻璃", Cfg.F_FORCE_LIQUID,
                                 "有些界面系统会自己判定成磨砂（比如通知横幅、某些卡片），你没法改。打开这个开关，强制它们也走液态折射。如果哪个界面变糊或变色，关掉即可。")
@@ -1634,11 +2339,8 @@ class SettingsActivity : ComponentActivity() {
     /**
      * 开关型精细参数。
      *
-     * v3.0.4：从「点击整行 + 右侧文字」改成**真开关**。
-     * 原来那一版右边显示「已关闭 / 原厂」，用户反馈两点：
-     *   ① 看着像按钮不像开关，不知道点一下是开还是关；
-     *   ② "原厂"看不懂。
-     * 现在状态由 Switch 本身表达，不再需要文字。
+     * 状态用真开关（Switch）表达，不用「点击整行 + 右侧文字」：
+     * 文字版看着像按钮不像开关，用户不知道点一下是开还是关；"原厂"也不好懂。
      */
     @Composable
     private fun TuneSwitch(label: String, key: String, tip: String = "") {
@@ -1648,6 +2350,7 @@ class SettingsActivity : ComponentActivity() {
             on = v
             hv.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
             prefs().edit().putInt(key, if (v) 1 else 0).commit()
+            notifyCfgChanged()
         }
         Row(
             Modifier.fillMaxWidth().clickable { setOn(!on) }
@@ -1715,7 +2418,13 @@ class SettingsActivity : ComponentActivity() {
                 },
                 valueRange = 0f..rangeMax.toFloat(),
                 steps = effSteps,
-                onValueChangeFinished = { prefs().edit().putInt(key, pct).commit() },
+                onValueChangeFinished = {
+                    prefs().edit().putInt(key, pct).commit()
+                    notifyCfgChanged()
+                    // 不在这里删 cfg_snapshot。删缓存只对「下一次进程启动」
+                    // 有效，对当前正在渲染的进程没有作用；而删完若用户直接重启手机，
+                    // 开机首帧反而无缓存可读，会把玻璃失效请回来。
+                },
                 modifier = Modifier.fillMaxWidth()
             )
         }
@@ -1749,16 +2458,24 @@ class SettingsActivity : ComponentActivity() {
      */
     @Composable
     private fun SecurityPage(back: () -> Unit) {
-        // v3.2.33：清理云控已从「开关」改成「按钮」。
-        // 它本来就不是状态（点一次执行一次），做成开关会让用户误以为
-        // "开着就一直生效"，关着就以为没清理过。用局部状态控制确认框即可。
-        var showPurge by remember { mutableStateOf(false) }
+        // 清理是独立动作：按目录多选 -> 扫描列清单 -> 备份后删除，并提供恢复入口。
+        var showPurgePicker by remember { mutableStateOf(false) }
+        // 默认勾选只在数据层定：一级全部默认勾选；二级、三级默认不勾。
+        // 用户点进来看到的就是已勾状态，不是渲染时假装勾上。
+        var purgeSelected by remember {
+            mutableStateOf(cotaEntries.filter { it.level == 1 }.map { it.key }.toSet())
+        }
+        var purgePreview by remember { mutableStateOf<CotaScanResult?>(null) }
+        var backups by remember { mutableStateOf<List<CotaBackup>?>(null) }
+        var showBackupPicker by remember { mutableStateOf(false) }
+        var restoreTs by remember { mutableStateOf<String?>(null) }
+
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp),
             contentPadding = PaddingValues(top = 8.dp, bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item { BackHeader("安全组件", back) }
             item { TipText("下面每一项都会让系统变得更「不设防」。默认全部关闭，开启前会二次确认，请确认你理解它的后果。") }
-            // v3.2.47：三张独立卡片，顺序按用户要求：反诈 → 云控+清理 → 截屏。
+            // 三张独立卡片，顺序按用户要求：反诈 → 云控+清理 → 截屏。
             // 清理**不能**单独成卡 —— 它和云控是同一件事的两半，拆开看不出因果关系。
             item {
                 SwitchCard(listOf(
@@ -1785,38 +2502,63 @@ class SettingsActivity : ComponentActivity() {
             item {
                 SwitchCard(
                     rows = listOf(
-                    SwRow("屏蔽性能 / 温控策略云控下发",
-                        "云端把性能/温控策略写进 /data/cota/para/ 之后，PowerGenie 既不收重载通知，"
-                                + "也读不到那几个文件（对它们的存在性判断和打开操作一律按「不存在」处理），"
-                                + "只会用自己出厂内置的策略。和「屏蔽高温限制」互补：那个管设备已经热了别降频，"
-                                + "这个管别再推新策略。",
+                    SwRow("屏蔽云控下发（CPU + 温控）",
+                        "只作用于 CPU 与温控策略这三份云控：CpuCfg / PgConfig / ThermalCfg "
+                                + "三个 Receiver，以及 cpuconfig / pg_config / thermal_config 三份 legacy 文件。"
+                                + "开关开 = 三份都挡（Receiver 不触发、文件按「不存在」处理）；关 = 全部放行。"
+                                + "和「屏蔽高温限制」互补：那个管设备已经热了别降频，这个管别再推新策略。",
                         Cfg.K_NOCLOUD, true, false, confirmOnEnable = true, scopes = S_THERMAL,
-                        confirmTitle = "屏蔽性能 / 温控策略云控下发",
+                        confirmTitle = "屏蔽云控下发（CPU + 温控）",
                         confirmLines = listOf(
-                            "三个下发通知（CpuCfg / PgConfig / ThermalCfgCotaUpdateReceiver）全拦下，不会触发热重载",
-                            "cpuconfig / pg_config / thermal_config 这三份配置，PowerGenie 一律看不到",
-                            "进程启动时读 /data/cota/para/ 的旧配置同样被挡",
-                            "只影响 PowerGenie / iaware；无障碍、权限、胶囊等其它 cota 配置不受影响"
+                            "CpuCfgCotaUpdateReceiver / PgConfigCotaUpdateReceiver / ThermalCfgCotaUpdateReceiver 三个下发入口全拦",
+                            "cpuconfig / pg_config / thermal_config 三份 legacy 文件：exists / isFile / length / canRead / isDirectory 返回不存在，list / listFiles 返回 null",
+                            "FileInputStream / FileReader / RandomAccessFile / NIO 对这三份文件抛文件不存在",
+                            "只作用于 CPU 与温控策略；无障碍、权限、胶囊等其它 cota 配置不受影响"
                         ),
-                        confirmNote = "文件本身可能仍会被写下来（写入方是别的进程，拦不到），但 PowerGenie 读不到 —— 效果等同于没下发。想彻底清干净，用下面的「清理云端配置残留（ROOT）」。")
+                        confirmNote = "这里管「让系统读不到 / 收不到新策略」；想删掉已经落盘的文件，用下面的「清理云端配置残留（ROOT）」，两者不互相替代。")
                     ),
                     trailing = {
                     Row(
-                        Modifier.fillMaxWidth().clickable { showPurge = true }.padding(18.dp),
+                        Modifier.fillMaxWidth().clickable { showPurgePicker = true }.padding(18.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(Modifier.weight(1f)) {
                             Text("清理云端配置残留（ROOT）", fontSize = 16.sp,
                                 color = MiuixTheme.colorScheme.onSurface)
                             Spacer(Modifier.height(3.dp))
-                            Text("删除 /data/cota/para/ 下三份性能相关云控配置"
-                                    + "（cpuconfig / pg_config / thermal_config），让 PowerGenie "
-                                    + "回到内置默认策略。点一下执行一次，需要 ROOT。",
+                            Text("按目录多选，删除 /data/cota/para/ 下的云控配置。"
+                                    + "删除前会整批备份到下载目录 has_cota_backup/；"
+                                    + "三级目录默认不选、红字标注，勾选后也会删。",
                                 fontSize = 12.5.sp,
                                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
                         }
                         Spacer(Modifier.width(12.dp))
                         Text("清理", fontSize = 14.sp, color = MiuixTheme.colorScheme.primary)
+                    }
+                    Box(Modifier.fillMaxWidth().padding(start = 18.dp).height(1.dp)
+                        .background(MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.08f)))
+                    Row(
+                        Modifier.fillMaxWidth().clickable {
+                            backups = null
+                            showBackupPicker = true
+                            Thread {
+                                val list = try { listCotaBackups() } catch (_: Throwable) { emptyList() }
+                                runOnUiThread { backups = list }
+                            }.apply { name = "has-cota-backup-list" }.start()
+                        }.padding(18.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("从备份恢复云控配置（ROOT）", fontSize = 16.sp,
+                                color = MiuixTheme.colorScheme.onSurface)
+                            Spacer(Modifier.height(3.dp))
+                            Text("列出下载目录 has_cota_backup/ 下的备份，"
+                                    + "选择后整批恢复到 /data/cota/para/ 原路径。",
+                                fontSize = 12.5.sp,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Text("查看", fontSize = 14.sp, color = MiuixTheme.colorScheme.primary)
                     }
                     }
                 )
@@ -1860,29 +2602,126 @@ class SettingsActivity : ComponentActivity() {
             item { Footnote("改完重启「系统界面」生效（这个钩子在 system_server 里，作用域要勾「android」/显示为「系统」）。") }
         }
 
-        if (showPurge) {
-            ConfirmEnableDialog(
-                title = "⚠ 清理云端配置残留（危险操作）",
-                lines = listOf(
-                    "将要删除这三个文件（不可撤销）：",
-                    "  /data/cota/para/cpuconfig      ← CPU 频率/核数策略",
-                    "  /data/cota/para/pg_config      ← PowerGenie 通用策略",
-                    "  /data/cota/para/thermal_config ← 温控策略",
-                    "",
-                    "删除后无法恢复。如果这些文件正被系统使用，",
-                    "可能出现功耗/温控策略异常（异常发热、耗电变快或降温变慢）。",
-                    "",
-                    "执行完请立即重启手机，让 PowerGenie 回到内置默认策略。",
-                    "",
-                    "⚠ 绝大多数设备上这三个文件**本来就不存在** —— 那说明云端",
-                    "从未给这台机器下发过性能配置，属于正常状态，不是清理失败。"
-                ),
-                note = "需要 ROOT。点「清理」后立即执行一次，不会留下任何状态。",
-                onConfirm = {
-                    showPurge = false
-                    purgeCotaConfigs { /* 结果由 purgeCotaConfigs 内部 Toast 提示 */ }
+        if (showPurgePicker) {
+            CotaPickerDialog(
+                title = "清理云端配置残留（ROOT）",
+                desc = "按目录多选。删除前会先整批备份到下载目录 has_cota_backup/。",
+                actionLabel = "扫描所选",
+                footer = "三级高风险目录勾选后仍会执行；删除前必须整批备份到下载目录。",
+                selected = purgeSelected,
+                onToggle = { k ->
+                    purgeSelected = if (k in purgeSelected) purgeSelected - k
+                    else purgeSelected + k
                 },
-                onDismiss = { showPurge = false }
+                onScan = {
+                    if (purgeSelected.isEmpty()) {
+                        Toast.makeText(this, "先选至少一个目录", Toast.LENGTH_SHORT).show()
+                    } else {
+                        val picked = cotaEntries.filter { it.key in purgeSelected }
+                        showPurgePicker = false
+                        Toast.makeText(this, "正在扫描所选目录…", Toast.LENGTH_SHORT).show()
+                        Thread {
+                            val ts = java.text.SimpleDateFormat("yyyyMMdd-HHmmss-SSS",
+                                java.util.Locale.US).format(java.util.Date())
+                            val res = try { scanCota(picked) } catch (t: Throwable) {
+                                CotaScanResult(
+                                    picked.map { CotaScan(it, PurgeProbe.UNKNOWN, emptyList()) },
+                                    t.javaClass.simpleName)
+                            }
+                            runOnUiThread { purgePreview = res.copy(backupTs = ts) }
+                        }.apply { name = "has-cota-scan" }.start()
+                    }
+                },
+                onDismiss = { showPurgePicker = false }
+            )
+        }
+        purgePreview?.let { pv ->
+            if (pv.error != null || pv.hasUnknown) {
+                ConfirmEnableDialog(
+                    title = "无法确认云控文件状态",
+                    lines = pv.scans.map {
+                        it.entry.title + "：" + when (it.state) {
+                            PurgeProbe.FOUND -> it.files.size.toString() + " 个文件"
+                            PurgeProbe.GONE -> "不存在"
+                            PurgeProbe.UNKNOWN -> "无法确认"
+                        }
+                    } + listOf("", pv.error ?: "有路径在当前命名空间看不到"),
+                    note = "未执行任何删除。请检查 ROOT 授权后重试。",
+                    confirmLabel = "知道了",
+                    onConfirm = { purgePreview = null },
+                    onDismiss = { purgePreview = null }
+                )
+            } else if (pv.allGone) {
+                ConfirmEnableDialog(
+                    title = "没有可清理的文件",
+                    lines = pv.scans.map { it.entry.title + "：不存在" },
+                    note = "所选目录本来就不存在，无需清理。",
+                    confirmLabel = "知道了",
+                    onConfirm = { purgePreview = null },
+                    onDismiss = { purgePreview = null }
+                )
+            } else {
+                CotaPreviewDialog(
+                    preview = pv,
+                    onConfirm = {
+                        val picked = pv.scans.map { it.entry }
+                        val ts = pv.backupTs ?: java.text.SimpleDateFormat(
+                            "yyyyMMdd-HHmmss-SSS", java.util.Locale.US)
+                            .format(java.util.Date())
+                        purgePreview = null
+                        purgeCotaEntries(picked, ts) { /* 结果由 purgeCotaEntries 内部 Toast */ }
+                    },
+                    onDismiss = { purgePreview = null }
+                )
+            }
+        }
+        if (showBackupPicker) {
+            val list = backups
+            if (list == null) {
+                ConfirmEnableDialog(
+                    title = "读取备份列表…",
+                    lines = listOf("正在读取 $cotaBackupRoot/"),
+                    note = "需要 ROOT。",
+                    confirmLabel = "关闭",
+                    onConfirm = { showBackupPicker = false },
+                    onDismiss = { showBackupPicker = false }
+                )
+            } else if (list.isEmpty()) {
+                ConfirmEnableDialog(
+                    title = "没有可恢复的备份",
+                    lines = listOf("$cotaBackupRoot/ 下没有 manifest.txt"),
+                    note = "先执行一次「清理云端配置残留」，清理前会自动备份。",
+                    confirmLabel = "知道了",
+                    onConfirm = { showBackupPicker = false },
+                    onDismiss = { showBackupPicker = false }
+                )
+            } else {
+                CotaRestorePickerDialog(
+                    backups = list,
+                    onPick = { ts ->
+                        showBackupPicker = false
+                        restoreTs = ts
+                    },
+                    onDismiss = { showBackupPicker = false }
+                )
+            }
+        }
+        restoreTs?.let { ts ->
+            ConfirmEnableDialog(
+                title = "从备份恢复云控配置",
+                lines = listOf(
+                    "备份：$cotaBackupRoot/$ts/",
+                    "将把该备份记录的条目整批恢复到 /data/cota/para/ 原路径",
+                    "恢复后逐文件回读大小并做 EXIST / GONE / UNKNOWN 复核",
+                    "恢复后请重启手机生效"
+                ),
+                note = "只恢复备份清单里的条目（含三级高风险）；逐文件校验大小。",
+                confirmLabel = "恢复",
+                onConfirm = {
+                    restoreTs = null
+                    restoreCotaBackup(ts) { /* 结果由 restoreCotaBackup 内部 Toast */ }
+                },
+                onDismiss = { restoreTs = null }
             )
         }
     }
@@ -2140,8 +2979,8 @@ class SettingsActivity : ComponentActivity() {
     @Composable
     private fun InfoDot(tip: String) {
         var open by remember { mutableStateOf(false) }
-        // v3.2.36：触控区 17dp → **48dp**（Android 无障碍标准的最小触控尺寸）。
-        // 原来视觉和触控都是 17dp，手指很难点中；现在外层 48dp 只负责接收点击
+        // 触控区 17dp → **48dp**（Android 无障碍标准的最小触控尺寸）。
+        // 视觉和触控都是 17dp 时手指很难点中；外层 48dp 只负责接收点击
         // （无背景、无涟漪），内层 17dp 才是那个小圆点，视觉不变。
         Box(
             Modifier.size(48.dp).clickable { open = true },
@@ -2230,7 +3069,7 @@ class SettingsActivity : ComponentActivity() {
     private fun SwitchCard(
         rows: List<SwRow>,
         onAfterChange: (() -> Unit)? = null,
-        // v3.2.47：卡片尾部追加一块自定义内容（不是开关，而是一个动作行）。
+        // 卡片尾部追加一块自定义内容（不是开关，而是一个动作行）。
         // 用在「云控下发」那张卡：清理动作必须和它连在一起，不能被拆成两张卡片 ——
         // 拆开会让用户以为它们是两件不相干的事。
         trailing: (@Composable () -> Unit)? = null
@@ -2317,6 +3156,7 @@ class SettingsActivity : ComponentActivity() {
         title: String,
         lines: List<String>,
         note: String?,
+        confirmLabel: String = "开启",
         onConfirm: () -> Unit,
         onDismiss: () -> Unit
     ) {
@@ -2339,9 +3179,250 @@ class SettingsActivity : ComponentActivity() {
                         Text("取消", fontSize = 14.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                             modifier = Modifier.clickable { onDismiss() }.padding(8.dp))
                         Spacer(Modifier.width(8.dp))
-                        Text("开启", fontSize = 14.sp, fontWeight = FontWeight.Bold,
+                        Text(confirmLabel, fontSize = 14.sp, fontWeight = FontWeight.Bold,
                             color = MiuixTheme.colorScheme.primary,
                             modifier = Modifier.clickable { onConfirm() }.padding(8.dp))
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 云控清理：按目录多选。一级 / 二级分组，保护名单明示且不可选。
+     */
+    @Composable
+    private fun CotaPickerDialog(
+        title: String,
+        desc: String,
+        actionLabel: String,
+        footer: String,
+        selected: Set<String>,
+        onToggle: (String) -> Unit,
+        onScan: () -> Unit,
+        onDismiss: () -> Unit
+    ) {
+        Dialog(onDismissRequest = onDismiss) {
+            Surface(shape = RoundedCornerShape(24.dp), color = MiuixTheme.colorScheme.surface) {
+                Column(Modifier.padding(18.dp)) {
+                    Text(title, fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                        color = MiuixTheme.colorScheme.onSurface)
+                    Text(desc,
+                        fontSize = 13.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = 8.dp))
+                    Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())
+                        .padding(top = 4.dp)) {
+                        for (level in listOf(1, 2, 3)) {
+                            val list = cotaEntries.filter { it.level == level }
+                            if (list.isEmpty()) continue
+                            Text(
+                                when (level) {
+                                    1 -> "一级目录（默认全选）"
+                                    2 -> "二级目录（可以清理）"
+                                    else -> "三级目录（谨慎清理）"
+                                },
+                                fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                                color = if (level == 3) Color(0xFFD32F2F.toInt())
+                                else MiuixTheme.colorScheme.primary,
+                                modifier = Modifier.padding(top = 8.dp, bottom = 2.dp))
+                            for (e in list) {
+                                Row(Modifier.fillMaxWidth().clickable { onToggle(e.key) }
+                                    .padding(vertical = 7.dp),
+                                    verticalAlignment = Alignment.CenterVertically) {
+                                    CheckDot(e.key in selected)
+                                    Spacer(Modifier.width(10.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        Text(e.title, fontSize = 14.sp,
+                                            color = if (e.level == 3)
+                                                Color(0xFFD32F2F.toInt())
+                                            else MiuixTheme.colorScheme.onSurface)
+                                        if (e.level == 3) {
+                                            Text("⚠ 涉及合规/权限，删了可能出问题（会先备份，可恢复）",
+                                                fontSize = 11.5.sp,
+                                                color = Color(0xFFD32F2F.toInt()))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Text(footer,
+                            fontSize = 12.sp,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            modifier = Modifier.padding(top = 10.dp))
+                    }
+                    Row(Modifier.fillMaxWidth().padding(top = 16.dp),
+                        horizontalArrangement = Arrangement.End) {
+                        Text("取消", fontSize = 14.sp,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            modifier = Modifier.clickable { onDismiss() }.padding(8.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text(actionLabel, fontSize = 14.sp, fontWeight = FontWeight.Bold,
+                            color = MiuixTheme.colorScheme.primary,
+                            modifier = Modifier.clickable { onScan() }.padding(8.dp))
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun CheckDot(checked: Boolean) {
+        Box(Modifier.size(20.dp).clip(CircleShape)
+            .background(if (checked) MiuixTheme.colorScheme.primary else Color.Transparent)
+            .border(1.dp, MiuixTheme.colorScheme.primary, CircleShape),
+            contentAlignment = Alignment.Center) {
+            if (checked) {
+                Text("✓", fontSize = 12.sp, color = Color.White)
+            }
+        }
+    }
+
+    /**
+     * 清理确认框：列出每个条目的具体文件清单与数量（最多每项 8 个，超出显示总数）。
+     */
+    @Composable
+    private fun CotaPreviewDialog(
+        preview: CotaScanResult,
+        onConfirm: () -> Unit,
+        onDismiss: () -> Unit
+    ) {
+        Dialog(onDismissRequest = onDismiss) {
+            Surface(shape = RoundedCornerShape(24.dp), color = MiuixTheme.colorScheme.surface) {
+                Column(Modifier.padding(18.dp)) {
+                    val ctx = LocalContext.current
+                    val lowCount = preview.scans.count {
+                        it.entry.level == 1 && it.state == PurgeProbe.FOUND
+                    }
+                    val midCount = preview.scans.count {
+                        it.entry.level == 2 && it.state == PurgeProbe.FOUND
+                    }
+                    val highCount = preview.highRiskCount
+                    val backupPath = "$cotaBackupRoot/${preview.backupTs ?: "执行时生成"}/"
+                    Text("确认清理云控配置", fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                        color = MiuixTheme.colorScheme.onSurface)
+                    Text("一级 $lowCount 个 / 二级 $midCount 个 / 三级 $highCount 个；" +
+                            "合计 ${preview.files.size} 个文件、${preview.totalBytes} 字节。",
+                        fontSize = 13.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = 8.dp))
+                    if (highCount > 0) {
+                        Text("包含 $highCount 个高风险目录（三级）；执行前会整批备份，可恢复。",
+                            fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                            color = Color(0xFFD32F2F.toInt()),
+                            modifier = Modifier.padding(top = 6.dp))
+                    } else {
+                        Text("未包含三级高风险目录。", fontSize = 13.sp,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            modifier = Modifier.padding(top = 6.dp))
+                    }
+                    Text("备份位置（点按复制）：$backupPath",
+                        fontSize = 12.5.sp, color = MiuixTheme.colorScheme.primary,
+                        modifier = Modifier.padding(top = 6.dp).clickable {
+                            try {
+                                val cm = ctx.getSystemService(
+                                    android.content.ClipboardManager::class.java)
+                                cm?.setPrimaryClip(android.content.ClipData.newPlainText(
+                                    "has_cota_backup", backupPath))
+                                Toast.makeText(ctx, "已复制备份路径", Toast.LENGTH_SHORT).show()
+                            } catch (_: Throwable) {
+                            }
+                        })
+                    Column(Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState())
+                        .padding(top = 4.dp)) {
+                        for (s in preview.scans) {
+                            if (s.state != PurgeProbe.FOUND) continue
+                            Text(s.entry.title + "（${s.files.size} 个文件）",
+                                fontSize = 13.5.sp, fontWeight = FontWeight.Bold,
+                                color = if (s.entry.level == 3)
+                                    Color(0xFFD32F2F.toInt())
+                                else MiuixTheme.colorScheme.onSurface,
+                                modifier = Modifier.padding(top = 8.dp))
+                            if (s.files.isEmpty()) {
+                                Text("  （空目录，只移除目录）", fontSize = 12.sp,
+                                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                            } else {
+                                for (f in s.files.take(8)) {
+                                    Text("  " + f.removePrefix(cotaRoot + "/"),
+                                        fontSize = 12.sp,
+                                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                                }
+                                if (s.files.size > 8) {
+                                    Text("  … 其余 ${s.files.size - 8} 个", fontSize = 12.sp,
+                                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                                }
+                            }
+                        }
+                    }
+                    Text("确认后将删除上述文件，不可撤销；删除前已整目录备份。",
+                        fontSize = 12.sp, color = Color(0xFFD32F2F.toInt()),
+                        modifier = Modifier.padding(top = 10.dp))
+                    Row(Modifier.fillMaxWidth().padding(top = 16.dp),
+                        horizontalArrangement = Arrangement.End) {
+                        Text("取消", fontSize = 14.sp,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            modifier = Modifier.clickable { onDismiss() }.padding(8.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("确认", fontSize = 14.sp, fontWeight = FontWeight.Bold,
+                            color = MiuixTheme.colorScheme.primary,
+                            modifier = Modifier.clickable { onConfirm() }.padding(8.dp))
+                    }
+                }
+            }
+        }
+    }
+
+    /** 备份选择框（时间倒序）。 */
+    @Composable
+    private fun CotaRestorePickerDialog(
+        backups: List<CotaBackup>,
+        onPick: (String) -> Unit,
+        onDismiss: () -> Unit
+    ) {
+        Dialog(onDismissRequest = onDismiss) {
+            Surface(shape = RoundedCornerShape(24.dp), color = MiuixTheme.colorScheme.surface) {
+                Column(Modifier.padding(18.dp)) {
+                    val ctx = LocalContext.current
+                    Text("从备份恢复", fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                        color = MiuixTheme.colorScheme.onSurface)
+                    Text("备份根目录（点按复制）：$cotaBackupRoot/", fontSize = 12.sp,
+                        color = MiuixTheme.colorScheme.primary,
+                        modifier = Modifier.padding(top = 6.dp).clickable {
+                            try {
+                                val cm = ctx.getSystemService(
+                                    android.content.ClipboardManager::class.java)
+                                cm?.setPrimaryClip(android.content.ClipData.newPlainText(
+                                    "has_cota_backup", cotaBackupRoot + "/"))
+                                Toast.makeText(ctx, "已复制备份根目录", Toast.LENGTH_SHORT).show()
+                            } catch (_: Throwable) {
+                            }
+                        })
+                    Text("选择要恢复的备份（按时间倒序）：", fontSize = 13.sp,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = 8.dp))
+                    Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())
+                        .padding(top = 6.dp)) {
+                        for (b in backups) {
+                            Row(Modifier.fillMaxWidth().clickable { onPick(b.ts) }
+                                .padding(vertical = 9.dp),
+                                verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(b.ts, fontSize = 14.sp,
+                                        color = MiuixTheme.colorScheme.onSurface)
+                                    Text("$cotaBackupRoot/${b.ts}/", fontSize = 11.5.sp,
+                                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                                    Text("${b.entries} 个条目 / ${b.files} 个文件",
+                                        fontSize = 12.sp,
+                                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                                }
+                                Text("恢复", fontSize = 13.sp,
+                                    color = MiuixTheme.colorScheme.primary)
+                            }
+                        }
+                    }
+                    Row(Modifier.fillMaxWidth().padding(top = 12.dp),
+                        horizontalArrangement = Arrangement.End) {
+                        Text("关闭", fontSize = 14.sp,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            modifier = Modifier.clickable { onDismiss() }.padding(8.dp))
                     }
                 }
             }
@@ -2384,31 +3465,116 @@ class SettingsActivity : ComponentActivity() {
     private val WarnColor = Color(0xFFE5484D)
 
     /**
-     * 作用域状态行。只在**读到了运行记录**之后才下结论：
-     * 读不到（probed=false）时不显示，避免把"还没检测"画成"没运行"。
+     * 单个作用域是否真的在跑。
+     *
+     * <p>三处特殊处理：
+     * <ul>
+     *   <li>iaware / powergenie 是同一进程的两个包名 —— LSPosed 不一定两个都回调，
+     *       只要任一有新鲜回执就算生效，避免"温控服务"随机报红；</li>
+     *   <li>system_server 永远不进 probe 表（binder 会挂住），改读
+     *       persist.sys.has.sysprobe 的属性版本；</li>
+     *   <li>其余按 probe 记录判定。</li>
+     * </ul>
      */
+    private fun scopeLive(pkg: String): Boolean {
+        val st = FrameworkProbe.state
+        return when {
+            pkg == "android" -> sysprobeValid()
+            pkg == "com.hihonor.iaware" || pkg == "com.hihonor.powergenie" ->
+                st.has("com.hihonor.iaware") || st.has("com.hihonor.powergenie")
+            else -> st.has(pkg)
+        }
+    }
+
+    /** 本次开机上报过、进程 pid 有效（心跳可能暂停）。用于深休眠后避免误报红。 */
+    private fun scopeAlive(pkg: String): Boolean {
+        val st = FrameworkProbe.state
+        return when {
+            pkg == "android" -> sysprobeBootMatches()
+            pkg == "com.hihonor.iaware" || pkg == "com.hihonor.powergenie" ->
+                st.alive("com.hihonor.iaware") || st.alive("com.hihonor.powergenie")
+            else -> st.alive(pkg)
+        }
+    }
+
+    /** 有回执但心跳已停超过 5 分钟（只对 probe 类作用域；system_server 走属性）。 */
+    private fun scopeExpired(pkg: String): Boolean {
+        val st = FrameworkProbe.state
+        return when {
+            pkg == "android" -> false
+            pkg == "com.hihonor.iaware" || pkg == "com.hihonor.powergenie" ->
+                !scopeLive(pkg) &&
+                    (st.expired("com.hihonor.iaware") || st.expired("com.hihonor.powergenie"))
+            else -> st.expired(pkg)
+        }
+    }
+
+    /** 进程在跑，但跑的是旧版本模块。 */
+    private fun scopeStale(pkg: String): Boolean {
+        val st = FrameworkProbe.state
+        return when {
+            pkg == "android" -> sysprobeBootMatches() &&
+                sysprobeCode() in 1 until BuildConfig.VERSION_CODE
+            pkg == "com.hihonor.iaware" || pkg == "com.hihonor.powergenie" ->
+                st.stale("com.hihonor.iaware") || st.stale("com.hihonor.powergenie")
+            else -> st.stale(pkg)
+        }
+    }
+
+    /** 读 system_server 注入痕迹的版本号（属性格式 "3.2.73(203)|<boot_id>"）。 */
+    private fun sysprobeCode(): Int {
+        val raw = readProp("persist.sys.has.sysprobe") ?: return -1
+        val verPart = raw.substringBefore('|')
+        val n = Regex("(\\d+)").findAll(verPart).lastOrNull()?.value?.toIntOrNull()
+        return n ?: -1
+    }
+
+    /** 属性里的 boot_id 是否等于本次开机（持久属性重启后不会消失）。 */
+    private fun sysprobeBootMatches(): Boolean {
+        val raw = readProp("persist.sys.has.sysprobe") ?: return false
+        val parts = raw.split('|')
+        if (parts.size < 2 || parts[1].isBlank()) return false
+        return parts[1].trim() == currentBootId()
+    }
+
+    private fun sysprobeValid(): Boolean =
+        sysprobeBootMatches() && sysprobeCode() >= BuildConfig.VERSION_CODE
+
+    private fun currentBootId(): String = try {
+        java.io.File("/proc/sys/kernel/random/boot_id").readText().trim()
+    } catch (_: Throwable) {
+        ""
+    }
+
     private fun scopeStatusOf(required: List<String>): Pair<String, Boolean>? {
         if (required.isEmpty()) return null
         val st = FrameworkProbe.state
         if (!st.probed) return null
         if (!st.running) {
+            // 本次开机都上报过，只是心跳暂停（深休眠/Doze）→ 黄色提示，不报红。
+            if (required.all { scopeAlive(it) }) {
+                return "作用域状态：本次开机已上报，心跳暂停（深休眠/Doze 后属正常，解锁后自动恢复）" to true
+            }
             return "作用域状态：未检测到模块运行（在 LSPosed 启用模块并勾选作用域后重启生效）" to false
         }
-        val miss = st.missing(required)
+        val miss = required.filter { !scopeLive(it) }
         if (miss.isNotEmpty()) {
-            // v3.2.37：把「从没上报过」和「上报过但记录超过 3 天」分开说。
-            // 后者很可能只是很久没重启进程，不是模块坏了 —— 之前一律显示
+            // 把「从没上报过」和「上报过但心跳停了」分开说。
+            // 后者很可能只是进程很久没重启，不是模块坏了 —— 一律显示
             // "作用域未生效"，用户会以为要重新配置，白折腾。
-            if (miss.all { st.expired(it) }) {
+            if (miss.all { scopeExpired(it) }) {
                 val names = miss.joinToString("、") { scopeLabel(it) }
-                return "作用域状态：${names} 的记录已超过 3 天未刷新（重启作用域即可更新，不一定是故障）" to true
+                return "作用域状态：${names} 的记录已超过 5 分钟未刷新（心跳已停，重启作用域即可更新，不一定是故障）" to true
             }
-            val names = miss.joinToString("、") { scopeLabel(it) + "(" + it + ")" }
-            return "作用域状态：${names} 作用域未生效（勾选并重启作用域生效）" to false
+            val names = miss.joinToString("、") { pkg ->
+                if (pkg == "android") "系统框架（system_server 未注入或仍是旧版本，需重启手机）"
+                else scopeLabel(pkg) + "(" + pkg + ")"
+            }
+            return "作用域状态：${names} 作用域未生效（勾选并重启对应作用域）" to false
         }
         // 全部生效 → 默认隐藏，不打扰；只有"跑着旧版本、需要手动重启"才提一句
-        if (required.any { st.stale(it) }) {
-            return "作用域状态：进程跑的是旧版本模块（重启作用域后更新）" to false
+        if (required.any { scopeStale(it) }) {
+            return "作用域状态：进程跑的是旧版本模块（重启对应作用域后更新）" to false
         }
         return null
     }
@@ -2433,9 +3599,11 @@ class SettingsActivity : ComponentActivity() {
         val msg: String = if (!st.running) {
             "模块还没在任何作用域生效：请在 LSPosed 勾选后重启作用域"
         } else {
-            val miss = st.missing(scopes)
+            val miss = scopes.filter { !scopeLive(it) }
             if (miss.isEmpty()) return
-            miss.joinToString("、") { scopeLabel(it) } + " 作用域未生效：请在 LSPosed 勾选后重启作用域"
+            miss.joinToString("、") { pkg ->
+                if (pkg == "android") "系统框架" else scopeLabel(pkg)
+            } + " 作用域未生效：请在 LSPosed 勾选后重启对应作用域"
         }
         val appCtx = ctx.applicationContext ?: ctx
         scopeWarnShot?.let { mainHandler.removeCallbacks(it) }
@@ -2630,7 +3798,7 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
-    /** 重启作用域：可多选，一次 su 会话全部执行（v2.3.0）。 */
+    /** 重启作用域：可多选，一次 su 会话全部执行。 */
     @Composable
     private fun ScopeRestartDialog(onDismiss: () -> Unit) {
         val picked = remember {
@@ -2644,22 +3812,17 @@ class SettingsActivity : ComponentActivity() {
                     Text("勾选要重启的应用，改动后的开关随之生效", fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary, modifier = Modifier.padding(bottom = 6.dp))
                     scopeTargets.forEachIndexed { i, t ->
                         val on = picked[t.pkg] == true
-                        val probed = FrameworkProbe.state.probed
-                        val running = FrameworkProbe.state.has(t.pkg)
                         Row(Modifier.fillMaxWidth().clickable { picked[t.pkg] = !on }.padding(vertical = 11.dp),
                             verticalAlignment = Alignment.CenterVertically) {
                             CheckMark(on)
                             Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
                                 Text(t.label, fontSize = 15.5.sp, color = MiuixTheme.colorScheme.onSurface)
-                                Text(t.pkg, fontSize = 10.5.sp,
+                                Text(if (t.pkg == "__reboot__") "整机重启（system_server 无法单进程重启）"
+                                    else t.pkg, fontSize = 10.5.sp,
                                     color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                                     modifier = Modifier.padding(top = 1.dp))
                             }
-                            Text(if (!probed) "未知" else if (running) "运行中" else "未运行",
-                                fontSize = 11.5.sp,
-                                color = if (running) MiuixTheme.colorScheme.primary
-                                        else MiuixTheme.colorScheme.onSurfaceVariantSummary)
                         }
                         if (i < scopeTargets.size - 1) {
                             Box(Modifier.fillMaxWidth().height(1.dp)
@@ -2692,7 +3855,7 @@ class SettingsActivity : ComponentActivity() {
     }
 
     /**
-     * 直接弹选择框，不再先跑一次 su -c id 预检 —— 那一步要多等一次授权握手，
+     * 直接弹选择框，不先跑一次 su -c id 预检 —— 那一步要多等一次授权握手，
      * 而命令真失败时 restartScopes 已经会明确报"ROOT 授权被拒绝"。
      */
     private fun requestRootThenPickScope() {
