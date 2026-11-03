@@ -2,6 +2,7 @@ package io.github.voreulch.honoradvanced;
 
 import android.app.AndroidAppHelper;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.database.ContentObserver;
 import android.database.Cursor;
 import android.os.Handler;
@@ -50,29 +51,45 @@ public final class Cfg {
     public static final String K_NODUCK = "noduck";       // misc: block notification audio ducking
     public static final String K_HOTTEMP = "hottemp";     // misc: suppress the system high-temperature popups
     public static final String K_DIAG = "diag";           // about: verbose diagnostics into the LSPosed log
-    // ===== 安全组件（v3.2.0）=====
+    // ===== 安全组件 =====
     //
     // 这几个都是"解除系统限制"型开关，默认全关、需要用户显式打开。
     public static final String K_NOSECURE = "nosecure";   // 允许截屏/录屏（清 FLAG_SECURE）
     public static final String K_NOCLOUD = "nocloud";     // 屏蔽性能/温控策略的云控下发
-    public static final String K_NOFRAUD = "nofraud";     // 屏蔽反诈组件的数据采集与上报
+    public static final String K_NOFRAUD = "nofraud";     // 屏蔽反诈组件的数据采集与上报（只含 2 个 Fraud Processor）
     /**
-     * 清理云端配置残留（v3.2.0 引入，v3.2.33 起**不再是开关**）。
+     * 清理云端配置残留的占位键。
      *
-     * <p>删除 /data/cota/para/ 下三份性能相关配置（cpuconfig / pg_config / thermal_config）。
+     * <p>删除动作由界面上的独立按钮执行（确认框 → 一次 su rm），不读写这个 prefs 键；
+     * 删除目标为 /data/cota/para 下三份性能相关配置（cpuconfig / pg_config / thermal_config），
      * 需要 ROOT。
      *
-     * <p><b>⚠ 这个常量现在只是一个占位键</b>：
+     * <p><b>⚠ 恒为 false，不得用于门控</b>：
      * <ul>
-     *   <li>界面上它已经从开关改成独立按钮（点击 → 确认框 → 执行一次 su rm），
-     *       不会读写这个 prefs 键</li>
-     *   <li>保留常量只是为了两件事：① 旧版 prefs 里可能残留这个键，KEYS 里留着
-     *       才不会在迁移时被当成孤儿删掉；② provider 快照的键集合保持稳定，
-     *       老版本 hook 读到它也不会出错</li>
+     *   <li>保留在 KEYS 里，是为了让 prefs 迁移不把可能存在的历史键当孤儿删掉</li>
+     *   <li>provider 快照的键集合保持稳定，hook 读到它也不会出错</li>
      * </ul>
-     * 任何新代码都不应该再调 {@code isOn(K_PURGECOTA)} 做门控 —— 它现在恒为 false。
+     * 任何新代码都不应再调 {@code isOn(K_PURGECOTA)} —— 它恒为 false。
      */
     public static final String K_PURGECOTA = "purgecota";
+
+    /**
+     * 玻璃配置的「重置代数」**唯一来源是系统属性**。
+     *
+     * <p>为什么不放 prefs：prefs 和属性会有两份状态，一旦 prefs 前进、属性没前进，
+     * 宿主每次启动都会判 epoch 不符，缓存永久失效。只保留属性这一份：
+     * 恢复 / 导入 / 玻璃线开关变更时先写属性并回读，读回一致才继续改 prefs；
+     * 写失败就整笔中止，不存在"两份状态分叉"。
+     *
+     * <p>为什么用属性而不是 provider：宿主在 {@code handleLoadPackage} 里拿不到
+     * Context，provider 还没起来；属性是唯一能在首帧之前同步读到的通道。
+     *
+     * <p>读失败（反射异常 / 值非数字）返回 {@link #EPOCH_UNKNOWN}，由宿主
+     * 显式走 fail-open（接受本次缓存并在日志里写清），绝不静默当 0。
+     */
+    public static final String PROP_GLASS_EPOCH = "persist.sys.has.glass_epoch";
+    /** epoch 读不到 / 解析失败时的哨兵值。 */
+    public static final int EPOCH_UNKNOWN = -1;
 
     public static final String[] KEYS = {
             K_GLASS,
@@ -81,8 +98,13 @@ public final class Cfg {
     };
 
     /**
-     * 作用域清单（与 res/values/arrays.xml 的 xposed_scope 一致）。
+     * 作用域清单（与 res/values/arrays.xml 的 xposed_scope **除模块自身外**一致）。
      * 两处用途：CfgProvider 校验 probe 上报来源；UI 判断某个开关依赖的进程有没有跑起来。
+     *
+     * <p>注意：arrays.xml 里还列了模块自身 {@code io.github.voreulch.honoradvanced}，
+     * 那是 LSPosed 为了让模块进程也加载（设置页自检/导出）而勾的；但模块自身从不
+     * 通过 {@code Probe.report} 上报，所以这里的 probe 白名单**故意不列自己**。
+     * 两者不是“必须逐项相同”，而是“宿主进程集合相同 + 模块自身仅用于激活”。
      */
     public static final String[] SCOPES = {
             "com.android.systemui",
@@ -93,25 +115,26 @@ public final class Cfg {
             "com.hihonor.powergenie",
             "com.hihonor.iaware",
             "com.hihonor.securityserver",
-            // v3.2.42：感知服务本体（自己就有反诈逻辑和独立上报通道）
+            // 感知服务本体（自己就有反诈逻辑和独立上报通道）
             "com.hihonor.awareness",
             "android",
     };
 
-    // ===== 分控件强度（v2.5.0）=====
+    // ===== 分控件强度 =====
     //
     // 原生的 initBulrParams 给四类控件**分别**赋了亮度/饱和度/遮罩资源：
     //   通知卡    brightness 0.08  saturation 1.2
     //   控制中心瓦片 brightness 0.12  saturation 1.1
     //   滑块      brightness 0.12  saturation 1.1
     //   圆形按钮   brightness 0.08  saturation 1.1
-    // 而旧版只有一个 mask 乘数一把刷到所有控件上 —— 想单独压暗通知卡，滑块和
-    // 按钮会跟着一起变，这就是"一刀切"。
+    // 单一 mask 乘数会把所有控件一起改 —— 想单独压暗通知卡，滑块和按钮会跟着变，
+    // 这就是"一刀切"。
     //
     // 这里给每类控件一个 0-200 的强度百分比（100 = 保持原生配方），同时作用于
-    // 该类的遮罩 alpha、亮度、饱和度三项。默认全 100 时行为与旧版完全一致。
-    // v2.5.7: 分区域粗调（tune_*）已并入精细调节 —— 既然每个字段都能单独拖，
-    // 再留一层"整类缩放"只会让同一件事有两个旋钮，反而困惑。
+    // 该类的遮罩 alpha、亮度、饱和度三项。默认全 100 时行为与原生完全一致。
+    // 分区域粗调（tune_*）并入精细调节 —— 每个字段都能单独拖，再留一层"整类缩放"
+    // 只会让同一件事有两个旋钮，反而困惑。
+    // TUNE_KEYS 保留为空通道（provider 的通用 int 通道，目前无使用者）。
     public static final String[] TUNE_KEYS = {};
 
     /**
@@ -122,7 +145,7 @@ public final class Cfg {
      * prefs，优先于这里的默认）。全部返回 100 表示跟随荣耀原厂。
      */
     public static int tuneDefPct(String key) {
-        return 100;   // 粗调层已移除，保留签名只为兼容旧调用点
+        return 100;   // 粗调层与精细调节重复，恒为 100；保留签名只为兼容现有调用点
     }
 
     /**
@@ -131,12 +154,37 @@ public final class Cfg {
      * <p>同 {@link #tuneDefPct(String)}，烧录时在这里逐项写死。
      * 注意 {@link #F_HL_ANGLE} 是角度而不是百分比，它的出厂值单独写在下面。
      */
-    /** v3.0.5「高光语义反转」的一次性迁移标记。 */
+    /** 「高光语义」一次性迁移标记。 */
     public static final String MIG_HL_V2 = "hl_semantic_v2";
 
+    /** 锁屏按钮历史烧录值 -> 原厂等价的一次性迁移标记。 */
+    public static final String MIG_KG_BTN_V2 = "kg_btn_orig_v1";
+
     /**
-     * v3.0.5：四个高光键的语义反转（旧 1 = 关闭高光 → 新 1 = 开启高光），
-     * 把老用户存下来的值翻转一次。
+     * 把历史烧录值（fn_kg_btn=50 / dep=140 / dis=110 / edge=120）重置为 100（原厂等价）。
+     *
+     * <p>只重置**恰好等于历史烧录值**的项：用户手动拖过别的值就保留。
+     * 一次性标记，避免每次启动覆盖用户后续的调整。
+     */
+    public static void migrateKgBtnDefaults(SharedPreferences p) {
+        if (p.getBoolean(MIG_KG_BTN_V2, false)) return;
+        // 只有四键**全部**等于历史配方时才整组迁移；用户改过任何一个
+        // 就完全不动，避免"恰好等于历史值"被误伤。
+        boolean allOld = p.contains(F_KG_BTN) && p.getInt(F_KG_BTN, 100) == 50
+                && p.contains(F_KG_BTN_DEP) && p.getInt(F_KG_BTN_DEP, 100) == 140
+                && p.contains(F_KG_BTN_DIS) && p.getInt(F_KG_BTN_DIS, 100) == 110
+                && p.contains(F_KG_BTN_EDGE) && p.getInt(F_KG_BTN_EDGE, 100) == 120;
+        SharedPreferences.Editor ed = p.edit().putBoolean(MIG_KG_BTN_V2, true);
+        if (allOld) {
+            ed.putInt(F_KG_BTN, 100).putInt(F_KG_BTN_DEP, 100)
+                    .putInt(F_KG_BTN_DIS, 100).putInt(F_KG_BTN_EDGE, 100);
+        }
+        ed.apply();
+    }
+
+    /**
+     * 高光键当前语义是 1 = 开启高光；老数据里存的是反语义值（1 = 关闭），
+     * 这里把老用户存下来的值翻转一次。
      *
      * <p><b>⚠ 必须在 {@code CfgProvider.onCreate()} 里调，不能只放在
      * SettingsActivity</b> —— 那个方法只有用户打开模块界面才会跑。老用户升级后
@@ -162,7 +210,7 @@ public final class Cfg {
             int oldSl = intOf(p, F_HL_SL);
 
             if (oldOn != 0) {
-                // 用户旧版勾过「关闭全部高光」——新语义下等价于**四个全关**。
+                // 老数据里勾过「关闭全部高光」——当前语义下等价于**四个全关**。
                 //
                 // ⚠ 这里绝不能逐个翻转。逐个翻会得到「hl_on=0（关）+ 三个分项=1（开）」
                 // 的自相矛盾状态；hook 按"任一开着就算开"判断，结果反而是**全亮** ——
@@ -193,7 +241,7 @@ public final class Cfg {
         }
     }
 
-    /** v3.2.0「烧录配方落地」的一次性标记。 */
+    /** 「烧录配方落地」的一次性标记。 */
     public static final String MIG_BAKED = "baked_v1";
 
     /**
@@ -217,7 +265,7 @@ public final class Cfg {
     }
 
     /**
-     * v3.2.0：把「烧录配方」按新装 / 老用户两种情况落地。
+     * 把「烧录配方」按新装 / 老用户两种情况落地。
      *
      * <p><b>规则（用户定死）</b>：
      * <ul>
@@ -271,9 +319,8 @@ public final class Cfg {
         }
         // ---- 开关型默认值 ----
         //
-        // v3.0.5 语义反转：四个高光键从「1 = 关闭高光」改成「1 = 开启高光」。
-        // 原厂是四类高光**全开**的，所以默认值必须是 1，不是 0。
-        // 判定侧同步改了：hook 里现在是 `getInt(key, 1) == 0` 才关。
+        // 四个高光键语义：1 = 开启高光，0 = 关闭；原厂四类全开，所以默认 1。
+        // 判定侧：hook 里 `getInt(key, 1) == 0` 才关。
         //
         // ⚠ 老用户的数据由 migratePrefs 一次性翻转（见那个方法里的 hl_semantic_v2 标记），
         // 不翻的话他们升级后四个开关会全部反掉。
@@ -287,10 +334,10 @@ public final class Cfg {
             return 0;
         }
 
-        // ===== 出厂配方（v3.2.0 烧录）=====
+        // ===== 出厂配方 =====
         //
-        // 这一版的"100%"不再是"系统原厂"，而是**主人自己调好的那套观感**。
-        // 也就是说新装用户打开就是下面这组值，不用自己再拖一遍。
+        // 这里的"100%"不是"系统原厂"，而是**主人自己调好的那套观感**。
+        // 新装用户打开就是下面这组值，不用自己再拖一遍。
         //
         // 数据来源：从共享 prefs 里逐项导出（fn_* -> 值），只列非 100 的项
         // （100 本来就是"不改动"，不用占位）。改这里等于改所有人的出厂观感，
@@ -312,10 +359,10 @@ public final class Cfg {
                 case F_HL_CC: return 1;
                 case F_HL_ON: return 1;
                 case F_HL_SL: return 1;
-                case F_KG_BTN: return 50;
-                case F_KG_BTN_DEP: return 140;
-                case F_KG_BTN_DIS: return 110;
-                case F_KG_BTN_EDGE: return 120;
+                // 锁屏按钮（手电筒 + 相机）默认 100（原厂等价、不处理）。
+                // 更强的烧录值会让手电筒底板在浅色壁纸下发白；
+                // 用户仍可用现有 fn_kg_btn* 滑条调。
+                // prefs 里等于历史烧录值的键由 migrateKgBtnDefaults 一次性重置。
                 case F_KG_ICON: return 50;
                 case F_KG_ICON_DEP: return 130;
                 case F_KG_ICON_DIS: return 130;
@@ -323,9 +370,8 @@ public final class Cfg {
                 case F_KG_TXT_DEP: return 130;
                 case F_KG_TXT_DIS: return 130;
                 case F_KG_TXT_EDGE: return 120;
-                // F_KG_WIDGET（锁屏小组件透明度）v3.2.27 撤出烧录配方：60 -> 100。
-                // 用户定调「新用户默认 100%」= 系统原样，不占位，走 default。
-                // 之所以不再烧 60：小组件是整块 alpha（连文字一起淡），烧低了新用户
+                // F_KG_WIDGET（锁屏小组件透明度）不占位，走 default = 100（系统原样）。
+                // 小组件是整块 alpha（连文字一起淡），烧低了新用户
                 // 一开箱就觉得天气卡发灰，说不清是自己还是模块干的。
                 case F_KL_CORNER: return 80;
                 case F_KL_MASK: return 40;
@@ -388,11 +434,9 @@ public final class Cfg {
     public static final String F_HL_CC = "fn_hl_cc";
     public static final String F_HL_BTN = "fn_hl_btn";
     public static final String F_HL_SL = "fn_hl_sl";
-    // 注：原本还有一个 F_WINBLUR（强制 isWindowBlur=true），v2.6.3 删除。
-    // 原因：isWindowBlur 是 initBulrParams 内部的**分支标记**而不是可调参数 ——
+    // 不要给 isWindowBlur 加开关：它是 initBulrParams 内部的**分支标记**而不是可调参数 ——
     // 原生给 case=1/2/4 赋 false、case=3/5 赋 true，强行改成 true 会让普通
-    // 通知卡也走整窗模糊（效果错乱 + 功耗上升）；而且 UI 上从来没暴露过这个
-    // 键，用户摸不到，属于只会在旧 prefs 残留时偷偷改变行为的死代码。
+    // 通知卡也走整窗模糊（效果错乱 + 功耗上升）。
 
     // 锁屏通知卡片（case=2 且 z=true）：和普通通知卡同名但值不同，必须分开调
     public static final String F_KL_MASK = "fn_kl_mask";
@@ -501,6 +545,7 @@ public final class Cfg {
     public static final String F_KG_BTN_DIS = "fn_kg_btn_dis";
     public static final String F_KG_BTN_THK = "fn_kg_btn_thk";
     public static final String F_KG_BTN_EDGE = "fn_kg_btn_edge";
+
     public static final String F_KG_ICON_DEP = "fn_kg_icon_dep";
     public static final String F_KG_ICON_DIS = "fn_kg_icon_dis";
     public static final String F_KG_ICON_THK = "fn_kg_icon_thk";
@@ -624,18 +669,22 @@ public final class Cfg {
     // once per second (a toggle therefore lands within ~1s, still "instant").
     private static volatile java.lang.reflect.Method sPropGet;
     private static volatile long sPropAt;
-    // ⚠ v3.0.0 修正：这里原来是 `= true`，与上面注释"读不到 -> OFF"**正好相反**。
-    // 后果：万一反射失败（Class.forName 抛异常、或字段被 SELinux 拦），
-    // 代码会一路保持 true —— 也就是**高温旁路在没有用户授权的情况下一直开着**，
-    // 而这恰恰是注释里说"绝不能发生"的情况（root 级安全绕过）。
-    // 改成 false 后：首次成功读取前一律按关处理，最多延迟 1 秒（TTL）。
+    // ⚠ 反射失败（Class.forName 抛异常、或字段被 SELinux 拦）时必须按关处理，
+    // 绝不能默认 true —— 否则高温旁路会在没有用户授权的情况下一直开着（root 级安全绕过）。
+    // 首次成功读取前一律 false，最多延迟 1 秒（TTL）。
     private static volatile boolean sPropVal = false;
 
     /** 降级开关的缓存时间戳。 */
     private static volatile long sDgAt;
     private static volatile boolean sDgVal = false;
 
-    /** 降级安装是否开启（system_server 侧用，走属性）。 */
+    /**
+     * 降级安装是否开启（system_server 侧用，走属性）。
+     *
+     * <p>缺省值改为 **1（允许）** —— 和设置页默认、provider 缺省统一。
+     * 属性还没被写入（刚装模块 / 属性服务异常）时，系统层按「允许」处理；
+     * 老用户在设置里显式关过的，属性写过 0，仍然按关处理。
+     */
     public static boolean downgradeOn() {
         long now = android.os.SystemClock.uptimeMillis();
         if (now - sDgAt < 1000L) {
@@ -648,7 +697,7 @@ public final class Cfg {
                 m = sp.getMethod("get", String.class, String.class);
                 sPropGet = m;
             }
-            sDgVal = !"0".equals(m.invoke(null, PROP_DOWNGRADE, "0"));
+            sDgVal = !"0".equals(m.invoke(null, PROP_DOWNGRADE, "1"));
         } catch (Throwable t) {
             // 沿用上次值
         }
@@ -688,6 +737,31 @@ public final class Cfg {
         sNsAt = now;
         return sNsVal;
     }
+
+    /**
+     * 当前玻璃重置代数（唯一来源 {@link #PROP_GLASS_EPOCH}）。
+     *
+     * <p>返回 {@link #EPOCH_UNKNOWN} 表示"读不到/读不懂"，不是 0。宿主必须
+     * 明确处理 unknown：按 fail-open 接受本次缓存并记日志，避免属性服务一时
+     * 异常就把所有宿主的缓存永久判死。属性为空 = 从未恢复过 = 0（这是已知值）。
+     */
+    public static int glassEpoch() {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            Object v = sp.getMethod("get", String.class, String.class)
+                    .invoke(null, PROP_GLASS_EPOCH, "");
+            String s = v == null ? "" : String.valueOf(v).trim();
+            if (s.isEmpty()) {
+                return 0; // 属性未设置：明确知道是 0
+            }
+            return Integer.parseInt(s);
+        } catch (Throwable t) {
+            return EPOCH_UNKNOWN;
+        }
+    }
+
+    /** 本进程读缓存时用的 epoch；provider 晚到后用于告警对比。 */
+    private static volatile int sCachedEpoch = EPOCH_UNKNOWN;
 
     public static boolean hottempOn() {
         long now = android.os.SystemClock.uptimeMillis();
@@ -739,7 +813,7 @@ public final class Cfg {
      * "UI 显示关闭、hook 实际开启"的鬼故事 —— 别再拆开写。
      */
     public static boolean isOptIn(String key) {
-        // ===== v3.2.0：所有**总闸**默认关闭 =====
+        // ===== 所有**总闸**默认关闭 =====
         //
         // 规则（用户定）：装完模块什么都不该自动生效，要用户自己开。
         //   · 有总开关的 -> 总开关默认关
@@ -751,7 +825,8 @@ public final class Cfg {
         if (K_GLASS.equals(key) || K_PURIFY.equals(key)) return true;
         // 安全组件：每一项都是独立的能力，默认全关。
         if (K_NOSECURE.equals(key) || K_NOCLOUD.equals(key)
-                || K_NOFRAUD.equals(key) || K_PURGECOTA.equals(key)) return true;
+                || K_NOFRAUD.equals(key)
+                || K_PURGECOTA.equals(key)) return true;
         return K_NODUCK.equals(key) || K_HOTTEMP.equals(key)
                 || K_DIAG.equals(key);
     }
@@ -762,7 +837,7 @@ public final class Cfg {
     }
 
     /**
-     * 等快照落地，最多 {@code ms} 毫秒（v3.2.29）。
+     * 等快照落地，最多 {@code ms} 毫秒。
      *
      * <p>给**用户主动触发**的路径用：安装器净化。重启作用域后第一次安装时，
      * installer 进程刚起、provider 可能还没回来，而 {@code isOn(K_PURIFY)} 在
@@ -885,7 +960,7 @@ public final class Cfg {
             return;
         }
         sStarted = true;
-        // v3.2.28：**同步**读本地副本，必须在起线程之前。
+        // **同步**读本地副本，必须在起线程之前。
         // 线程里第一次 loadOnce() 会 query provider，而 provider 属于模块 app ——
         // 开机时那是一次冷启动，query 能阻塞好几秒。等它返回再填缓存，SystemUI
         // 早就把锁屏和材质渲染完了，等于没救。
@@ -899,7 +974,7 @@ public final class Cfg {
             public void run() {
                 // early phase: app/binder may not be up yet — retry briefly
                 //
-                // v3.2.30：**不能只重试 15 秒**。真机实测（11-02 12:24）：
+                // **不能只重试 15 秒**。真机实测（11-02 12:24）：
                 // 开机时用户还没解锁，模块 App 装在 CE 存储里**根本起不来**，
                 // provider 查询返回 "Unknown URL"；15 秒一到放弃之后，整个开机
                 // 周期都不会再试 —— 于是缓存永远写不上，下次开机还是失效。
@@ -1060,9 +1135,9 @@ public final class Cfg {
 
     /** one provider query; true on success. Never called from a hook callback. */
     /**
-     * 拿一个能用的 Context（v3.2.5）。
+     * 拿一个能用的 Context。
      *
-     * <p>原来只用 {@code AndroidAppHelper.currentApplication()}，但**有些系统进程
+     * <p>单靠 {@code AndroidAppHelper.currentApplication()} 不够：**有些系统进程
      * 根本没有 Application 实例** —— securityserver 就是以 Service 为主的进程，
      * 那个调用恒返回 null。后果极其隐蔽：
      * <ul>
@@ -1090,7 +1165,7 @@ public final class Cfg {
         return null;
     }
 
-    // ==================== 快照本地副本（v3.2.28 开机失效修复） ====================
+    // ==================== 快照本地副本（开机失效修复） ====================
     //
     // 为什么需要它：provider 是**跨进程**的，开机时模块 app 还没起来，SystemUI 的
     // 首次 query 必然失败，要重试 1~3 秒才拿到数据。而 SystemUI 在这之前就已经
@@ -1110,7 +1185,7 @@ public final class Cfg {
     // 恰恰是"低存储/开机卡顿"时最需要的。
     private static final String CACHE_FILE = "cfg_snapshot.txt";
     /** 格式版本。改动缓存结构时递增，旧文件会被丢弃而不是误读。 */
-    private static final String CACHE_VER = "v1";
+    private static final String CACHE_VER = "v2";
     /** 只尝试读一次，避免 30 轮重试里反复读盘。 */
     private static boolean sCacheTried = false;
     /** 当前快照是不是从缓存来的（用于"缓存与线上不一致"的告警判据）。 */
@@ -1246,6 +1321,60 @@ public final class Cfg {
                 Diag.note("Cfg cache: 版本不符(" + first + ")，已忽略");
                 return;
             }
+            // 版本握手。缓存必须带 build fingerprint + versionCode + 时间戳；
+            // 任何一项不匹配（换机/换 ROM/模块升级）都视为失效，避免把旧包的观感
+            // 带到新版本。时间戳只用于日志，不做短过期（常驻进程可能几天不重启）。
+            String fpLine = r.readLine();
+            String vcLine = r.readLine();
+            String tsLine = r.readLine();
+            String fp = android.os.Build.FINGERPRINT;
+            if (fpLine == null || !fpLine.equals("fp=" + fp)) {
+                Diag.note("Cfg cache: fingerprint 不符，已丢弃");
+                try { f.delete(); } catch (Throwable ignored) { }
+                return;
+            }
+            if (vcLine == null || !vcLine.equals("vc=" + BuildConfig.VERSION_CODE)) {
+                Diag.note("Cfg cache: versionCode 不符，已丢弃");
+                try { f.delete(); } catch (Throwable ignored) { }
+                return;
+            }
+            if (tsLine == null || !tsLine.startsWith("ts=")) {
+                Diag.note("Cfg cache: 缺少时间戳，已丢弃");
+                try { f.delete(); } catch (Throwable ignored) { }
+                return;
+            }
+            // epoch 三态。
+            //   known 且一致  -> 用缓存
+            //   known 且不符  -> 丢弃，回退 provider
+            //   unknown       -> fail-open 接受本次缓存 + 日志写清
+            // 没有 ep= 的缓存无法校验，vc 升级时已经会被版本握手丢掉；
+            // 这里再遇到缺 ep 一律当"无法证明有效"→ 丢弃。
+            String epLine = r.readLine();
+            int cacheEp;
+            if (epLine == null || !epLine.startsWith("ep=")) {
+                Diag.note("Cfg cache: 缺少 epoch，已丢弃");
+                try { f.delete(); } catch (Throwable ignored) { }
+                return;
+            }
+            try {
+                cacheEp = Integer.parseInt(epLine.substring(3).trim());
+            } catch (Throwable t) {
+                Diag.note("Cfg cache: epoch 解析失败(" + epLine + ")，已丢弃");
+                try { f.delete(); } catch (Throwable ignored) { }
+                return;
+            }
+            int curEp = glassEpoch();
+            if (curEp == EPOCH_UNKNOWN) {
+                // 属性读不到：宁可接受一次旧缓存，也不要把缓存永久判死。
+                // 下一次进程启动如果属性恢复，缓存会被重新比对并纠正。
+                Diag.note("Cfg cache: epoch 未知（属性读取失败），"
+                        + "fail-open 采用缓存 ep=" + cacheEp);
+            } else if (cacheEp != curEp) {
+                Diag.note("Cfg cache: epoch 不符(cache=" + cacheEp
+                        + ", current=" + curEp + ")，已丢弃并回退 provider");
+                try { f.delete(); } catch (Throwable ignored) { }
+                return;
+            }
             Map<String, int[]> m = new HashMap<String, int[]>();
             String line;
             while ((line = r.readLine()) != null) {
@@ -1265,6 +1394,7 @@ public final class Cfg {
             if (sSnapshot == null) {
                 sSnapshot = m;
                 sSnapshotFromCache = true;
+                sCachedEpoch = cacheEp;
                 markReady();
                 // 这行用 note 而不是 log：note 不受诊断开关控制，用户反馈
                 // "开机玻璃没了"时能直接在日志里看到首帧用的是哪份配置。
@@ -1297,6 +1427,17 @@ public final class Cfg {
         try {
             StringBuilder sb = new StringBuilder(4096);
             sb.append(CACHE_VER).append('\n');
+            sb.append("fp=").append(android.os.Build.FINGERPRINT).append('\n');
+            sb.append("vc=").append(BuildConfig.VERSION_CODE).append('\n');
+            sb.append("ts=").append(System.currentTimeMillis()).append('\n');
+            // epoch 只有一个来源（属性）。读不到就**不写缓存**，
+            // 免得写进一个无法校验的 ep=0/-1，下一次启动反而永久丢缓存。
+            int ep = glassEpoch();
+            if (ep == EPOCH_UNKNOWN) {
+                Diag.note("Cfg cache write: epoch 未知，跳过写缓存");
+                return;
+            }
+            sb.append("ep=").append(ep).append('\n');
             for (Map.Entry<String, int[]> e : m.entrySet()) {
                 if (e.getKey() == null || e.getValue() == null) {
                     continue;
@@ -1387,8 +1528,9 @@ public final class Cfg {
             // 而玻璃线是冻结的、已渲染的元素不会重算。这条告警专门给排查用：
             // 用户反馈「界面显示的设置和实际效果不一致」时，日志里能直接看到。
             if (sSnapshotFromCache) {
-                Diag.warn("Cfg 快照与本地缓存不一致：本进程已按缓存渲染，"
-                        + "重启 SystemUI 后才会用线上值");
+                Diag.warn("Cfg 快照与本地缓存不一致（epoch "
+                        + sCachedEpoch + "→" + glassEpoch()
+                        + "）：本进程已按缓存渲染，重启 SystemUI 后才会用线上值");
             }
             // 每次真正拿到线上值都刷新本地副本 —— 它代表"下一次开机时该用什么"。
             writeCache(m);
