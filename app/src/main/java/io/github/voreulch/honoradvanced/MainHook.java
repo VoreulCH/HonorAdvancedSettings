@@ -171,10 +171,82 @@ public final class MainHook implements IXposedHookLoadPackage {
             } catch (Throwable ignored) {
             }
             boot = boot == null ? "" : boot.trim();
-            set.invoke(null, "persist.sys.has.sysprobe",
-                    io.github.voreulch.honoradvanced.BuildConfig.VERSION_NAME
-                            + "(" + io.github.voreulch.honoradvanced.BuildConfig.VERSION_CODE + ")|" + boot);
+            // 框架代次：软重启不改变 boot_id，必须另给一个"这次 system_server
+            // 真的重新加载了模块"的凭证。用 pid + startAt + 墙钟时间，三者任一
+            // 变化都说明是新进程；宿主上报时带上它，首页按 epoch 是否一致判新鲜。
+            long startAt = procStartAt();
+            String epoch = android.os.Process.myPid() + ":" + startAt + ":"
+                    + System.currentTimeMillis();
+            // 217：写后必须回读。写不进去 / 读回不一致 = 这次不能算已注入，
+            // epoch_state 写 FAIL，首页据此判红；绝不允许"写了就当成功"。
+            set.invoke(null, "persist.sys.has.framework_epoch", epoch);
+            String epochBack = getProp("persist.sys.has.framework_epoch");
+            if (epochBack == null || !epoch.equals(epochBack)) {
+                set.invoke(null, "persist.sys.has.epoch_state", "FAIL:epoch_readback");
+                Diag.err("epoch readback mismatch expected=" + epoch
+                        + " got=" + epochBack, null);
+                return;
+            }
+            // 新代次已确认，才清掉软重启 pending；清不掉就继续 pending=1，
+            // 首页不会把旧记录当新鲜（宁可黄，也不假绿）。
+            set.invoke(null, "persist.sys.has.epoch_pending", "0");
+            String pending = getProp("persist.sys.has.epoch_pending");
+            if (pending == null || !"0".equals(pending)) {
+                set.invoke(null, "persist.sys.has.epoch_state", "FAIL:pending_clear");
+                Diag.err("epoch pending clear failed got=" + pending, null);
+                return;
+            }
+            set.invoke(null, "persist.sys.has.epoch_state", "OK");
+            String probe = io.github.voreulch.honoradvanced.BuildConfig.VERSION_NAME
+                    + "(" + io.github.voreulch.honoradvanced.BuildConfig.VERSION_CODE + ")|"
+                    + boot + "|" + epoch;
+            set.invoke(null, "persist.sys.has.sysprobe", probe);
+            String probeBack = getProp("persist.sys.has.sysprobe");
+            if (probeBack == null || !probe.equals(probeBack)) {
+                set.invoke(null, "persist.sys.has.epoch_state", "FAIL:sysprobe_readback");
+                Diag.err("sysprobe readback mismatch expected=" + probe
+                        + " got=" + probeBack, null);
+            }
+        } catch (Throwable t) {
+            try {
+                Class<?> sp2 = Class.forName("android.os.SystemProperties");
+                java.lang.reflect.Method set2 = sp2.getMethod("set", String.class, String.class);
+                set2.invoke(null, "persist.sys.has.epoch_state", "FAIL:exception");
+            } catch (Throwable ignored) {
+            }
+            Diag.err("epoch write/readback exception", t);
+        }
+    }
+
+    private static String getProp(String key) {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            Object v = sp.getMethod("get", String.class, String.class)
+                    .invoke(null, key, "");
+            return v == null ? "" : String.valueOf(v).trim();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** /proc/self/stat 第 22 列（开机后的 clock ticks）；读不到返回 0。 */
+    private static long procStartAt() {
+        java.io.BufferedReader r = null;
+        try {
+            r = new java.io.BufferedReader(new java.io.FileReader("/proc/self/stat"));
+            String line = r.readLine();
+            if (line == null) return 0L;
+            int close = line.lastIndexOf(')');
+            if (close < 0 || close + 2 >= line.length()) return 0L;
+            String[] rest = line.substring(close + 2).trim().split("\\s+");
+            if (rest.length <= 19) return 0L;
+            return Long.parseLong(rest[19]);
         } catch (Throwable ignored) {
+            return 0L;
+        } finally {
+            if (r != null) {
+                try { r.close(); } catch (Throwable ignored) { }
+            }
         }
     }
 
