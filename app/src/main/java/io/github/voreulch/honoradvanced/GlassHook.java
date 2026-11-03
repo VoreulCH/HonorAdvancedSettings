@@ -63,9 +63,6 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  */
 public final class GlassHook implements IXposedHookLoadPackage {
 
-    // 注：以前这里有个 private static final String TAG = "HAS-Glass"，
-    // 从没被用过（所有日志都走 Diag.*，带进程 scope 前缀），v2.6.10 删掉。
-
     // SystemUI apk classes (present only in com.android.systemui process)
     private static final String TMM_CLASS =
             "com.hihonor.systemui.magic.transparentmode.TransparentModeManager";
@@ -1054,7 +1051,7 @@ public final class GlassHook implements IXposedHookLoadPackage {
      * **findClass 直接失败**（`HnLiquidGlassParamsEx missing`）——那是个 framework 类，
      * launcher 的 PathClassLoader 拿不到。
      *
-     * <p>改成 hook launcher 自己的入口：
+     * <p>hook launcher 自己的入口：
      * <pre>
      *   LiquidGlassUtils.setLiquidGlassParams(View, TransparentBlurParams, Object shape)
      * </pre>
@@ -1129,6 +1126,8 @@ public final class GlassHook implements IXposedHookLoadPackage {
         if (vt == null) return null;
         String group;
         switch (vt) {
+            // 199 移出去的两项接回现有 btn 组。
+            // 手电筒和相机走同一组 fn_kg_btn*，用户调一次两个按钮同步变化。
             case "bottom_tool":
             case "flashlight_tool":
             case "flashlight_tool_backplane":
@@ -1292,9 +1291,8 @@ public final class GlassHook implements IXposedHookLoadPackage {
         // 等价，只是省掉一轮 48 次查表。
         if (!sSysOn && !sKgOn && !sBannerOn) return false;
         for (String k : Cfg.FN_KEYS) {
-            // 三种键（百分比项、开关项、角度）判定方式其实完全一样：
-            // 当前值 != 出厂默认值。以前这里按类型写了三个分支，但三个分支
-            // 的表达式一字不差，纯属历史遗留的复制粘贴，合成一行。
+            // 三种键（百分比项、开关项、角度）判定方式完全一样：
+            // 当前值 != 出厂默认值，合成一行即可。
             if (Cfg.getInt(k, Cfg.fnDefPct(k)) != Cfg.fnDefPct(k)) return true;
         }
         return false;
@@ -1341,12 +1339,12 @@ public final class GlassHook implements IXposedHookLoadPackage {
         // 配方来源：排查"玻璃发亮/发灰"先看这一行。
         // standard = baked 标准配方 + 两层滑条；off = 系统综合关闭走原生玻璃。
         //
-        // ⚠ v2.6.9：以前这里用 Diag.note()，但实测 **note 的输出进不了 logcat**
+        // ⚠ 这里必须用 Diag.log()，不能用 Diag.note()：实测 **note 的输出进不了 logcat**
         // （Vector 的日志桥在模块 handleLoadPackage 早期还没就绪，XposedBridge.log
         // 那一刻的输出全丢）。结果就是：启动期的版本横幅、hook 挂载结果、这一行
         // recipe 全都看不到，排查时只能靠猜"跑的是哪一版、钩子挂上没有"。
-        // 现在改成 log()（运行时通道，实测能进 logcat），并把版本号和两个关键
-        // 钩子的挂载状态直接写进这一行。
+        // log() 是运行时通道，实测能进 logcat，版本号和两个关键钩子的挂载状态
+        // 直接写在这一行。
         if (sRecipeLogged < 3) {
             sRecipeLogged++;
             String line = "recipe: v" + BuildConfig.VERSION_NAME
@@ -1434,9 +1432,9 @@ public final class GlassHook implements IXposedHookLoadPackage {
                             return;
                         }
                     } catch (Throwable t) {
-                        // 字段读不到就保持原值（不压磨砂）。这条路以前是硬编码
-                        // false、不依赖任何字段；现在多了个依赖，一旦宿主改字段名
-                        // 就会静默退化 —— 所以留一条一次性日志，别让它悄悄失效。
+                        // 字段读不到就保持原值（不压磨砂）。这条判定依赖
+                        // mIsTransparentModeOn；一旦宿主改字段名就会静默退化 ——
+                        // 所以留一条一次性日志，别让它悄悄失效。
                         if (!sFrostGateWarned) {
                             sFrostGateWarned = true;
                             log("frost-type gate: mIsTransparentModeOn 读不到 ("
@@ -1657,10 +1655,10 @@ public final class GlassHook implements IXposedHookLoadPackage {
                             log("kbshade failed: " + t);
                         }
                     }
-                    // ---- 按控件类型分别缩放（v2.5.0）----
-                    // 原生 initBulrParams 给四类控件赋了不同的亮度/饱和度/遮罩资源，
-                    // 旧版只有一个 sMaskScale 一把刷到全部控件上；现在每类还有自己的
-                    // 强度权重，想单独压暗通知卡不会连带滑块和按钮一起变。
+                    // ---- 按控件类型分别缩放 ----
+                    // 原生 initBulrParams 给四类控件赋了不同的亮度/饱和度/遮罩资源；
+                    // 单一 sMaskScale 会把全部控件一起刷。每类有自己的强度权重后，
+                    // 想单独压暗通知卡不会连带滑块和按钮一起变。
                     if (sMaskScale < 0.999f) {
                         try {
                             // 通知卡（含瓦片内的通知卡、动态卡片渐变）
@@ -1669,7 +1667,7 @@ public final class GlassHook implements IXposedHookLoadPackage {
                             scaleAlphaField(o, "liauidGlassNtfOverlayColor", ntf);
                             scaleAlphaField(o, "controlNtfMaskColor", ntf);
                             scaleAlphaField(o, "controlNtfverlayColor", ntf);
-                            // ⚠ 这三个数组**不在这里处理**（v3.2.6 第 4 轮复查发现的双重叠加）：
+                            // ⚠ 这三个数组**不在这里处理**（第 4 轮复查发现的双重叠加）：
                             //   multiMaskColors              -> 归「多层遮罩浓度」km
                             //   dynamicCardGradientMaskColor -> 归「动态卡渐变颜色」kc
                             // 早先它们也在这里跟着 ntf 乘一次，用户同时拖「通知卡底色」和
@@ -1699,12 +1697,12 @@ public final class GlassHook implements IXposedHookLoadPackage {
                             log("mask scale failed: " + t);
                         }
                     }
-                    // ⚠ v2.6.10：这个块以前**不分 case** 一把刷 —— 它把 controlNtfMaskColor /
+                    // ⚠ 这个块不能**不分 case** 一把刷 —— 那会把 controlNtfMaskColor /
                     // controlNtfverlayColor 绝对覆盖成 0x66 灰，连磨砂模式（case=1）和
                     // 横幅（case=3）都被改。而这两个字段在原生里每个 case 的底色都不一样
                     // （case=1 用 no_transparent 不透明色、case=2 用 transparent、
                     //   case=3 用 headsup 那套），一刀切成 0x66 等于把别人的配方毁了。
-                    // 现在只对「普通通知卡」(case=2 且 z=false) 生效 —— 锁屏卡走 kbshade
+                    // 所以只对「普通通知卡」(case=2 且 z=false) 生效 —— 锁屏卡走 kbshade
                     // 自己的配方，横幅走 banner 块，都各有各的写法。
                     boolean plainNtfCard = param.args.length > 2
                             && param.args[0] instanceof Integer
@@ -1745,8 +1743,9 @@ public final class GlassHook implements IXposedHookLoadPackage {
                             //   case=3            -> b  通知横幅
                             //   case=1/4/5        -> null 一律不碰
                             //
-                            // 以前这里默认 scope="n"，等于把 case=1/4/5 也当成
-                            // 普通通知卡处理。但原生给它们赋的是完全不同的数值
+                            // 默认 scope 必须是 null（一律不碰）。
+                            // 若按 "n" 处理，等于把 case=1/4/5 也当成普通通知卡；
+                            // 原生给它们赋的是完全不同的数值
                             // （case=1 磨砂：controlSaturation=2.8、controlbrightness=0.0；
                             //   case=2 液态：1.1 / 0.12；case=5 的 blurRadius 直接 130），
                             // 把"通知卡遮罩 60%"这类微调套上去是改错了对象 ——
@@ -1796,14 +1795,14 @@ public final class GlassHook implements IXposedHookLoadPackage {
                                 // 高光开关都属系统线：系统线关掉时必须原样不动。
                                 // 用 if 包裹而不是 return —— return 会跳出整个
                                 // 精细块，将来若把横幅/锁屏逻辑挪到后面会被误伤。
-                                // ===== 多层遮罩 / 动态渐变 / 锁屏控制中心（v3.1.3）=====
-                                // 这几个字段以前是"有但没接"——单根 maskColor 只是其中一层，
+                                // ===== 多层遮罩 / 动态渐变 / 锁屏控制中心 =====
+                                // 单根 maskColor 只是其中一层，
                                 // 真正决定观感的是这几个数组里每一层的 alpha。
                                 if (sSysOn) {
                                     float km = fineF(Cfg.F_MULTI_MASK);
                                     if (Math.abs(km - 1f) > 0.001f) {
                                         // 复用已有的 scaleAlphaArray（反射 Array，支持任意数组类型），
-                                        // 别再写一份 —— 上一版就是重复实现被抓了。
+                                        // 别再写一份。
                                         try {
                                             scaleAlphaArray(o, "multiMaskColors", km);
                                             scaleAlphaArray(o, "multiButtonMaskColors", km);
@@ -1941,13 +1940,16 @@ public final class GlassHook implements IXposedHookLoadPackage {
                     }
                     if (sFolderMode && param.args.length > 0 && param.args[0] instanceof Integer
                             && (Integer) param.args[0] >= 2) {
-                        // launcher folder recipe (LiquidLargeOnHighGeneral):
-                        // refraction 0.3 / depth 0.54 / thickness 0.62 /
-                        // dispersion 0.2 — wide soft refraction band with a
-                        // restrained chromatic fringe, no glow. Absolute
-                        // values (after any scaling) so tiles render exactly
-                        // like desktop folders. Cases >=2 are the liquid
-                        // branches (2 = tiles, 3 = ntf banner).
+                        // folder recipe (LiquidLargeOnHighGeneral)，观感取自桌面
+                        // 文件夹：refraction 0.3 / depth 0.54 / thickness 0.62 /
+                        // dispersion 0.2 —— 宽而软的折射带、克制的色散、无 glow。
+                        //
+                        // ⚠ case>=2 并不只命中桌面文件夹：SystemUI 的 case 2
+                        // （通知卡）与 case 3（heads-up 横幅）同样会走到这里，
+                        // 这四个绝对值会一并作用到通知卡/横幅上。
+                        // 它只改 refraction / depth / thickness / dispersion 四个
+                        // 光学字段，**不碰 alpha / mask / brightness** ——
+                        // 「工具栏背景全透明」不是这块造成的，排查时不要往这里归因。
                         // thickness honors the thick prop as a multiplier on
                         // the folder base (0.62) — widens the edge refraction
                         // band without touching refraction/dispersion.
@@ -2084,8 +2086,8 @@ public final class GlassHook implements IXposedHookLoadPackage {
             XposedBridge.hookAllMethods(android.widget.TextView.class, "setTextColor", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
-                    // v2.5.3: 原来这里门控 DIY 模式，DIY 移除后改跟系统线 ——
-                    // 精细调节同样能把玻璃调得很透，深色文字仍需反白兜底。
+                    // 门控跟系统线走：精细调节同样能把玻璃调得很透，
+                    // 深色文字仍需反白兜底。
                     if (!sysOn()) return;
                     if (!(param.args[0] instanceof Integer)) return;
                     int c = (Integer) param.args[0];
@@ -2475,13 +2477,13 @@ public final class GlassHook implements IXposedHookLoadPackage {
                     }
                     if (!Cfg.isOn(Cfg.K_GLASS)) return;
                     refreshProps();
-                    // v2.6.10：这条线上有三项可调（角度 / 厚度 / 亮度），以前只挡了
+                    // 这条线上有三项可调（角度 / 厚度 / 亮度），门控不能只挡
                     // 总开关 —— 用户把「系统液态玻璃」关掉之后，边缘光的角度和精细
-                    // 权重**照样在改**，跟"关掉=恢复系统默认"的承诺不符。
+                    // 权重必须一起停，才符合"关掉=恢复系统默认"。
                     // 锁屏卡（sKgCardNow）归锁屏线管，其余归系统线管。
                     boolean lineOk = sKgCardNow ? sKgOn : sSysOn;
                     if (!lineOk) return;
-                    // v2.5.2 边缘光角度（原厂固定 250，光永远从同一方向来）。
+                    // 边缘光角度（原厂固定 250，光永远从同一方向来）。
                     // 放在厚度逻辑之前：厚度那边有"scale≈1 就 return"的早退，
                     // 否则只调角度会被直接跳过。
                     try {
@@ -2747,6 +2749,7 @@ public final class GlassHook implements IXposedHookLoadPackage {
                     return;
                 }
                 View v = (View) param.args[0];
+                // 手电筒和相机统一走 ViewEx 路线，不做按控件排除。
                 int i = (Integer) param.args[1];
                 boolean z = (Boolean) param.args[2];
                 trackIconTarget(v, i, z);
