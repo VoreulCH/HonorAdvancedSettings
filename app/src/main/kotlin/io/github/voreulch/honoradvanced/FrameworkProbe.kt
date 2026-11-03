@@ -13,28 +13,46 @@ data class ScopeReport(
     val pkg: String,
     /** 上报时跑在进程里的模块版本号（低于当前版本 = 该进程还开着旧代码）。 */
     val ver: Int,
-    /** 上报时间（System.currentTimeMillis）。 */
+    /** 上报进程的 pid。 */
+    val pid: Int,
+    /** 上报时的 boot_id（每次重启变化）。 */
+    val bootId: String,
+    /** 进程启动时刻（/proc/<pid>/stat 第 22 列，开机后的 clock ticks；0=未取到）。 */
+    val startAt: Long,
+    /** 最近一次心跳时间（System.currentTimeMillis）。 */
     val at: Long
 )
 
 /**
- * 上报记录的有效期（v3.2.36）。
+ * 心跳窗口。
  *
- * <p>为什么需要：自证记录存在模块 app 的 prefs 里，**模块被禁用/卸载后这些记录
- * 不会消失**。原来的 {@code has()} 只看"有没有这条记录"，于是模块早就停了，
- * 界面还理直气壮地显示"作用域已生效" —— 典型的假阳性。
- *
- * <p>现在的判据：记录时间距现在超过 72 小时就当作无效。取 72 小时而不是更短，
- * 是因为常驻进程（systemui / launcher）本来就可能好几天不重启，它们的上报时间
- * 停留在上次启动那一刻是正常现象。真被禁用的模块不会连续三天还在上报。
+ * <p>不能用长窗口兜底：模块被禁用后旧记录还能"绿"三天，是假阳性。
+ * Probe 每 60 秒写一次心跳，超过 5 分钟没心跳就判失效。
+ * 同时要求记录里的 boot_id 等于本次开机的 boot_id：重启后旧记录立刻作废。
  */
-private const val STALE_AFTER_MS = 72L * 60L * 60L * 1000L
+private const val HEARTBEAT_WINDOW_MS = 5L * 60L * 1000L
 
-/** 某条上报是否还"新鲜"（时间戳合法且不过期）。 */
+private var sBootId: String? = null
+
+/** 本次开机的 boot_id（读取失败返回空串 = 所有记录判失效）。 */
+private fun currentBootId(): String {
+    sBootId?.let { return it }
+    val b = try {
+        java.io.File("/proc/sys/kernel/random/boot_id").readText().trim()
+    } catch (_: Throwable) {
+        ""
+    }
+    sBootId = b
+    return b
+}
+
+/** 某条上报是否还"新鲜"：本次开机 + 最近心跳。 */
 private fun ScopeReport.isFresh(): Boolean {
     if (at <= 0L) return false
+    val boot = currentBootId()
+    if (boot.isEmpty() || bootId != boot) return false
     val age = System.currentTimeMillis() - at
-    return age in 0..STALE_AFTER_MS
+    return age in 0..HEARTBEAT_WINDOW_MS
 }
 
 /**
@@ -52,11 +70,23 @@ data class ModuleState(
 
     fun has(pkg: String): Boolean = reports[pkg]?.isFresh() == true
 
+    /**
+     * 本次开机上报过、进程 pid 有效，但心跳可能已经过期（深休眠 / Doze 后常见）。
+     *
+     * <p>与 [has] 分开表达：心跳新鲜 = 绿；仅"本次开机仍活着" = 黄（等一下会自愈），
+     * 不能一解锁就报红。
+     */
+    fun alive(pkg: String): Boolean {
+        val r = reports[pkg] ?: return false
+        val boot = currentBootId()
+        return boot.isNotEmpty() && r.bootId == boot && r.pid > 0
+    }
+
     fun missing(required: Collection<String>): List<String> =
         required.filter { !has(it) }
 
     /**
-     * 上报过，但记录已经过期（v3.2.37）。
+     * 上报过，但记录已经过期。
      *
      * <p>用来把「**从没上报过**」（模块没勾作用域 / 没重启）和「**上报过但记录太旧**」
      * 区分开。两者的修法完全不同：
@@ -66,12 +96,17 @@ data class ModuleState(
      * </ul>
      * 不区分的话，用户看到"作用域未生效"会以为模块坏了，白折腾一轮。
      */
-    fun expired(pkg: String): Boolean = reports[pkg]?.let { !it.isFresh() } ?: false
+    fun expired(pkg: String): Boolean {
+        val r = reports[pkg] ?: return false
+        val boot = currentBootId()
+        if (r.bootId.isEmpty() || r.bootId != boot) return false
+        return System.currentTimeMillis() - r.at > HEARTBEAT_WINDOW_MS
+    }
 
     /** 该作用域在跑，但跑的是旧版本模块（OTA 后没重启进程）。 */
     fun stale(pkg: String): Boolean {
         val r = reports[pkg] ?: return false
-        return r.ver < BuildConfig.VERSION_CODE
+        return r.bootId == currentBootId() && r.ver in 1 until BuildConfig.VERSION_CODE
     }
 
     companion object {
@@ -144,11 +179,21 @@ object FrameworkProbe {
             cursor.use { c ->
                 val pi = c.getColumnIndex(CfgProvider.COL_PKG)
                 val vi = c.getColumnIndex(CfgProvider.COL_VER)
-                val ai = c.getColumnIndex("at")
+                val idi = c.getColumnIndex(CfgProvider.COL_PID)
+                val bi = c.getColumnIndex(CfgProvider.COL_BOOT)
+                val si = c.getColumnIndex(CfgProvider.COL_START)
+                val ai = c.getColumnIndex(CfgProvider.COL_BEAT)
                 if (pi < 0 || vi < 0 || ai < 0) return null
                 while (c.moveToNext()) {
                     val p = c.getString(pi) ?: continue
-                    out[p] = ScopeReport(p, c.getInt(vi), c.getLong(ai))
+                    out[p] = ScopeReport(
+                        p,
+                        c.getInt(vi),
+                        if (idi >= 0) c.getInt(idi) else 0,
+                        if (bi >= 0) (c.getString(bi) ?: "") else "",
+                        if (si >= 0) c.getLong(si) else 0L,
+                        c.getLong(ai)
+                    )
                 }
             }
             out
