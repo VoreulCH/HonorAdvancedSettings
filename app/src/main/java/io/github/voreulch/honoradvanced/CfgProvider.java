@@ -43,6 +43,12 @@ public final class CfgProvider extends ContentProvider {
     public static final String COL_BOOT = "boot";
     public static final String COL_START = "start";
     public static final String COL_BEAT = "beat";
+    /**
+     * 框架代次（216 起）。system_server 每次加载模块写一个新的
+     * {@code persist.sys.has.framework_epoch}（pid:startAt:time），宿主上报时带上。
+     * 软重启不改变 boot_id，只有 epoch 能证明"框架确实换代了"。
+     */
+    public static final String COL_EPOCH = "epoch";
 
     @Override
     public boolean onCreate() {
@@ -163,7 +169,7 @@ public final class CfgProvider extends ContentProvider {
             // 探针表只给模块自身 / root / shell 读。
             if (!probeCallerAllowed()) {
                 return new MatrixCursor(new String[]{
-                        COL_PKG, COL_VER, COL_PID, COL_BOOT, COL_START, COL_BEAT}, 0);
+                        COL_PKG, COL_VER, COL_PID, COL_BOOT, COL_START, COL_BEAT, COL_EPOCH}, 0);
             }
             return probeCursor();
         }
@@ -196,7 +202,7 @@ public final class CfgProvider extends ContentProvider {
     /** 已上报的作用域（pkg / 模块版本 / 上报时间）。 */
     private Cursor probeCursor() {
         MatrixCursor c = new MatrixCursor(new String[]{
-                COL_PKG, COL_VER, COL_PID, COL_BOOT, COL_START, COL_BEAT},
+                COL_PKG, COL_VER, COL_PID, COL_BOOT, COL_START, COL_BEAT, COL_EPOCH},
                 Cfg.SCOPES.length);
         Context ctx = getContext();
         if (ctx == null) {
@@ -213,8 +219,17 @@ public final class CfgProvider extends ContentProvider {
             String boot = "";
             long start = 0L;
             long beat = 0L;
+            String epoch = "";
             String[] parts = raw.split("\\|", -1);
-            if (parts.length >= 5) {
+            if (parts.length >= 6) {
+                try { ver = Integer.parseInt(parts[0]); } catch (Throwable ignored) {}
+                try { pid = Integer.parseInt(parts[1]); } catch (Throwable ignored) {}
+                boot = parts[2] == null ? "" : parts[2];
+                try { start = Long.parseLong(parts[3]); } catch (Throwable ignored) {}
+                try { beat = Long.parseLong(parts[4]); } catch (Throwable ignored) {}
+                epoch = parts[5] == null ? "" : parts[5].trim();
+            } else if (parts.length == 5) {
+                // 216 之前的记录没有 epoch：照常解析，但判新鲜会因 epoch 为空而失效。
                 try { ver = Integer.parseInt(parts[0]); } catch (Throwable ignored) {}
                 try { pid = Integer.parseInt(parts[1]); } catch (Throwable ignored) {}
                 boot = parts[2] == null ? "" : parts[2];
@@ -225,7 +240,7 @@ public final class CfgProvider extends ContentProvider {
                 try { ver = Integer.parseInt(parts[0]); } catch (Throwable ignored) {}
                 try { beat = Long.parseLong(parts[1]); } catch (Throwable ignored) {}
             }
-            c.addRow(new Object[]{pkg, ver, pid, boot, start, beat});
+            c.addRow(new Object[]{pkg, ver, pid, boot, start, beat, epoch});
         }
         return c;
     }
@@ -373,14 +388,44 @@ public final class CfgProvider extends ContentProvider {
         }
         Long startV = values.getAsLong(COL_START);
         long start = startV == null ? 0L : startV;
+        String epoch = values.getAsString(COL_EPOCH);
+        if (epoch == null || epoch.length() > 64) {
+            epoch = "";
+        }
+        // epoch 只允许 pid:startAt:time 这类字符，别把任意文本写进 prefs。
+        epoch = epoch.replaceAll("[^0-9A-Za-z:_-]", "");
         // 心跳时间用服务端时间，不信任客户端传来的 beat。
         long now = System.currentTimeMillis();
-        String rec = ver + "|" + pid + "|" + boot + "|" + start + "|" + now;
+        String rec = ver + "|" + pid + "|" + boot + "|" + start + "|" + now + "|" + epoch;
         boolean ok = ctx.getSharedPreferences(PREFS_PROBE, Context.MODE_PRIVATE)
                 .edit()
                 .putString(pkg, rec)
                 .commit();
         return ok ? uri : null;
+    }
+
+    /**
+     * 主动清掉探针记录（模块 App 自己调用，不需要 root）。
+     *
+     * <p>重启作用域 / 软重启前必须调用：旧记录留在 5 分钟窗口里会冒充"新鲜"，
+     * 首页就会假绿或永远卡在"心跳暂停"。传空集合 = 清全部。
+     */
+    public static int clearProbe(Context ctx, String... pkgs) {
+        if (ctx == null) {
+            return 0;
+        }
+        SharedPreferences p = ctx.getSharedPreferences(PREFS_PROBE, Context.MODE_PRIVATE);
+        SharedPreferences.Editor e = p.edit();
+        if (pkgs == null || pkgs.length == 0) {
+            e.clear();
+        } else {
+            for (String pkg : pkgs) {
+                if (pkg != null && isKnownScope(pkg)) {
+                    e.remove(pkg);
+                }
+            }
+        }
+        return e.commit() ? 1 : 0;
     }
 
     @Override
