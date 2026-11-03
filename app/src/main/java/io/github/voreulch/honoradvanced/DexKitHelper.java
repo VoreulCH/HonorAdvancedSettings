@@ -33,10 +33,31 @@ public final class DexKitHelper {
             sBridge = null;
         }
         try {
+            // 先数 dex，**没有 dex 的分片直接跳过**，绝不把空包交给
+            // DexKitBridge.create。securityserver 会传 8 个 split，其中资源/配置
+            // split 没有 classes.dex；旧实现会对这些空包建索引，native 层可能
+            // SIGABRT（tombstone 里 libdexkit 的多次崩溃即此类）。
+            int zipDex = countDexEntries(apkPath);
+            if (zipDex <= 0) {
+                Diag.note("DexKit skip: no classes.dex in " + apkPath);
+                return null;
+            }
             System.loadLibrary("dexkit");
             sBridge = org.luckypray.dexkit.DexKitBridge.create(apkPath);
+            // 只有 APK 本身确实有多个 dex 时才走全量读取；
+            // installer/powergenie 只有一个 dex，不能让它们冷启动白付 I/O。
+            if (sBridge != null && sBridge.getDexNum() == 1 && zipDex > 1) {
+                byte[][] all = readAllDexBytes(apkPath);
+                if (all != null && all.length > 1) {
+                    try { sBridge.close(); } catch (Throwable ignored) { }
+                    sBridge = org.luckypray.dexkit.DexKitBridge.create(all);
+                    Diag.note("DexKit multi-dex fallback: " + all.length + " dex");
+                }
+            }
             sApk = apkPath;
-            Diag.log("DexKit bridge ready for " + apkPath);
+            Diag.log("DexKit bridge ready for " + apkPath
+                    + " dexNum=" + (sBridge == null ? -1 : sBridge.getDexNum())
+                    + " zipDex=" + zipDex);
         } catch (Throwable t) {
             Diag.err("DexKit bridge init failed", t);
         }
@@ -143,28 +164,31 @@ public final class DexKitHelper {
     }
 
     /**
-     * 按**类名正则**找类（v3.2.43）。
+     * 按**类名包含关键字**找类。
      *
      * <p>为什么需要这个而不继续用 {@link #findClassByStrings}：
      * {@code MethodMatcher.usingStrings} 只匹配**方法体内 const-string 引用的字面量**。
      * 而 {@code queryFraudCallingLatestRecordBy} 这类是**方法名**、
      * {@code FraudCallDetectStandardData} 这类是**类名** —— 它们不在 const-string
-     * 里，所以按字符串扫一定是 0 命中（实测 awareness 里 46MB dex、2ms 返回空，就是这个原因）。
+     * 里，所以按字符串扫一定是 0 命中。
      *
-     * <p>按类名正则匹配才是这类目标的正确工具：只要 OTA 后业务类名还带
-     * {@code Fraud} 字样就能命中，不需要知道混淆后的完整包路径。
-     *
-     * @param nameRegex 注意是**全限定类名**的正则，例如 {@code ".*[Ff]raud.*"}
+     * <p>按类名 Contains 匹配：只要 OTA 后业务类名还带 {@code Fraud}/{@code Subject}
+     * 字样就能命中。结果必须再由调用方校验“继承 baseplugin.ej.f + insert 形状”，
+     * 不能直接 hook 所有 POJO。
      */
-    public static java.util.List<Class<?>> findClassesByNameRegex(
-            String apkPath, ClassLoader cl, String nameRegex) {
+    public static java.util.List<Class<?>> findClassesByNameContains(
+            String apkPath, ClassLoader cl, String keyword) {
         java.util.List<Class<?>> out = new java.util.ArrayList<>();
         org.luckypray.dexkit.DexKitBridge b = bridge(apkPath);
         if (b == null) return out;
         try {
             org.luckypray.dexkit.query.FindClass query = org.luckypray.dexkit.query.FindClass.create()
                     .matcher(org.luckypray.dexkit.query.matchers.ClassMatcher.create()
-                            .className(nameRegex));
+                            // SimilarRegex 只支持 ^ / $ 锚点，传 ".*[Ff]raud.*"
+                            // 仍会 0 命中。这里只用 Contains 查关键字 "Fraud"/"Subject"，
+                            // 结果再由调用方做“继承 baseplugin.ej.f + insert 形状”双重校验。
+                            .className(keyword,
+                                    org.luckypray.dexkit.query.enums.StringMatchType.Contains));
             java.util.List<org.luckypray.dexkit.result.ClassData> list = b.findClass(query);
             if (list == null) return out;
             for (org.luckypray.dexkit.result.ClassData cd : list) {
@@ -179,8 +203,84 @@ public final class DexKitHelper {
                 }
             }
         } catch (Throwable t) {
-            Diag.err("DexKit findClassesByNameRegex failed", t);
+            Diag.err("DexKit findClassesByNameContains failed", t);
         }
         return out;
+    }
+
+    /** 数 APK 内有几个 classes*.dex，决定是否需要多 dex 兜底。 */
+    private static int countDexEntries(String apkPath) {
+        java.util.zip.ZipFile zf = null;
+        int n = 0;
+        try {
+            zf = new java.util.zip.ZipFile(apkPath);
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> en = zf.entries();
+            while (en.hasMoreElements()) {
+                java.util.zip.ZipEntry e = en.nextElement();
+                if (e != null && e.getName().endsWith(".dex") && e.getSize() > 0) n++;
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (zf != null) try { zf.close(); } catch (Throwable ignored) { }
+        }
+        return n;
+    }
+
+    /** 读取 APK 内全部 classes*.dex，供多 dex 入口兜底。 */
+    private static byte[][] readAllDexBytes(String apkPath) {
+        java.util.ArrayList<byte[]> list = new java.util.ArrayList<>();
+        java.util.zip.ZipFile zf = null;
+        try {
+            zf = new java.util.zip.ZipFile(apkPath);
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> en = zf.entries();
+            while (en.hasMoreElements()) {
+                java.util.zip.ZipEntry e = en.nextElement();
+                if (e == null || !e.getName().endsWith(".dex") || e.getSize() <= 0) continue;
+                java.io.InputStream in = null;
+                try {
+                    in = zf.getInputStream(e);
+                    java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(
+                            (int) Math.min(Integer.MAX_VALUE, e.getSize()));
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+                    list.add(bos.toByteArray());
+                } finally {
+                    if (in != null) try { in.close(); } catch (Throwable ignored) { }
+                }
+            }
+        } catch (Throwable t) {
+            Diag.err("DexKit readAllDex failed", t);
+        } finally {
+            if (zf != null) try { zf.close(); } catch (Throwable ignored) { }
+        }
+        return list.isEmpty() ? null : list.toArray(new byte[0][]);
+    }
+
+    /** canary：DexKit 实际索引了几个 dex。 */
+    public static int dexNum(String apkPath) {
+        org.luckypray.dexkit.DexKitBridge b = bridge(apkPath);
+        if (b == null) return -1;
+        try {
+            return b.getDexNum();
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** canary：按精确全限定名找一个类（Equals），确认多 dex 是否都索引到。 */
+    public static boolean hasClassExact(String apkPath, String className) {
+        org.luckypray.dexkit.DexKitBridge b = bridge(apkPath);
+        if (b == null) return false;
+        try {
+            org.luckypray.dexkit.query.FindClass query = org.luckypray.dexkit.query.FindClass.create()
+                    .matcher(org.luckypray.dexkit.query.matchers.ClassMatcher.create()
+                            .className(className,
+                                    org.luckypray.dexkit.query.enums.StringMatchType.Equals));
+            java.util.List<org.luckypray.dexkit.result.ClassData> list = b.findClass(query);
+            return list != null && !list.isEmpty();
+        } catch (Throwable t) {
+            return false;
+        }
     }
 }
