@@ -78,6 +78,7 @@ public final class Probe {
                             if (push(c, pkg)) {
                                 Diag.log("probe reported: " + pkg + " @"
                                         + BuildConfig.VERSION_NAME + " boot=" + bootId()
+                                        + " epoch=" + frameworkEpoch()
                                         + (i > 0 ? " (try " + (i + 1) + ")" : ""));
                                 // 成功后开始每分钟心跳，UI 判活靠"本次开机 + 最近心跳"。
                                 startHeartbeat(pkg, c);
@@ -210,6 +211,23 @@ public final class Probe {
         }
     }
 
+    /**
+     * 当前框架代次（system_server 每次加载模块时写的新值）。
+     *
+     * <p>不要缓存：软重启后 system_server 要过一会儿才写入新 epoch，宿主的下一次
+     * 心跳必须能读到新值，否则记录会一直挂着旧代次、首页永远判不新鲜。
+     */
+    private static String frameworkEpoch() {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            Object v = sp.getMethod("get", String.class, String.class)
+                    .invoke(null, "persist.sys.has.framework_epoch", "");
+            return v == null ? "" : String.valueOf(v).trim();
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
     private static boolean push(Context c, String pkg) {
         ContentValues v = new ContentValues();
         v.put(CfgProvider.COL_PKG, pkg);
@@ -219,6 +237,7 @@ public final class Probe {
         long startAt = processStartAt();
         if (startAt > 0) v.put(CfgProvider.COL_START, startAt);
         v.put(CfgProvider.COL_BEAT, System.currentTimeMillis());
+        v.put(CfgProvider.COL_EPOCH, frameworkEpoch());
         Uri r = c.getContentResolver().insert(CfgProvider.URI_PROBE, v);
         return r != null;
     }
