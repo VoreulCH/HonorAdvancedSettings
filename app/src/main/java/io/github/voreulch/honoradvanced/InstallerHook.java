@@ -1396,9 +1396,35 @@ public final class InstallerHook {
             // boolean), marker iface sd1, delivery PIA$b.c(ld1, de1))
             Class<?>[] cs = locateAll(new String[]{"ed1", "br0", "bx1", "md1"},
                     "HnAppCheckJob", "insertRiskAppDb");
-            Method m = null;
+            // 14.0.22.322 线的入口不在 br0 类里：这一版 br0 还是**接口**
+            // （326/327 起才变成带内嵌回调接口的类），真正对外的门面是
+            // uq0.j(uq0.a)，uq0 内部再按机型选 yq0/zq0 两个 br0 实现。
+            // 只有 br0 是接口（即 322 这一代）才追加 uq0/yq0/zq0，并放在
+            // 最前面：hook 门面 j() 时 thisObject 是 uq0，deliverPass326
+            // 能直接拿 uq0 自己的 static a(boolean) 造 xq0，再投给回调的
+            // a(xq0)（受分页开关限制）和 c(xq0)（直接渲染）两个入口。
+            // 326/327/38/39 的 br0 不是接口，候选顺序一个字节都不变。
+            java.util.ArrayList<Class<?>> scan = new java.util.ArrayList<>();
+            try {
+                Class<?> br = HookEnv.cl.loadClass("br0");
+                if (br.isInterface()) {
+                    for (String n : new String[]{"uq0", "yq0", "zq0"}) {
+                        try {
+                            Class<?> k = HookEnv.cl.loadClass(n);
+                            if (k != null && !scan.contains(k)) scan.add(k);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
             for (Class<?> c : cs) {
+                if (!scan.contains(c)) scan.add(c);
+            }
+            Method m = null;
+            for (Class<?> c : scan) {
                 for (Method mm : c.getDeclaredMethods()) {
+                    if (java.lang.reflect.Modifier.isAbstract(mm.getModifiers())) continue;
                     Class<?>[] ps = mm.getParameterTypes();
                     if (ps.length == 2 && ps[0].isInterface() && ps[1] == boolean.class
                             && mm.getReturnType() == void.class
@@ -1406,6 +1432,7 @@ public final class InstallerHook {
                 }
                 if (m != null) break;
                 for (Method mm : c.getDeclaredMethods()) {
+                    if (java.lang.reflect.Modifier.isAbstract(mm.getModifiers())) continue;
                     Class<?>[] ps = mm.getParameterTypes();
                     if (ps.length == 1 && ps[0].isInterface()
                             && mm.getReturnType() == void.class
@@ -2214,6 +2241,18 @@ public final class InstallerHook {
                         "/api/installer/business/v3/ad/query");
                 put("AdDetailsV4RequestCall",
                         "/api/installer/business/v5/ad/query");
+                // 广告族的请求入口：这不是"安全检测"，但同属净化范围。
+                // 只补广告类，不碰其它网络请求（一刀切会误伤安装流程）。
+                // 路径以实际反编译源码为准；点/曝光没有固定路径（URL 由调用方
+                // 运行期传入），这里只登记类名，不再编造伪路径。
+                put("AdDetailsRequestCall",
+                        "/api/v1/installerapi/business/queryAdvertise");
+                put("AdClickEventRequestCall", "");
+                put("AdExposureEventRequestCall", "");
+                put("AdFilterStrategyRequestCall",
+                        "/api/v1/installerapi/business/queryFilterPolicy");
+                put("AdUnshownReportCall",
+                        "/api/installer/business/v4/ad/reportUnshown");
                 put("SecurityStrategyCall",
                         "/api/installer/config/v1/offlinepolicy/query");
                 put("HighRiskListRequestCall",
@@ -2254,7 +2293,7 @@ public final class InstallerHook {
         }
     }
 
-    /** 安全检测 / 高风险名单的 URL 锚：覆盖 14.0.22.x 老路径与新路径。 */
+    /** 安全检测 / 高风险名单 / 广告查询的 URL 锚：覆盖老路径与改名后的类。 */
     private static boolean securityAnchor(String url) {
         if (url == null) return false;
         String u = url.toLowerCase(Locale.US);
@@ -2264,6 +2303,12 @@ public final class InstallerHook {
                 || u.contains("/nodetect")
                 || u.contains("/tencent")
                 || u.contains("/offlinelist")
+                // 广告查询（AdDetails 系列）；只认这几条明确路径，不扩大成整类广告流量。
+                || u.contains("/queryadvertisement")
+                // 新一代安装器的广告/策略路径（类名会被 OTA 改掉，锚兜住）。
+                || u.contains("/business/queryadvertise")
+                || u.contains("/business/queryfilterpolicy")
+                || u.contains("/ad/reportunshown")
                 || u.contains("/api/installer/detect/");
     }
 
@@ -2290,8 +2335,9 @@ public final class InstallerHook {
                                 "buildResultForCallFailed", -1001,
                                 "blocked by HonorAdvancedSettings purify");
                         param.setResult(failed);
-                        Diag.log("[net] request blocked: " + url + " via " + cn
-                                + " (" + ver() + ")");
+                        Diag.log("[net] request blocked: "
+                                + (url == null || url.length() == 0 ? "(url unavailable)" : url)
+                                + " via " + cn + " (" + ver() + ")");
                     } catch (Throwable t) {
                         Diag.log("[net] request block failed for " + url + ": " + t);
                     }
