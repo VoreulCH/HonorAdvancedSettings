@@ -49,6 +49,15 @@ public final class CfgProvider extends ContentProvider {
      * 软重启不改变 boot_id，只有 epoch 能证明"框架确实换代了"。
      */
     public static final String COL_EPOCH = "epoch";
+    /**
+     * 反诈挂载回执（审核 N-221-11）：awareness 进程没有 sharedUserId，
+     * {@code SystemProperties.set} 大概率被 SELinux 拒；改由本 provider 侧落盘，
+     * UI 从自己的 provider 读。{@code -1} = 本进程没给出结论（老记录 / 子进程扫描
+     * 未完成 / 未跑反诈钩子），按"无回执"处理，绝不当成已生效。
+     */
+    public static final String COL_NF_COUNT = "nfcount";
+    /** 来源腿：semantic / shape / hardcoded / none；空 = 无回执。 */
+    public static final String COL_NF_LEG = "nfleg";
 
     @Override
     public boolean onCreate() {
@@ -202,7 +211,8 @@ public final class CfgProvider extends ContentProvider {
     /** 已上报的作用域（pkg / 模块版本 / 上报时间）。 */
     private Cursor probeCursor() {
         MatrixCursor c = new MatrixCursor(new String[]{
-                COL_PKG, COL_VER, COL_PID, COL_BOOT, COL_START, COL_BEAT, COL_EPOCH},
+                COL_PKG, COL_VER, COL_PID, COL_BOOT, COL_START, COL_BEAT, COL_EPOCH,
+                COL_NF_COUNT, COL_NF_LEG},
                 Cfg.SCOPES.length);
         Context ctx = getContext();
         if (ctx == null) {
@@ -220,8 +230,23 @@ public final class CfgProvider extends ContentProvider {
             long start = 0L;
             long beat = 0L;
             String epoch = "";
+            // 反诈回执：-1 = 老记录没这两列 / 解析失败 = 无回执，不许默认成 0 或 1。
+            int nfCount = -1;
+            String nfLeg = "";
             String[] parts = raw.split("\\|", -1);
-            if (parts.length >= 6) {
+            if (parts.length >= 8) {
+                try { ver = Integer.parseInt(parts[0]); } catch (Throwable ignored) {}
+                try { pid = Integer.parseInt(parts[1]); } catch (Throwable ignored) {}
+                boot = parts[2] == null ? "" : parts[2];
+                try { start = Long.parseLong(parts[3]); } catch (Throwable ignored) {}
+                try { beat = Long.parseLong(parts[4]); } catch (Throwable ignored) {}
+                epoch = parts[5] == null ? "" : parts[5].trim();
+                try {
+                    int v = Integer.parseInt(parts[6]);
+                    if (v >= 0 && v <= 64) nfCount = v;
+                } catch (Throwable ignored) {}
+                nfLeg = parts[7] == null ? "" : parts[7].trim();
+            } else if (parts.length >= 6) {
                 try { ver = Integer.parseInt(parts[0]); } catch (Throwable ignored) {}
                 try { pid = Integer.parseInt(parts[1]); } catch (Throwable ignored) {}
                 boot = parts[2] == null ? "" : parts[2];
@@ -240,7 +265,7 @@ public final class CfgProvider extends ContentProvider {
                 try { ver = Integer.parseInt(parts[0]); } catch (Throwable ignored) {}
                 try { beat = Long.parseLong(parts[1]); } catch (Throwable ignored) {}
             }
-            c.addRow(new Object[]{pkg, ver, pid, boot, start, beat, epoch});
+            c.addRow(new Object[]{pkg, ver, pid, boot, start, beat, epoch, nfCount, nfLeg});
         }
         return c;
     }
@@ -394,14 +419,71 @@ public final class CfgProvider extends ContentProvider {
         }
         // epoch 只允许 pid:startAt:time 这类字符，别把任意文本写进 prefs。
         epoch = epoch.replaceAll("[^0-9A-Za-z:_-]", "");
+        // 反诈挂载回执（N-221-11 / N-221-16）：带字段就按字段落盘
+        // （-1 = 无回执，必须能把旧值清掉）；不带字段（心跳 / 未跑反诈钩子的
+        // 作用域）才考虑继承，且必须 pid + boot + start 三项与上一条完全一致。
+        // 任何一项不同 = 另一个进程或另一次开机，旧计数绝不能盖到本次记录上。
+        Integer nfV = values.getAsInteger(COL_NF_COUNT);
+        String nfLegV = values.getAsString(COL_NF_LEG);
+        SharedPreferences probePrefs =
+                ctx.getSharedPreferences(PREFS_PROBE, Context.MODE_PRIVATE);
+        String prev = probePrefs.getString(pkg, null);
+        int nf = -1;
+        String nfLeg = "";
+        if (nfV != null) {
+            if (nfV >= 0 && nfV <= 64) {
+                nf = nfV;
+            }
+            nfLeg = isNofraudLeg(nfLegV) ? nfLegV : "";
+        } else if (prev != null) {
+            String[] p = prev.split("\\|", -1);
+            if (p.length >= 8) {
+                int prevPid = 0;
+                long prevStart = 0L;
+                try {
+                    prevPid = Integer.parseInt(p[1]);
+                } catch (Throwable ignored) {
+                }
+                try {
+                    prevStart = Long.parseLong(p[3]);
+                } catch (Throwable ignored) {
+                }
+                String prevBoot = p[2] == null ? "" : p[2];
+                // 继承还要求本次进程启动时刻可读（start > 0）：0 是"没取到"，
+                // 两条都 0 会让不同进程误判成同一条身份。
+                if (start > 0 && prevPid == pid && prevBoot.equals(boot)
+                        && prevStart == start) {
+                    try {
+                        int v = Integer.parseInt(p[6]);
+                        if (v >= 0 && v <= 64) {
+                            nf = v;
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    String leg = p[7] == null ? "" : p[7].trim();
+                    nfLeg = isNofraudLeg(leg) ? leg : "";
+                }
+            }
+        }
+        // 半截组合（N-221-23）：没有挂载数就不许留来源腿，
+        // 否则会生成 count=-1、leg=semantic 这种自相矛盾的回执。
+        if (nf < 0) {
+            nfLeg = "";
+        }
         // 心跳时间用服务端时间，不信任客户端传来的 beat。
         long now = System.currentTimeMillis();
-        String rec = ver + "|" + pid + "|" + boot + "|" + start + "|" + now + "|" + epoch;
-        boolean ok = ctx.getSharedPreferences(PREFS_PROBE, Context.MODE_PRIVATE)
-                .edit()
+        String rec = ver + "|" + pid + "|" + boot + "|" + start + "|" + now + "|" + epoch
+                + "|" + nf + "|" + nfLeg;
+        boolean ok = probePrefs.edit()
                 .putString(pkg, rec)
                 .commit();
         return ok ? uri : null;
+    }
+
+    /** 来源腿只认这四种，其余一律当"无回执"，避免任意文本落盘后被 UI 当证据。 */
+    private static boolean isNofraudLeg(String v) {
+        return "semantic".equals(v) || "shape".equals(v)
+                || "hardcoded".equals(v) || "none".equals(v);
     }
 
     /**
