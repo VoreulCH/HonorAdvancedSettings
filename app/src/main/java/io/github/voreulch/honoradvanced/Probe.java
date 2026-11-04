@@ -56,7 +56,62 @@ public final class Probe {
     private Probe() {
     }
 
+    /**
+     * 已知共享进程表：包名 -> 实际进程名。
+     *
+     * <p>有的包不跑在自己的同名进程里（荣耀性能服务与智能调度共用 iaware 进程），
+     * 这类宿主必须放行，否则会被误判成"子进程"而永久不上报，首页由绿变红。
+     * 只登记已确认的一对；`pkg:sub` 形式一律不放行。
+     */
+    private static final java.util.Map<String, String> SHARED_PROCESS =
+            new java.util.HashMap<>();
+
+    static {
+        SHARED_PROCESS.put("com.hihonor.powergenie", "com.hihonor.iaware");
+    }
+
+    private static boolean reportableInThisProcess(String pkg, String proc) {
+        if (pkg.equals(proc)) return true;
+        String shared = SHARED_PROCESS.get(pkg);
+        return shared != null && shared.equals(proc);
+    }
+
+    /**
+     * 当前进程名。优先 {@code Application.getProcessName()}（minSdk 33 恒可用），
+     * 退化读 /proc/self/cmdline；都失败返回 ""，由调用方 fail-open ——
+     * 读不到进程名不能把所有宿主一起静默。
+     */
+    private static String currentProcessName() {
+        try {
+            String s = android.app.Application.getProcessName();
+            if (s != null && s.length() > 0) return s;
+        } catch (Throwable ignored) {
+        }
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(
+                        new java.io.FileInputStream("/proc/self/cmdline")))) {
+            String s = r.readLine();
+            if (s != null) {
+                int nul = s.indexOf('\0');
+                return nul >= 0 ? s.substring(0, nul) : s;
+            }
+        } catch (Throwable t) {
+            // 落到下面的 fail-open
+        }
+        return "";
+    }
+
     public static void report(final String pkg) {
+        // 主键只由主进程写（N-221-22 / N-221-24）：同包名的 `pkg:sub` 子进程
+        // 若也写 pkg 键，会每 60 秒覆盖一次主进程的回执，界面只能在
+        // 绿/红/无法判断之间跳。共享进程按 SHARED_PROCESS 表放行。
+        String proc = currentProcessName();
+        if (proc.length() == 0) {
+            // N-221-25：读不到进程名时放行一次（fail-open），并留下可见日志。
+            Diag.note("probe: cmdline unavailable, fail-open");
+        } else if (!reportableInThisProcess(pkg, proc)) {
+            return;
+        }
         final String key = pkg + "#" + android.os.Process.myPid();
         synchronized (sQueued) {
             if (!sQueued.add(key)) {
@@ -238,6 +293,14 @@ public final class Probe {
         if (startAt > 0) v.put(CfgProvider.COL_START, startAt);
         v.put(CfgProvider.COL_BEAT, System.currentTimeMillis());
         v.put(CfgProvider.COL_EPOCH, frameworkEpoch());
+        // 反诈挂载回执（审核 N-221-11）：awareness 进程写不了系统属性，
+        // 改走这条已验证可用的自证通道。没跑反诈钩子的作用域不带这两个字段，
+        // provider 会保留上一条记录的值，不会被心跳抹掉。
+        int nf = MiscHook.nofraudMount();
+        if (nf >= 0) {
+            v.put(CfgProvider.COL_NF_COUNT, nf);
+            v.put(CfgProvider.COL_NF_LEG, MiscHook.nofraudLeg());
+        }
         Uri r = c.getContentResolver().insert(CfgProvider.URI_PROBE, v);
         return r != null;
     }
