@@ -255,7 +255,9 @@ public final class MiscHook {
             int nFraud = 0;
             java.util.Set<String> seen = new java.util.HashSet<String>();
             java.util.List<java.lang.reflect.Method> fraudCandidates = new java.util.ArrayList<>();
-            int fraudDynamic = 0;
+            // 动态腿单独留一份：后面的日志只报"动态扫出来的那几个"，
+            // 不能把硬编码兜底混进来冒充动态命中。
+            java.util.List<java.lang.reflect.Method> dynamicList = new java.util.ArrayList<>();
             // DexKit 只试一次：46MB APK 不能每次 handleLoadPackage 重解析。
             // 只扫描反诈 Fraud Processor，不再扫描/挂载 Subject。
             if (!sAwarenessDexTried) {
@@ -274,22 +276,20 @@ public final class MiscHook {
                                     + "StandardEventDataOffFraudBehaviorProcessor");
                     boolean canPojo = DexKitHelper.hasClassExact(baseApk,
                             "com.hihonor.awareness.server.aisecurity.opencapacity.data.FraudAppUsageData");
-                    boolean canBase = DexKitHelper.hasClassExact(baseApk, "baseplugin.ej.f");
+                    // 不再用某个具体基类当 canary：基类全名本身就会随 OTA 变，
+                    // 把它打进日志只会让人误以为"基类没了 = 锚点没了"。
                     Diag.note("DexKit canary: dexNum=" + dexNum
-                            + " processor=" + canProcessor + " fraudPojo=" + canPojo
-                            + " base=" + canBase);
+                            + " processor=" + canProcessor + " fraudPojo=" + canPojo);
                     if (dexNum == 1) {
                         Diag.note("warn: DexKit 只索引 1 个 dex，动态扫描会漏 classes2+；硬编码兜底");
                     }
                     fraudCandidates.addAll(findProcessorMethods(apkPaths, cl, "Fraud"));
-                    fraudDynamic = fraudCandidates.size();
+                    dynamicList.addAll(fraudCandidates);
                     long cost = android.os.SystemClock.elapsedRealtime() - t0;
-                    if (fraudDynamic == 0 || cost > 5000L) {
-                        Diag.note("warn: DexKit 动态扫描 fraud=" + fraudDynamic
-                                + " cost=" + cost + "ms，降级为硬编码 Processor");
-                    } else {
-                        Diag.note("DexKit 动态候选: fraud=" + fraudDynamic
-                                + " / " + cost + "ms");
+                    // 命中/零命中的结论由 findProcessorMethods 记录、在挂载完成后
+                    // 统一输出，这里只留一条耗时告警，避免同一结论吐两遍。
+                    if (cost > 5000L) {
+                        Diag.note("warn: DexKit fraud scan cost=" + cost + "ms");
                     }
                 }
             }
@@ -297,16 +297,83 @@ public final class MiscHook {
             fraudCandidates.addAll(loadProcessorMethods(cl, AWARENESS_FRAUD_PROCESSORS));
             nFraud = hookAwarenessList(fraudCandidates, Cfg.K_NOFRAUD, seen, "fraud");
             sAwarenessDone = nFraud > 0;
-            Diag.note("nofraud: fraud " + nFraud
-                    + "（动态候选 fraud=" + fraudDynamic + "）"
-                    + (sAwarenessDone ? "" : " ⚠ 一个都没命中，锚点可能随 OTA 失效"));
+            // 计算来源腿（供自证日志与回执共用）。
+            String leg = nFraud <= 0 ? "none"
+                    : sFraudScanLeg == LEG_SEMANTIC ? "semantic"
+                    : sFraudScanLeg == LEG_SHAPE ? "shape"
+                    : "hardcoded";
+            // 自证（N-221-26）：主/子进程各打一行，实机可直接确认主进程挂载数。
+            Diag.note("nofraud: proc=" + currentProcessName() + " count=" + nFraud
+                    + " leg=" + leg);
+            // 结论日志：成功与否只看 nFraud（sAwarenessDone 同源），零命中绝不置绿。
+            if (nFraud == 0) {
+                // 形状腿"有候选但证据过滤后为 0"已经单独记过，不再重复。
+                if (sFraudScanLeg != LEG_SHAPE_FILTERED) {
+                    Diag.note("nofraud: no processor found");
+                }
+            } else if (sFraudScanLeg == LEG_SEMANTIC) {
+                Diag.note("nofraud: semantic hooked=" + classNames(dynamicList));
+            } else if (sFraudScanLeg == LEG_SHAPE) {
+                Diag.note("nofraud: shape-only fallback, hooked=" + classNames(dynamicList)
+                        + " (语义腿零命中)");
+            }
+            // 挂载回执（审核 N-221-09 / N-221-11 / N-221-13）：
+            // - 子进程只在真挂上时才写，**永不写 0**；
+            // - 主进程扫描正常走完才写（含 0）；异常路径进 catch，不落值，
+            //   保持 -1（未知），避免"扫一半失败"被当成"确实没有反诈类"。
+            // - 属性 persist.sys.has.nofraud 是排障记录，UI 判色不读它。
+            boolean mainProc = "com.hihonor.awareness".equals(currentProcessName());
+            if (nFraud > 0 || mainProc) {
+                sNofraudMount = nFraud;
+                sNofraudLeg = leg;
+                writeNofraudReceipt(nFraud, leg);
+            }
         } catch (Throwable t) {
             Diag.note("skip: nofraud awareness hook 失败 ("
                     + t.getClass().getSimpleName() + ")");
         }
     }
 
+    /**
+     * 写挂载回执：{@code persist.sys.has.nofraud=<versionCode>|<挂载数>|<来源腿>}。
+     * 来源腿取值：semantic / shape / hardcoded / none。写后回读，不一致就记日志。
+     */
+    private static void writeNofraudReceipt(int count, String leg) {
+        String val = BuildConfig.VERSION_CODE + "|" + count + "|" + leg;
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            java.lang.reflect.Method set = sp.getMethod("set", String.class, String.class);
+            set.invoke(null, "persist.sys.has.nofraud", val);
+            Object back = sp.getMethod("get", String.class, String.class)
+                    .invoke(null, "persist.sys.has.nofraud", "");
+            String got = back == null ? "" : String.valueOf(back).trim();
+            if (!val.equals(got)) {
+                Diag.note("warn: nofraud receipt readback mismatch expected="
+                        + val + " got=" + got);
+            }
+        } catch (Throwable t) {
+            Diag.note("warn: nofraud receipt write failed ("
+                    + t.getClass().getSimpleName() + ")");
+        }
+    }
+
     private static volatile boolean sAwarenessDone = false;
+    /**
+     * 本进程反诈挂载回执：{@code -1} = 还没跑完 / 扫描异常中断 / 本进程不跑反诈钩子。
+     * 由 {@link Probe} 随自证上报带给 provider，设置页从 provider 读。
+     */
+    private static volatile int sNofraudMount = -1;
+    private static volatile String sNofraudLeg = "";
+
+    /** 反诈挂载数；{@code -1} = 无结论（无回执）。 */
+    public static int nofraudMount() {
+        return sNofraudMount;
+    }
+
+    /** 反诈来源腿：semantic / shape / hardcoded / none；空 = 无回执。 */
+    public static String nofraudLeg() {
+        return sNofraudLeg;
+    }
     /** DexKit 在 awareness 的 46MB dex 上只尝试一次（见 initAwareness 里的说明）。 */
     private static volatile boolean sAwarenessDexTried = false;
     private static volatile int sAwarenessHitLog = 0;
@@ -322,47 +389,222 @@ public final class MiscHook {
     };
 
     /**
-     * 动态发现 Processor。Contains("Fraud") 只负责圈类，
-     * 真正的过滤条件在这里：
-     *   1) 不是 face 相关类；
-     *   2) 继承 {@code baseplugin.ej.f}（如果基类能加载）；
-     *   3) 只收 {@code insert(...)} 方法（POJO 的 getter/setter 全部排除）。
+     * 两套上限，分别生效：语义腿命中几个挂几个（16 足够覆盖反诈类后续拆分）；
+     * 形状腿是"猜"，最多 2 个。
+     *
+     * <p>同形状（{@code insert(IStandardEventData)} 返回 boolean）的类，processor/impl
+     * 下实测 10 个：2 个反诈 + 通话/短信/应用行为等 8 个正常写入。
+     */
+    private static final int MAX_SEMANTIC_CANDIDATES = 16;
+    private static final int MAX_SHAPE_FALLBACK = 2;
+    /** 本轮动态扫描实际用了哪条腿。结论日志在挂载完成后统一输出。 */
+    private static final int LEG_NONE = 0;
+    private static final int LEG_SEMANTIC = 1;
+    private static final int LEG_SHAPE = 2;
+    /** 形状腿有候选，但反诈证据过滤后为 0（只记日志，不挂）。 */
+    private static final int LEG_SHAPE_FILTERED = 3;
+    private static volatile int sFraudScanLeg = LEG_NONE;
+    /** 事件数据接口（稳定业务类型，不是混淆类名）。 */
+    private static final String AWARENESS_EVENT_DATA =
+            "com.hihonor.awareness.dataplatform.data.IStandardEventData";
+
+    /**
+     * 动态发现"事件数据写入"入口，**不依赖任何基类全名**。
+     *
+     * <p>判据是两条彼此独立的腿，汇入同一个候选池：
+     * <ol>
+     *   <li><b>语义腿</b>：类名（含祖先/接口链）带 {@code Fraud}；</li>
+     *   <li><b>形状腿</b>：dex 里任意 {@code insert(IStandardEventData)} 且返回
+     *       {@code boolean} 的方法 —— 不要求继承谁。</li>
+     * </ol>
+     *
+     * <p>准入只看"方法形状 + 反诈证据"，基类只作为排序加分（{@link #hasOwnBaseAncestor}），
+     * 不参与准入，也不出现任何具体基类名 —— 同一对 Processor 在不同版本里继承的
+     * 插件基类包名并不相同，下一代还会再换；把基类当必要条件，动态扫描必然在 OTA 后哑火。
+     *
+     * <p>形状腿单独启用时，候选还必须再有一条反诈证据：类名/祖先/接口链含 {@code Fraud}，
+     * <b>或</b>类内有方法引用 {@code FraudBehaviorEventSet} / {@code ofFraudBehaviorEventSet}。
+     * 同形状的 processor/impl 类实测 10 个，其中 2 个反诈、8 个是通话/短信/应用行为等
+     * 正常写入；没有证据一律不挂 —— 宁可漏拦，不能误拦。
+     *
+     * <p>取用规则：语义腿有命中就只挂语义腿（{@code K_NOFRAUD} 的语义是"只关反诈"）；
+     * 语义腿全灭才启用形状腿，且最多 2 个。两套上限独立。
      */
     private static java.util.List<java.lang.reflect.Method> findProcessorMethods(
             String[] apks, ClassLoader cl, String keyword) {
-        java.util.List<java.lang.reflect.Method> out = new java.util.ArrayList<>();
-        java.util.Set<String> seen = new java.util.HashSet<>();
-        Class<?> base = null;
-        try { base = cl.loadClass("baseplugin.ej.f"); } catch (Throwable ignored) { }
-        // 基类加载不到时直接放弃动态扫描，只走硬编码；
-        // 不再退化成"只看 insert 名字"的宽松匹配，避免 OTA 改名后误收 POJO。
-        if (base == null) return out;
+        java.util.LinkedHashMap<String, Cand> pool = new java.util.LinkedHashMap<>();
+        java.util.HashSet<String> fraudStringClasses = new java.util.HashSet<>();
         for (String ap : apks) {
+            // 反诈证据：类内有方法引用反诈表名。分两次查，避免 DexKit 的
+            // usingStrings 多值时按 AND 匹配，把 "ofFraud..." 这类写法漏掉。
+            try {
+                fraudStringClasses.addAll(
+                        DexKitHelper.findClassesUsingStrings(ap, "FraudBehaviorEventSet"));
+            } catch (Throwable ignored) {
+            }
+            try {
+                fraudStringClasses.addAll(
+                        DexKitHelper.findClassesUsingStrings(ap, "ofFraudBehaviorEventSet"));
+            } catch (Throwable ignored) {
+            }
+            // 腿 1：类名语义（含祖先链由 Cand 再判定）
             try {
                 for (Class<?> c : DexKitHelper.findClassesByNameContains(ap, cl, keyword)) {
-                    if (c.getName().toLowerCase(java.util.Locale.US).contains("face")) {
-                        continue;
-                    }
-                    if (!base.isAssignableFrom(c)) {
-                        continue;
-                    }
+                    if (c == null) continue;
                     for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
-                        if (m == null || !"insert".equals(m.getName())
-                                || m.getParameterTypes().length != 1) {
-                            continue;
-                        }
-                        if (!"com.hihonor.awareness.dataplatform.data.IStandardEventData"
-                                .equals(m.getParameterTypes()[0].getName())) {
-                            continue;
-                        }
-                        String k = c.getName() + "#insert/" + m.getParameterTypes()[0].getName();
-                        if (seen.add(k)) out.add(m);
+                        addCandidate(pool, m, fraudStringClasses);
                     }
                 }
             } catch (Throwable ignored) {
             }
+            // 腿 2：方法形状（与基类无关）
+            try {
+                for (java.lang.reflect.Method m : DexKitHelper.findMethodsByShape(
+                        ap, cl, "insert", AWARENESS_EVENT_DATA, "boolean")) {
+                    addCandidate(pool, m, fraudStringClasses);
+                }
+            } catch (Throwable ignored) {
+            }
         }
+        java.util.ArrayList<Cand> semantic = new java.util.ArrayList<>();
+        java.util.ArrayList<Cand> shape = new java.util.ArrayList<>();
+        for (Cand c : pool.values()) {
+            if (c.fraudText) semantic.add(c);
+            // 形状腿的证据闸门：类名 Fraud 或 类内引用反诈表名，二选一。
+            if (c.fraudText || c.fraudString) shape.add(c);
+        }
+        java.util.List<Cand> take;
+        int limit;
+        if (!semantic.isEmpty()) {
+            take = semantic;
+            limit = MAX_SEMANTIC_CANDIDATES;
+            sFraudScanLeg = LEG_SEMANTIC;
+        } else if (!pool.isEmpty() && shape.isEmpty()) {
+            sFraudScanLeg = LEG_SHAPE_FILTERED;
+            Diag.note("nofraud: shape-only fallback filtered to zero");
+            return new java.util.ArrayList<>();
+        } else if (shape.isEmpty()) {
+            sFraudScanLeg = LEG_NONE;
+            return new java.util.ArrayList<>();
+        } else {
+            take = shape;
+            limit = MAX_SHAPE_FALLBACK;
+            sFraudScanLeg = LEG_SHAPE;
+        }
+        java.util.Collections.sort(take, CAND_ORDER);
+        int n = Math.min(take.size(), limit);
+        java.util.List<java.lang.reflect.Method> out = new java.util.ArrayList<>(n);
+        for (int i = 0; i < n; i++) out.add(take.get(i).m);
         return out;
+    }
+
+    /** 日志用类名列表，最多 8 个。 */
+    private static String classNames(java.util.List<java.lang.reflect.Method> ms) {
+        int n = Math.min(ms.size(), 8);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(ms.get(i).getDeclaringClass().getSimpleName());
+        }
+        if (ms.size() > n) sb.append(", ...");
+        return sb.toString();
+    }
+
+    private static void addCandidate(java.util.Map<String, Cand> pool,
+                                     java.lang.reflect.Method m,
+                                     java.util.Set<String> fraudStringClasses) {
+        try {
+            if (m == null || !"insert".equals(m.getName())) return;
+            Class<?> c = m.getDeclaringClass();
+            if (c == null || c.getName().contains("$")) return;
+            // 人脸活体/深伪是安全防线，永远不碰（大小写都算）
+            if (c.getName().toLowerCase(java.util.Locale.US).contains("face")) return;
+            Class<?>[] ps = m.getParameterTypes();
+            if (ps.length != 1 || !AWARENESS_EVENT_DATA.equals(ps[0].getName())) return;
+            if (m.getReturnType() != boolean.class) return;
+            if (pool.containsKey(c.getName())) return;
+            pool.put(c.getName(), new Cand(m, fraudStringClasses.contains(c.getName())));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 候选及其排序权重。 */
+    private static final class Cand {
+        final java.lang.reflect.Method m;
+        final Class<?> cls;
+        /** 类名/祖先/接口链含 Fraud。 */
+        final boolean fraudText;
+        /** 类内有方法引用反诈表名（FraudBehaviorEventSet / ofFraudBehaviorEventSet）。 */
+        final boolean fraudString;
+        final boolean ownBase;
+        final int depth;
+
+        Cand(java.lang.reflect.Method m, boolean fraudStringUsage) {
+            this.m = m;
+            this.cls = m.getDeclaringClass();
+            this.fraudText = hasFraudSemantics(cls);
+            this.fraudString = fraudStringUsage;
+            this.ownBase = hasOwnBaseAncestor(cls);
+            this.depth = classDepth(cls);
+        }
+    }
+
+    private static final java.util.Comparator<Cand> CAND_ORDER =
+            new java.util.Comparator<Cand>() {
+                @Override
+                public int compare(Cand a, Cand b) {
+                    if (a.fraudText != b.fraudText) return a.fraudText ? -1 : 1;
+                    if (a.ownBase != b.ownBase) return a.ownBase ? -1 : 1;
+                    if (a.depth != b.depth) return b.depth - a.depth;
+                    return a.cls.getName().compareTo(b.cls.getName());
+                }
+            };
+
+    /** 类名或祖先/接口链上出现 Fraud 语义。 */
+    private static boolean hasFraudSemantics(Class<?> cls) {
+        java.util.ArrayDeque<Class<?>> q = new java.util.ArrayDeque<>();
+        java.util.HashSet<Class<?>> seen = new java.util.HashSet<>();
+        if (cls != null) q.add(cls);
+        while (!q.isEmpty() && seen.size() < 64) {
+            Class<?> c = q.poll();
+            if (c == null || c == Object.class || !seen.add(c)) continue;
+            if (c.getName().toLowerCase(java.util.Locale.US).contains("fraud")) return true;
+            Class<?> s = c.getSuperclass();
+            if (s != null) q.add(s);
+            for (Class<?> i : c.getInterfaces()) {
+                if (i != null) q.add(i);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 排序加分：继承链上有"应用自有基类"（非 android/java/kotlin 框架类）。
+     * 只加分，不参与准入；这样不同版本里换了包名的插件基类都会得分，
+     * 下一代换成任何新包名也照样得分，又不需要出现任何具体基类名。
+     */
+    private static boolean hasOwnBaseAncestor(Class<?> cls) {
+        Class<?> s = cls == null ? null : cls.getSuperclass();
+        int guard = 0;
+        while (s != null && s != Object.class && guard++ < 64) {
+            String n = s.getName();
+            if (!n.startsWith("android.") && !n.startsWith("java.")
+                    && !n.startsWith("javax.") && !n.startsWith("kotlin.")) {
+                return true;
+            }
+            s = s.getSuperclass();
+        }
+        return false;
+    }
+
+    private static int classDepth(Class<?> cls) {
+        int d = 0;
+        Class<?> s = cls == null ? null : cls.getSuperclass();
+        while (s != null && s != Object.class && d < 64) {
+            d++;
+            s = s.getSuperclass();
+        }
+        return d;
     }
 
     /** 硬编码 Processor 清单：只取 insert(...) 形状，POJO 不会进来。 */
