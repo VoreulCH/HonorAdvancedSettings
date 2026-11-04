@@ -173,8 +173,7 @@ public final class DexKitHelper {
      * 里，所以按字符串扫一定是 0 命中。
      *
      * <p>按类名 Contains 匹配：只要 OTA 后业务类名还带 {@code Fraud}/{@code Subject}
-     * 字样就能命中。结果必须再由调用方校验“继承 baseplugin.ej.f + insert 形状”，
-     * 不能直接 hook 所有 POJO。
+     * 字样就能命中。结果必须再由调用方校验"insert 形状"，不能直接 hook 所有 POJO。
      */
     public static java.util.List<Class<?>> findClassesByNameContains(
             String apkPath, ClassLoader cl, String keyword) {
@@ -186,7 +185,7 @@ public final class DexKitHelper {
                     .matcher(org.luckypray.dexkit.query.matchers.ClassMatcher.create()
                             // SimilarRegex 只支持 ^ / $ 锚点，传 ".*[Ff]raud.*"
                             // 仍会 0 命中。这里只用 Contains 查关键字 "Fraud"/"Subject"，
-                            // 结果再由调用方做“继承 baseplugin.ej.f + insert 形状”双重校验。
+                            // 结果再由调用方做"insert 形状"校验。
                             .className(keyword,
                                     org.luckypray.dexkit.query.enums.StringMatchType.Contains));
             java.util.List<org.luckypray.dexkit.result.ClassData> list = b.findClass(query);
@@ -204,6 +203,101 @@ public final class DexKitHelper {
             }
         } catch (Throwable t) {
             Diag.err("DexKit findClassesByNameContains failed", t);
+        }
+        return out;
+    }
+
+    /**
+     * 按**方法形状**找方法：方法名 + 单参数类型 + 返回类型，全部在 dex 元数据上过滤。
+     *
+     * <p>为什么不依赖基类：目标应用的插件基类包名会随 OTA 变（同一对 Processor
+     * 在不同版本里继承的基类包名并不相同）。只要"事件写入"这个业务形状还在，
+     * 锚点就不该失效。
+     *
+     * <p>先读 {@code MethodData} 的形参/返回类型名再 {@code getMethodInstance}，
+     * 避免为大量无关 {@code insert} 触发 ClassLoader 加载。
+     */
+    public static java.util.List<java.lang.reflect.Method> findMethodsByShape(
+            String apkPath, ClassLoader cl, String methodName,
+            String paramTypeName, String returnTypeName) {
+        java.util.List<java.lang.reflect.Method> out = new java.util.ArrayList<>();
+        org.luckypray.dexkit.DexKitBridge b = bridge(apkPath);
+        if (b == null) return out;
+        try {
+            org.luckypray.dexkit.query.FindMethod query =
+                    org.luckypray.dexkit.query.FindMethod.create()
+                            .matcher(org.luckypray.dexkit.query.matchers.MethodMatcher.create()
+                                    .name(methodName));
+            java.util.List<org.luckypray.dexkit.result.MethodData> list = b.findMethod(query);
+            if (list == null) return out;
+            for (org.luckypray.dexkit.result.MethodData md : list) {
+                try {
+                    if (md == null || !methodName.equals(md.getMethodName())) continue;
+                    if (md.getParamCount() != 1) continue;
+                    java.util.List<String> pts = md.getParamTypeNames();
+                    if (pts == null || pts.isEmpty()
+                            || !sameType(pts.get(0), paramTypeName)) continue;
+                    if (!sameType(md.getReturnTypeName(), returnTypeName)) continue;
+                    String cn = md.getDeclaredClassName();
+                    // 内部类与 face 相关类由调用方再校验一次，这里先省掉加载
+                    if (cn == null || cn.indexOf('$') >= 0) continue;
+                    if (cn.toLowerCase(java.util.Locale.US).contains("face")) continue;
+                    java.lang.reflect.Method m = md.getMethodInstance(cl);
+                    if (m == null || m.getParameterTypes().length != 1) continue;
+                    out.add(m);
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable t) {
+            Diag.err("DexKit findMethodsByShape failed", t);
+        }
+        return out;
+    }
+
+    /** DexKit 的类型名可能是点分名，也可能是描述符（{@code Lcom/x/Y;} / {@code Z}）。 */
+    private static boolean sameType(String dexName, String javaName) {
+        if (dexName == null || javaName == null) return false;
+        String a = dexName.trim().replace('/', '.');
+        if (a.length() > 1 && a.charAt(0) == 'L' && a.endsWith(";")) {
+            a = a.substring(1, a.length() - 1);
+        }
+        if (a.equals(javaName)) return true;
+        if ("boolean".equals(javaName)) return "Z".equals(a);
+        if ("int".equals(javaName)) return "I".equals(a);
+        if ("void".equals(javaName)) return "V".equals(a);
+        return false;
+    }
+
+    /**
+     * 找出"类内存在方法引用该字符串"的类（返回点分全名）。
+     *
+     * <p>用途：形状腿的反诈证据。类名被改名时，Processor 构造里仍会传反诈表名
+     * （{@code FraudBehaviorEventSet} / {@code ofFraudBehaviorEventSet}），
+     * 用它证明"这个事件写入类是反诈的"，而不是靠类名猜。
+     */
+    public static java.util.Set<String> findClassesUsingStrings(
+            String apkPath, String str) {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        if (str == null || str.isEmpty()) return out;
+        org.luckypray.dexkit.DexKitBridge b = bridge(apkPath);
+        if (b == null) return out;
+        try {
+            org.luckypray.dexkit.query.FindMethod query =
+                    org.luckypray.dexkit.query.FindMethod.create()
+                            .matcher(org.luckypray.dexkit.query.matchers.MethodMatcher.create()
+                                    .usingStrings(str));
+            java.util.List<org.luckypray.dexkit.result.MethodData> list = b.findMethod(query);
+            if (list == null) return out;
+            for (org.luckypray.dexkit.result.MethodData md : list) {
+                try {
+                    String cn = md.getDeclaredClassName();
+                    if (cn == null || cn.isEmpty()) continue;
+                    out.add(cn.replace('/', '.'));
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable t) {
+            Diag.err("DexKit findClassesUsingStrings failed", t);
         }
         return out;
     }
