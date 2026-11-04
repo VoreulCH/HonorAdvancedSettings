@@ -2678,6 +2678,28 @@ class SettingsActivity : ComponentActivity() {
      */
     @Composable
     private fun SecurityPage(back: () -> Unit) {
+        val probeCtx = LocalContext.current
+        val lifecycleOwner = LocalLifecycleOwner.current
+        // 反诈开关的"无法判断（稍后自动重试）"必须有真实重试（N-221-21）：
+        // 这页原来只有一次性刷新，回执晚到只能退出再进。这里补上和首页同口径的
+        // 前台轮询（恢复期 3 秒、稳定后 30 秒、后台/熄屏停）；FrameworkProbe.state
+        // 只在 SwitchRow 内被读取，重组范围就是反诈那一行及其开关卡，不重建整页。
+        LaunchedEffect(probeCtx, lifecycleOwner) {
+            lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                // 进入这页先给 1 分钟快刷窗口（3 秒一次），之后回落到 30 秒。
+                FrameworkProbe.pokeFast(60_000L)
+                while (true) {
+                    val pm = probeCtx.getSystemService(android.content.Context.POWER_SERVICE)
+                            as? android.os.PowerManager
+                    if (pm == null || pm.isInteractive) {
+                        FrameworkProbe.refresh(probeCtx, true)
+                        FrameworkProbe.refreshProc(probeCtx)
+                    }
+                    val delayMs = if (FrameworkProbe.fastRefreshDue()) 3000L else 30000L
+                    kotlinx.coroutines.delay(delayMs)
+                }
+            }
+        }
         // 清理是独立动作：按目录多选 -> 扫描列清单 -> 备份后删除，并提供恢复入口。
         var showPurgePicker by remember { mutableStateOf(false) }
         // 默认勾选只在数据层定：一级全部默认勾选；二级、三级默认不勾。
@@ -3830,6 +3852,23 @@ class SettingsActivity : ComponentActivity() {
         ""
     }
 
+    /**
+     * 反诈挂载回执（N-221-11 / N-221-17）：**只信 probe 通道**。
+     *
+     * <p>`persist.sys.has.nofraud` 仍会写，但只用于排障，UI 判色不读它：
+     * 属性没有 boot 信息，跨开机的旧值会被当成有效；两套口径也容易互相打架。
+     *
+     * <p>返回 (挂载数, 来源腿)；null = 无法判断（读不到 / 本次开机还没上报）。
+     */
+    private fun nofraudReceipt(scopes: List<String>): Pair<Int, String>? {
+        val st = FrameworkProbe.state
+        if (!st.probed) return null
+        for (p in scopes) {
+            st.nofraud(p)?.let { return it }
+        }
+        return null
+    }
+
     private fun scopeStatusOf(required: List<String>): Pair<String, Boolean>? {
         if (required.isEmpty()) return null
         val st = FrameworkProbe.state
@@ -3859,6 +3898,13 @@ class SettingsActivity : ComponentActivity() {
             // "作用域未生效"，用户会以为要重新配置，白折腾。
             if (miss.all { scopeExpired(it) }) {
                 val names = miss.joinToString("、") { scopeLabel(it) }
+                // 收紧归因（审核第③条）：只有"本次开机有过该包回执 + 主进程在跑 +
+                // 回执已过期"三条同时成立，才说回执未写入、等自动补报。
+                // 主进程没在跑的过期记录仍是"心跳已停"，不要引导用户空等。
+                val mainRunning = miss.all { st.mainProcessRunning(it) == true }
+                if (mainRunning) {
+                    return "作用域状态：${names} 主进程在运行，但模块回执未写入（本次开机有过上报且已超过 5 分钟；回到本应用后最多等 1 分钟会自动补报）" to false
+                }
                 return "作用域状态：${names} 的记录已超过 5 分钟未刷新（心跳已停，重启作用域即可更新，不一定是故障）" to true
             }
             val names = miss.joinToString("、") { pkg ->
@@ -3912,10 +3958,33 @@ class SettingsActivity : ComponentActivity() {
         Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(r.title, fontSize = 16.sp, color = MiuixTheme.colorScheme.onSurface)
-                scopeStatusOf(r.scopes)?.let { (text, ok) ->
-                    Text(text, fontSize = 12.sp,
-                        color = if (ok) MiuixTheme.colorScheme.primary else WarnColor,
-                        modifier = Modifier.padding(top = 2.dp))
+                val info = scopeStatusOf(r.scopes)
+                // 反诈开关的判色顺序（N-221-10 / N-221-18）：
+                // 1) 已勾选 → **无条件先读挂载回执**（只信 probe，主进程 pid 过滤）；
+                // 2) 回执缺失 → 中性灰"无法判断（稍后自动重试）"，不永久红；
+                // 3) 挂载数 0 → 红字"本版本未找到反诈写入类，拦截未生效"；
+                // 4) 只有挂载数 >0 才进入原来的黄色/绿色分支。
+                if (r.key == Cfg.K_NOFRAUD && checked) {
+                    val nf = nofraudReceipt(r.scopes)
+                    when {
+                        nf == null -> Text("无法判断（稍后自动重试）", fontSize = 12.sp,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            modifier = Modifier.padding(top = 2.dp))
+                        nf.first == 0 -> Text("本版本未找到反诈写入类，拦截未生效",
+                            fontSize = 12.sp, color = WarnColor,
+                            modifier = Modifier.padding(top = 2.dp))
+                        else -> info?.let { (text, ok) ->
+                            Text(text, fontSize = 12.sp,
+                                color = if (ok) MiuixTheme.colorScheme.primary else WarnColor,
+                                modifier = Modifier.padding(top = 2.dp))
+                        }
+                    }
+                } else {
+                    info?.let { (text, ok) ->
+                        Text(text, fontSize = 12.sp,
+                            color = if (ok) MiuixTheme.colorScheme.primary else WarnColor,
+                            modifier = Modifier.padding(top = 2.dp))
+                    }
                 }
                 r.statusText?.let { s ->
                     Text(s, fontSize = 12.sp,
