@@ -22,7 +22,14 @@ data class ScopeReport(
     /** 上报时的框架代次（system_server 每次加载模块生成；软重启后必须变化）。 */
     val epoch: String,
     /** 最近一次心跳时间（System.currentTimeMillis）。 */
-    val at: Long
+    val at: Long,
+    /**
+     * 反诈挂载数（审核 N-221-11）。provider 侧写入，不依赖系统属性。
+     * `-1` = 本进程没给出结论（老记录 / 未跑反诈钩子 / 扫描异常）→ 按"无回执"处理。
+     */
+    val nofraudCount: Int = -1,
+    /** 反诈来源腿：semantic / shape / hardcoded / none；空 = 无回执。 */
+    val nofraudLeg: String = ""
 )
 
 /**
@@ -177,6 +184,13 @@ data class ModuleState(
     /** 该包的进程当前是否存在（null 进程表 = 不知道）。 */
     fun pkgRunning(pkg: String): Boolean? = proc?.hasProcess(pkg)
 
+    /**
+     * 该包**主进程**当前是否在跑（精确等于包名，不含 `pkg:sub` 子进程）。
+     * null = 读不到进程表。
+     */
+    fun mainProcessRunning(pkg: String): Boolean? =
+        proc?.byName?.get(pkg)?.isNotEmpty()
+
     /** 记录里的心跳距今多少毫秒；没有记录 / 时间无效 = null。 */
     fun beatAgeMs(pkg: String): Long? {
         val r = reports[pkg] ?: return null
@@ -216,6 +230,27 @@ data class ModuleState(
     fun stale(pkg: String): Boolean {
         val r = reports[pkg] ?: return false
         return r.bootId == currentBootId() && r.ver in 1 until BuildConfig.VERSION_CODE
+    }
+
+    /**
+     * 反诈挂载回执（N-221-11 / N-221-19）：返回 (挂载数, 来源腿)。
+     *
+     * <p>只认**本次开机 + 主进程 pid** 的记录：awareness 的子进程也会写同一个
+     * pkg 键，若采纳子进程的记录，主进程写 0、子进程写 2 会让开关红绿乱跳。
+     * 过滤只复用 `pid` 列，不另造 pkg#pid 键。
+     *
+     * <p>`nofraudCount = -1`（老记录缺列 / 本进程无结论）与进程表读不到都返回
+     * null = 无法判断，绝不默认成 0 或 1。
+     */
+    fun nofraud(pkg: String): Pair<Int, String>? {
+        val r = reports[pkg] ?: return null
+        if (r.nofraudCount < 0) return null
+        val boot = currentBootId()
+        if (boot.isEmpty() || r.bootId != boot) return null
+        // 主进程 = 进程名精确等于包名的那一组；子进程（pkg:sub）不在其中。
+        val mainPids = proc?.byName?.get(pkg) ?: return null
+        if (r.pid <= 0 || r.pid !in mainPids) return null
+        return r.nofraudCount to r.nofraudLeg
     }
 
     companion object {
@@ -408,6 +443,8 @@ object FrameworkProbe {
                 val si = c.getColumnIndex(CfgProvider.COL_START)
                 val ai = c.getColumnIndex(CfgProvider.COL_BEAT)
                 val ei = c.getColumnIndex(CfgProvider.COL_EPOCH)
+                val nci = c.getColumnIndex(CfgProvider.COL_NF_COUNT)
+                val nli = c.getColumnIndex(CfgProvider.COL_NF_LEG)
                 if (pi < 0 || vi < 0 || ai < 0) return null
                 while (c.moveToNext()) {
                     val p = c.getString(pi) ?: continue
@@ -418,7 +455,9 @@ object FrameworkProbe {
                         if (bi >= 0) (c.getString(bi) ?: "") else "",
                         if (si >= 0) c.getLong(si) else 0L,
                         if (ei >= 0) (c.getString(ei) ?: "").trim() else "",
-                        c.getLong(ai)
+                        c.getLong(ai),
+                        if (nci >= 0) c.getInt(nci) else -1,
+                        if (nli >= 0) (c.getString(nli) ?: "").trim() else ""
                     )
                 }
             }
