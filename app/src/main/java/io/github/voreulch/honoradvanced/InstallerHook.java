@@ -1394,7 +1394,8 @@ public final class InstallerHook {
             // skipped and j() wins.
             // 38.301 ed1/bx1 · 14.0.22.x br0 · 14.0.39.301 md1 (md1.b(sd1,
             // boolean), marker iface sd1, delivery PIA$b.c(ld1, de1))
-            Class<?>[] cs = locateAll(new String[]{"ed1", "br0", "bx1", "md1"},
+            // 14.0.40.301: yd1（锚串命中；ed1/br0 在这版被改成了无关类）
+            Class<?>[] cs = locateAll(new String[]{"ed1", "br0", "bx1", "md1", "yd1"},
                     "HnAppCheckJob", "insertRiskAppDb");
             // 14.0.22.322 线的入口不在 br0 类里：这一版 br0 还是**接口**
             // （326/327 起才变成带内嵌回调接口的类），真正对外的门面是
@@ -2357,7 +2358,8 @@ public final class InstallerHook {
             // (DivideButtonModule) -> boolean — one rule covers both.
             // 38.301 xt1.O · 14.0.22.x nz0.g · 14.0.39.301 hu1.P — the
             // (DivideButtonModule) -> boolean shape is unchanged
-            Class<?>[] cs = locateAll(new String[]{"xt1", "nz0", "hc2", "pz0", "hu1"},
+            // 14.0.40.301: yu1（同一对锚串仍命中）
+            Class<?>[] cs = locateAll(new String[]{"xt1", "nz0", "hc2", "pz0", "hu1", "yu1"},
                     "WebInterceptStrategyUtil", "LinkTrafficUtils");
             Method m = resolveAny(cs, "boolean",
                     "com.hihonor.packageinstaller.entity.resp.DivideButtonModule");
@@ -2380,7 +2382,7 @@ public final class InstallerHook {
             // (CleanSpeedUpModule, boolean, boolean) -> boolean.
             // 14.0.39.301: hu1.u(CleanSpeedUpModule, boolean, boolean) ->
             // boolean — same shape as the 38.301 / 14.0.22.x rule
-            Class<?>[] cs = locateAll(new String[]{"xt1", "nz0", "hc2", "pz0", "hu1"},
+            Class<?>[] cs = locateAll(new String[]{"xt1", "nz0", "hc2", "pz0", "hu1", "yu1"},
                     "WebInterceptStrategyUtil", "LinkTrafficUtils");
             Method m = resolveAny(cs, "boolean",
                     "com.hihonor.packageinstaller.entity.resp.CleanSpeedUpModule",
@@ -2406,7 +2408,7 @@ public final class InstallerHook {
             // no longer references "AdNetworkUtil" on 326/327/39.301, so the
             // strict {AdNetworkUtil, SafeModeShowUtils} set only covers the
             // old builds; the single-string set covers the new ones.
-            Class<?>[] cs = locateAllUnion(new String[]{"lc1", "js0", "vz1", "tc1"},
+            Class<?>[] cs = locateAllUnion(new String[]{"lc1", "js0", "vz1", "tc1", "fd1"},
                     new String[]{"AdNetworkUtil", "SafeModeShowUtils"},
                     new String[]{"SafeModeShowUtils"});
             Method m = resolveAny(cs, "boolean",
@@ -2459,7 +2461,7 @@ public final class InstallerHook {
             // info-card fill: 38.301 lc1.u2 · 14.0.22.x js0.j ·
             // 14.0.39.301 tc1.s2 — all share (View, String, Activity,
             // boolean) -> void. Same anchor-set split as the card-tips gate.
-            Class<?>[] cs = locateAllUnion(new String[]{"lc1", "js0", "vz1", "tc1"},
+            Class<?>[] cs = locateAllUnion(new String[]{"lc1", "js0", "vz1", "tc1", "fd1"},
                     new String[]{"AdNetworkUtil", "SafeModeShowUtils"},
                     new String[]{"SafeModeShowUtils"});
             Method m = resolveAny(cs, "void",
@@ -2500,7 +2502,9 @@ public final class InstallerHook {
             // 14.0.39.301: ap1.a keeps the 16-param shape and field "a" is
             // still a WeakReference to InstallStaging (lm1), so the body below
             // (get() -> isActive() -> p(-1)) is unchanged.
-            Class<?>[] cs = locateAll(new String[]{"po1", "eu1", "ap1"},
+            // 14.0.40.301: rp1.a 在尾部多加了一个 String（17 参），前 16 参
+            // 形状与 38.301/39.301 完全一致；field "a" 仍指向 InstallStaging。
+            Class<?>[] cs = locateAll(new String[]{"po1", "eu1", "ap1", "rp1"},
                     "InstallStagingPresenter", "TencentNoDetectUtils");
             Method m = resolveAny(cs, "void",
                     "java.lang.String", "java.lang.String", "java.lang.String",
@@ -2508,6 +2512,14 @@ public final class InstallerHook {
                     "java.lang.String", "java.lang.String", "java.lang.String",
                     "int", "int", "long", "int", "int",
                     "java.lang.String", "java.lang.String");
+            if (m == null) {
+                m = resolveAny(cs, "void",
+                        "java.lang.String", "java.lang.String", "java.lang.String",
+                        "java.lang.String", "java.lang.String", "long",
+                        "java.lang.String", "java.lang.String", "java.lang.String",
+                        "int", "int", "long", "int", "int",
+                        "java.lang.String", "java.lang.String", "java.lang.String");
+            }
             if (m == null) { absent("staging presenter entry"); return; }
             XposedBridge.hookMethod(m, new XC_MethodHook() {
                 @Override
