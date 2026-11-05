@@ -27,12 +27,11 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.repeatOnLifecycle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -67,6 +66,15 @@ import io.github.voreulch.honoradvanced.ui.component.FloatingBottomBarItem
  * fully rebuilt on the open-source miuix component library.
  */
 class SettingsActivity : ComponentActivity() {
+
+    companion object {
+        /** 上次自动检查更新「成功拿到远端结果」的时间（毫秒）；失败不写，下次打开可重试。 */
+        private const val KEY_UPDATE_CHECK_TS = "auto_update_check_ts"
+        /** 自动检查节流：1 小时内再次打开 App 直接跳过，完全静默。 */
+        private const val UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000L
+        /** 防止「检查进行中又打开一次 App」并发发起第二套请求。 */
+        @Volatile private var autoChecking = false
+    }
 
     /** QQ group join link (time-limited authKey); swap the whole URL on expiry. */
     private val qqJoinUrl =
@@ -137,29 +145,6 @@ class SettingsActivity : ComponentActivity() {
         h.restartCmd?.let { ScopeTarget(h.pkg, h.label, it) }
     } + ScopeTarget("__reboot__", "系统框架（需整机重启）", "reboot")
 
-    // 各开关依赖的作用域（用于"作用域状态"提示）。system_server（android）读不到
-    // 模块 provider、也没法自证，所以不列进来 —— 它在开机时随进程加载。
-    private val S_SYSTEMUI = listOf("com.android.systemui")
-    private val S_PHOTOS = listOf("com.hihonor.photos")
-    private val S_LAUNCHER = listOf("com.hihonor.android.launcher")
-    private val S_INSTALLER = listOf("com.android.packageinstaller")
-    // 温控的真实状态分三处 —— iaware / powergenie（同一进程的两个
-    // 包名）+ system_server（无法自证，用 persist.sys.has.sysprobe 属性判定）。
-    private val S_THERMAL = listOf(
-        "com.hihonor.iaware", "com.hihonor.powergenie", "android"
-    )
-    /** 安全组件里的窗口/系统级钩子都在 system_server（作用域显示为 android）。 */
-    private val S_SYSTEM = listOf("android")
-    /** 反诈组件在 securityserver 进程。 */
-    // 反诈现在要两个作用域 —— 反诈服务（securityserver）+ 感知服务（awareness）。
-    // 只列前者的话，界面会显示"作用域已生效"，但 awareness 那边根本没被注入，
-    // 反诈数据照样从感知服务流出去 —— 典型的假绿灯。
-    private val S_NOFRAUD = listOf("com.hihonor.securityserver", "com.hihonor.awareness")
-
-    /** 首页要检查的全部宿主（由宿主表派生）；常驻/按需的判定规则见 [homeHosts]。 */
-    private val S_HOME = homeHosts.map { it.pkg }
-
-
     // switch write target shared with hooks via CfgProvider
     private fun prefs() = getSharedPreferences(Cfg.PREFS_FILE, MODE_PRIVATE)
 
@@ -171,35 +156,11 @@ class SettingsActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         resumeTick.intValue++
-        // 每次回到前台重读一次作用域自证（重启作用域后切回来就能看到新状态）。
-        // 再补一次 2.5s 后的强制读：用户很可能刚在 LSPosed 里重启完进程，
-        // 那时 Application 还没上报，第一次读拿到的还是旧记录。
-        try { FrameworkProbe.refresh(this) } catch (_: Throwable) {}
-        // 进程是否存在也要重扫：重启作用域后回到前台，缺失项的标签才能从
-        // "已运行，未上报" 变成 "未启动"（或反过来）。
-        try { FrameworkProbe.refreshProc(this) } catch (_: Throwable) {}
-        FrameworkProbe.pokeFast(15_000L)
-        maybeWarnEpochFailure()
-        // 开机窗口期 provider 冷启动很慢：本机实测 iaware 要 try 32（约 16 秒），
-        // 用户设备更慢。只补一次 2.5s 不够，界面会一直停在"未收到回执"。
-        // 2.5s / 10s / 30s 各强制读一次，probe 一到就自动转成"已生效"。
-        resumeProbeShots.forEach { mainHandler.removeCallbacks(it) }
-        val probeDelays = longArrayOf(2500L, 10000L, 30000L)
-        val shots = probeDelays.map {
-            Runnable {
-                try { FrameworkProbe.refresh(this, true) } catch (_: Throwable) {}
-            }
+        // 回到前台也查一次版本：与 onCreate 共用同一套 1 小时节流 + 并发闸，
+        // 冷启动瞬间 onCreate 已经起请求时，这里的 autoChecking 会直接挡住。
+        try { autoCheckUpdate() } catch (t: Throwable) {
+            AppLog.d("update", "auto check skipped: " + t.javaClass.simpleName)
         }
-        resumeProbeShots = shots
-        shots.forEachIndexed { i, r -> mainHandler.postDelayed(r, probeDelays[i]) }
-    }
-
-    override fun onPause() {
-        // 熄屏 / 切后台后，onResume 排的 2.5s / 10s / 30s 补读也必须停，
-        // 否则 30 秒后还会在 Doze 里打一次 provider 查询，违背“熄屏不刷新”。
-        resumeProbeShots.forEach { mainHandler.removeCallbacks(it) }
-        resumeProbeShots = emptyList()
-        super.onPause()
     }
 
     override fun onDestroy() {
@@ -211,28 +172,6 @@ class SettingsActivity : ComponentActivity() {
         } catch (_: Throwable) {
         }
         super.onDestroy()
-    }
-
-    private var resumeProbeShots: List<Runnable> = emptyList()
-    private var epochFailWarnedAt = 0L
-
-    /**
-     * system_server 写 epoch 后自检失败时，用户必须看到明确报错。
-     *
-     * <p>以前只写属性、不回读，写失败也像成功（186 双源翻车的同类问题）。
-     * 现在 MainHook 回读失败会写 `epoch_state=FAIL:...`，这里负责弹一次 Toast；
-     * 首页同时把系统框架标成缺失，不会假绿。
-     */
-    private fun maybeWarnEpochFailure() {
-        val st = currentEpochState()
-        if (!st.startsWith("FAIL")) return
-        val now = android.os.SystemClock.uptimeMillis()
-        if (now - epochFailWarnedAt < 60_000L) return
-        epochFailWarnedAt = now
-        AppLog.d("epoch", "系统框架自检失败: $st")
-        Toast.makeText(this,
-            "系统框架自检失败（$st），本次不能确认模块已生效；请重启手机或检查 ROOT",
-            Toast.LENGTH_LONG).show()
     }
 
     private fun applyBinding(key: String, on: Boolean, restart: Boolean, onResult: ((Boolean) -> Unit)? = null) {
@@ -1084,7 +1023,7 @@ class SettingsActivity : ComponentActivity() {
                     for (k in Cfg.FN_KEYS) ed.putInt(k, Cfg.factoryDefPct(k))
                     // 真·出厂语义：六条玻璃线全部关闭。
                     for (k in glassSwitchKeys()) ed.putBoolean(k, false)
-                    // 恢复出厂同时关闭云控屏蔽（默认关）。
+                    // 恢复出厂同时关闭云控屏蔽（默认关；读写两层同键）。
                     ed.putBoolean(Cfg.K_NOCLOUD, false)
                     if (!ed.commit()) throw IllegalStateException("写入失败（存储异常）")
                     AppLog.d("glasscfg", "恢复原厂参数 成功")
@@ -1786,10 +1725,16 @@ class SettingsActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         AppLog.init(this)
         super.onCreate(savedInstanceState)
-        // 主线程先触碰一次：Compose 的 mutableStateOf 建在工作线程的过期 snapshot
-        // 上会在组合阶段抛 IllegalStateException（HonorHook 踩过同样的坑）
-        FrameworkProbe.warmUp()
         migratePrefs()
+        // 旧键 nocloud_nowrite 已并入 nocloud（读写两层同键）：取或后删除旧键。
+        prefs().let { p ->
+            if (p.contains("nocloud_nowrite")) {
+                val ed = p.edit()
+                if (p.getBoolean("nocloud_nowrite", false)) ed.putBoolean(Cfg.K_NOCLOUD, true)
+                ed.remove("nocloud_nowrite")
+                if (ed.commit()) notifyCfgChanged()
+            }
+        }
         // keep the system-property bridge in sync with the stored switch
         // (first run after install, or after the pref was changed elsewhere)
         try { syncHottempProp(prefs().getBoolean(Cfg.K_HOTTEMP, false)) } catch (_: Throwable) {}
@@ -1820,7 +1765,12 @@ class SettingsActivity : ComponentActivity() {
             window.setStatusBarColor(android.graphics.Color.TRANSPARENT)
             window.setNavigationBarColor(android.graphics.Color.TRANSPARENT)
         } catch (_: Throwable) {}
+        // 每次打开药师读一遍回执，决定首页那行「已激活 / 未激活」。
+        // 同步执行、只跑一次，不轮询、不留后台任务。
+        try { ActivationProbe.probe() } catch (_: Throwable) {}
         setContent { HasApp() }
+        // 打开 App 自动检查更新：后台请求、1 小时节流、只有发现新版本才提示。
+        try { autoCheckUpdate() } catch (t: Throwable) { AppLog.d("update", "auto check skipped: " + t.javaClass.simpleName) }
     }
 
     @Composable
@@ -1935,28 +1885,9 @@ class SettingsActivity : ComponentActivity() {
 
     @Composable
     private fun MinePage(go: (Page) -> Unit) {
-        val probeCtx = LocalContext.current
-        val lifecycleOwner = LocalLifecycleOwner.current
-        // 217：只在 RESUMED（前台可见）时轮询；熄屏 / 后台 / Doze 直接停。
-        // 恢复期（回前台、重启作用域、软重启后）3 秒一次，稳定后 30 秒一次。
-        LaunchedEffect(probeCtx, lifecycleOwner) {
-            lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
-                while (true) {
-                    val pm = probeCtx.getSystemService(android.content.Context.POWER_SERVICE)
-                            as? android.os.PowerManager
-                    if (pm == null || pm.isInteractive) {
-                        FrameworkProbe.refresh(probeCtx, true)
-                        FrameworkProbe.refreshProc(probeCtx)
-                    }
-                    val delayMs = if (FrameworkProbe.fastRefreshDue()) 3000L else 30000L
-                    kotlinx.coroutines.delay(delayMs)
-                }
-            }
-        }
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp)) {
             item { PageTitle("荣耀高级设置") }
-            item { Subtitle("基于MagicOS11开发") }
-            item { FrameworkCard() }
+            item { HomeSubtitle() }
             item { ActionCard("液态玻璃", "系统 / 锁屏 / 相册三线玻璃效果与总开关") { go(Page.Glass) } }
             item { ActionCard("安装器净化", "跳过安全检测、禁止联网、信息卡与降级安装") { go(Page.Installer) } }
             item { ActionCard("系统综合", "通知音量、高温限制与系统级行为的总开关集合") { go(Page.Misc) } }
@@ -1969,196 +1900,49 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
-    /** 首页顶部：模块在各作用域里的实际运行状态（回执 + 进程是否在）。 */
+    /**
+     * 首页标题下那行：原来的版本说明 + 激活状态点。
+     *
+     * <p>三态（见 {@link ActivationProbe}）：绿 = 读到回执（或 XposedBridge 可加载）；
+     * 红 = 读取成功但一条回执都没有；黄 = 读取本身出错，无法确认（不猜红）。
+     */
     @Composable
-    private fun FrameworkCard() {
-        val st = FrameworkProbe.state
-        // system_server 用 persist.sys.has.sysprobe 自证：属性存在但版本旧 / boot_id 不符，
-        // 说明系统框架跑的还是旧代码，首页必须一起报出来。
-        // 属性完全读不到（没 root / 首次安装）时不算失败，避免无 root 用户被误报。
-        val sysRaw = readProp("persist.sys.has.sysprobe")
-        val sysKnown = !sysRaw.isNullOrBlank()
-        // 217：版本 + boot_id + 框架代次 + epoch 自检状态 + pending 标记，全部要过。
-        // 软重启不改 boot_id，只有 epoch 能证明 system_server 这次真的重新加载了模块；
-        // pending=1 期间任何记录都不许判绿，堵住软重启换代的时间缝。
-        val epochPending = readProp("persist.sys.has.epoch_pending")?.trim() == "1"
-        val epochState = currentEpochState()
-        val sysOk = sysKnown && sysprobeBootMatches()
-                && sysprobeCode() >= BuildConfig.VERSION_CODE
-                && sysprobeEpochMatches()
-                && !epochPending && epochState == "OK"
-        // 只认本次 boot_id + 当前 epoch + 心跳新鲜，且进程确实还活着。
-        // iaware / powergenie 同进程，任一新鲜即算。
-        fun homeFresh(pkg: String): Boolean = when (pkg) {
-            "com.hihonor.iaware", "com.hihonor.powergenie" ->
-                st.has("com.hihonor.iaware") || st.has("com.hihonor.powergenie")
-            else -> st.has(pkg)
+    private fun HomeSubtitle() {
+        // 高饱和三色，浅色/深色共用同一套。
+        val (label, dot) = when (ActivationProbe.state) {
+            Activation.ACTIVE -> "已激活" to Color(0xFF00C853)
+            Activation.INACTIVE -> "未激活" to Color(0xFFFF1744)
+            else -> "无法确认" to Color(0xFFFFD600)
         }
-        fun hasAnyRecord(pkg: String): Boolean = when (pkg) {
-            "com.hihonor.iaware", "com.hihonor.powergenie" ->
-                st.reports.containsKey("com.hihonor.iaware")
-                        || st.reports.containsKey("com.hihonor.powergenie")
-            else -> st.reports.containsKey(pkg)
-        }
-        fun newestReport(pkg: String): ScopeReport? = when (pkg) {
-            "com.hihonor.iaware", "com.hihonor.powergenie" ->
-                listOfNotNull(st.reports["com.hihonor.iaware"],
-                    st.reports["com.hihonor.powergenie"]).maxByOrNull { it.at }
-            else -> st.reports[pkg]
-        }
-        /** 进程是否在跑（三态）；iaware / powergenie 同进程，任一在跑即算。 */
-        fun hostRunning(pkg: String): Boolean? = when (pkg) {
-            "com.hihonor.iaware", "com.hihonor.powergenie" -> {
-                val a = st.pkgRunning("com.hihonor.iaware")
-                val b = st.pkgRunning("com.hihonor.powergenie")
-                when {
-                    a == true || b == true -> true
-                    a == false && b == false -> false
-                    else -> null
-                }
-            }
-            else -> st.pkgRunning(pkg)
-        }
-        /**
-         * 只看主进程（不含 `pkg:*` 子进程）。
-         *
-         * <p>相册的 `:ml` / `:BGS` 常驻不代表主进程在：按需宿主的阻塞判定必须用它，
-         * 否则主进程都退了、只剩子进程时，回执一过期就永久黄。
-         */
-        fun hostMainRunning(pkg: String): Boolean? = st.proc?.byName?.get(pkg)?.isNotEmpty()
-        val sysMissing = sysKnown && !sysOk
-        // 常驻宿主：进程活着就必须有新鲜回执，缺一不可。
-        // 按需宿主：主进程没起 / 只起了 :ml 这类子进程 / 本次开机从没上报 → 中性，
-        // 不阻塞绿灯；本次开机上报过、主进程仍在跑，但回执过期或跑的是旧版模块 → 阻塞。
-        val requiredMissing = homeHosts.filter { it.alwaysOn && !homeFresh(it.pkg) }
-        val onDemandMissing = homeHosts.filter { h ->
-            !h.alwaysOn && hostMainRunning(h.pkg) == true &&
-                (st.expired(h.pkg) || st.stale(h.pkg))
-        }
-        val missing = requiredMissing.map { it.pkg } + onDemandMissing.map { it.pkg } +
-            if (sysMissing) listOf("android") else emptyList()
-        val anyReport = S_HOME.any { hasAnyRecord(it) }
-        val ok = missing.isEmpty()
-        // 每缺一项的状态短标签：未启动 / 已运行，未上报 / 已运行，回执过期 / 无法判断。
-        // 心跳暂停是独立状态行，绝不混进后缀。
-        fun missingTag(pkg: String): String {
-            if (pkg == "android") return "已运行，未上报"
-            // 按需宿主只会因「回执过期 / 旧版模块」进 missing，别把它写成「未上报」。
-            if (hostMainRunning(pkg) == true && (st.expired(pkg) || st.stale(pkg))) {
-                return "已运行，回执过期"
-            }
-            return when (hostRunning(pkg)) {
-                null -> "无法判断"
-                true -> "已运行，未上报"
-                false -> "未启动"
-            }
-        }
-        // 按需上报单独一行：信息不丢，但不参与绿灯判定。
-        val onDemandNote = "按需上报：" + homeHosts.filter { !it.alwaysOn }.joinToString(" / ") { h ->
-            h.label + "（" + when {
-                homeFresh(h.pkg) -> "已上报"
-                hostMainRunning(h.pkg) == true && (st.expired(h.pkg) || st.stale(h.pkg)) ->
-                    "已运行，回执过期"
-                hostRunning(h.pkg) == true -> "已运行，未上报"
-                hostRunning(h.pkg) == false -> "启动后自动上报"
-                else -> "无法判断"
-            } + "）"
-        }
-
-        /** 心跳暂停的独立说明：最后上报时刻 + 已过秒数。 */
-        fun heartbeatNote(pkg: String): String? {
-            val alive = when (pkg) {
-                "com.hihonor.iaware", "com.hihonor.powergenie" ->
-                    st.alive("com.hihonor.iaware") || st.alive("com.hihonor.powergenie")
-                else -> st.alive(pkg)
-            }
-            if (!alive) return null
-            val epochOk = when (pkg) {
-                "com.hihonor.iaware", "com.hihonor.powergenie" ->
-                    st.epochMatches("com.hihonor.iaware") || st.epochMatches("com.hihonor.powergenie")
-                else -> st.epochMatches(pkg)
-            }
-            if (!epochOk) return null
-            val r = newestReport(pkg) ?: return null
-            if (r.at <= 0L) return null
-            val age = (System.currentTimeMillis() - r.at).coerceAtLeast(0L)
-            if (age <= 5L * 60L * 1000L) return null
-            val time = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
-                .format(java.util.Date(r.at))
-            return scopeLabel(pkg) + " 最后上报 $time（已过 ${age / 1000} 秒）"
-        }
-        val title = when {
-            !st.probed -> "正在检测模块状态…"
-            ok -> "模块已生效"
-            !anyReport -> "模块未生效"
-            else -> "部分作用域未上报"
-        }
-        val sub = when {
-            !st.probed -> "读取作用域运行记录"
-            ok -> {
-                val names = S_HOME.filter { homeFresh(it) }.joinToString(" / ") { scopeLabel(it) }
-                val at = st.reports.values.filter { it.at > 0L }.maxOfOrNull { it.at } ?: 0L
-                "已加载 $names · ${FrameworkProbe.ago(at)}上报"
-            }
-            !anyReport -> "未收到任何作用域上报（请在 LSPosed 启用模块并勾选作用域后重启）"
-            else -> missing.joinToString("、") { scopeLabel(it) + "（" + missingTag(it) + "）" }
-        }
-        val accent = when {
-            !st.probed -> MiuixTheme.colorScheme.onSurfaceVariantSummary
-            ok -> Color(0xFF2FBF6B)
-            missing.isEmpty() -> Color(0xFF2FBF6B)
-            anyReport -> Color(0xFFE8A33D)
-            else -> Color(0xFFE5484D)
-        }
-        val pausedNotes = missing.mapNotNull { heartbeatNote(it) }.distinct()
-        val epochFailNote = if (epochState.startsWith("FAIL")) "系统框架自检失败：$epochState" else null
-        Card(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp), cornerRadius = 16.dp) {
-            Row(Modifier.padding(horizontal = 18.dp, vertical = 16.dp),
-                verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(10.dp).clip(CircleShape).background(accent))
-                Spacer(Modifier.width(12.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(title, fontSize = 17.sp, fontWeight = FontWeight.Bold,
-                        color = MiuixTheme.colorScheme.onSurface)
-                    Text(sub, fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                        modifier = Modifier.padding(top = 3.dp))
-                    pausedNotes.forEach {
-                        Text("心跳暂停：$it", fontSize = 11.sp,
-                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                            modifier = Modifier.padding(top = 2.dp))
+        Row(Modifier.padding(start = 8.dp, top = 4.dp, bottom = 12.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            Text("基于MagicOS11开发", fontSize = 14.sp,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            Spacer(Modifier.width(12.dp))
+            Box(
+                Modifier.size(8.dp)
+                    .clip(CircleShape)
+                    .background(dot)
+                    .drawBehind {
+                        // 环画在圆内（半径减半个环宽），不用 border：它居中描边，
+                        // 外侧会被上面的 clip 裁掉一半。实色 #808080 不随 Monet 调色板漂移。
+                        val w = 1.dp.toPx()
+                        drawCircle(
+                            color = Color(0xFF808080),
+                            radius = size.minDimension / 2 - w / 2,
+                            style = Stroke(width = w)
+                        )
                     }
-                    Text(onDemandNote, fontSize = 10.5.sp,
-                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                        modifier = Modifier.padding(top = 2.dp))
-                    if (epochFailNote != null) {
-                        Text(epochFailNote, fontSize = 11.5.sp, color = Color(0xFFE5484D),
-                            modifier = Modifier.padding(top = 2.dp))
-                    }
-                    Text("熄屏或后台不刷新，回到页面立即刷新", fontSize = 10.sp,
-                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.7f),
-                        modifier = Modifier.padding(top = 3.dp))
-                }
-                Text(when {
-                    !st.probed -> "…"
-                    ok -> "正常"
-                    anyReport -> "部分未上报"
-                    else -> "异常"
-                }, fontSize = 13.sp, color = accent)
-            }
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(label, fontSize = 14.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
         }
-    }
-
-    private fun scopeLabel(pkg: String): String = when (pkg) {
-        "android" -> "系统框架"
-        else -> homeHosts.firstOrNull { it.pkg == pkg }?.label ?: pkg
     }
 
     // ================= Glass =================
 
     @Composable
     private fun GlassPage(back: () -> Unit) {
-        val probeCtx = LocalContext.current
-        LaunchedEffect(Unit) { FrameworkProbe.refresh(probeCtx, true) }
         var subPage by rememberSaveable { mutableStateOf("") }
         var openGroup by rememberSaveable { mutableStateOf("") }
         // 导入用系统文件选择器：只让用户挑 json/txt，不申请任何存储权限。
@@ -2193,7 +1977,7 @@ class SettingsActivity : ComponentActivity() {
                 item { TipText("总开关控制所有玻璃效果；下面三条线各自进去开关和逐项调节。") }
                 item {
                     SwitchCard(listOf(
-                        SwRow("总开关", "液态玻璃总闸，含 HIGH 强制渲染、LIQUID 材质判定等系统级底层，关闭后全部回退原厂", Cfg.K_GLASS, true, scopes = S_SYSTEMUI)
+                        SwRow("总开关", "液态玻璃总闸，含 HIGH 强制渲染、LIQUID 材质判定等系统级底层，关闭后全部回退原厂", Cfg.K_GLASS, true)
                     ))
                 }
                 item {
@@ -2226,7 +2010,7 @@ class SettingsActivity : ComponentActivity() {
                 }
                 item {
                     SwitchCard(listOf(
-                        SwRow("相册液态玻璃", "相册照片页工具栏的玻璃效果", Cfg.K_GALLERY, true, scopes = S_PHOTOS)
+                        SwRow("相册液态玻璃", "相册照片页工具栏的玻璃效果", Cfg.K_GALLERY, true)
                     ))
                 }
                 item { Footnote("开关改动后需重启系统界面（或重启手机）生效。") }
@@ -2234,7 +2018,7 @@ class SettingsActivity : ComponentActivity() {
                 item { BackHeader("桌面液态玻璃", { subPage = "" }) }
                 item {
                     SwitchCard(listOf(
-                        SwRow("桌面液态玻璃", "桌面卡片与文件夹的玻璃效果", Cfg.K_DESK, true, scopes = S_LAUNCHER)
+                        SwRow("桌面液态玻璃", "桌面卡片与文件夹的玻璃效果", Cfg.K_DESK, true)
                     ))
                 }
                 item {
@@ -2255,7 +2039,7 @@ class SettingsActivity : ComponentActivity() {
                 item { BackHeader("系统液态玻璃", { subPage = "" }) }
                 item {
                     SwitchCard(listOf(
-                        SwRow("系统液态玻璃", "状态栏通知与控制中心的观感", Cfg.K_SYSTEM, true, scopes = S_SYSTEMUI)
+                        SwRow("系统液态玻璃", "状态栏通知与控制中心的观感", Cfg.K_SYSTEM, true)
                     ))
                 }
                 item {
@@ -2332,7 +2116,7 @@ class SettingsActivity : ComponentActivity() {
                 item { BackHeader("锁屏液态玻璃", { subPage = "" }) }
                 item {
                     SwitchCard(listOf(
-                        SwRow("锁屏液态玻璃", "锁屏按钮与通知卡片的玻璃效果", Cfg.K_KEYGUARD, true, scopes = S_SYSTEMUI)
+                        SwRow("锁屏液态玻璃", "锁屏按钮与通知卡片的玻璃效果", Cfg.K_KEYGUARD, true)
                     ))
                 }
                 item {
@@ -2400,7 +2184,16 @@ class SettingsActivity : ComponentActivity() {
                 item { BackHeader("通知横幅液态玻璃", { subPage = "" }) }
                 item {
                     SwitchCard(listOf(
-                        SwRow("通知横幅液态玻璃", "来通知时顶部弹出的横幅玻璃效果", Cfg.K_BANNER, true, scopes = S_SYSTEMUI)
+                        SwRow("通知横幅液态玻璃", "来通知时顶部弹出的横幅玻璃效果", Cfg.K_BANNER, true)
+                    ))
+                }
+                item {
+                    // 222：与上面的玻璃总闸相互独立 —— 只读横幅实际渲染出来的背景亮度，
+                    // 深底自动亮字、浅底自动暗字（含单色图标）。关闭即完全回原厂。
+                    SwitchCard(listOf(
+                        SwRow("通知横幅文字自适应反色",
+                            "按横幅实际背景自动用亮字或暗字（含图标）；关闭后完全恢复原厂配色",
+                            Cfg.K_HUN_INVERT, true)
                     ))
                 }
                 item {
@@ -2652,16 +2445,14 @@ class SettingsActivity : ComponentActivity() {
 
     @Composable
     private fun InstallerPage(back: () -> Unit) {
-        val probeCtx = LocalContext.current
-        LaunchedEffect(Unit) { FrameworkProbe.refresh(probeCtx, true) }
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp)) {
             item { BackHeader("安装器净化", back) }
             item { TipText("跳过安全检测、禁止联网、信息卡与降级安装。开关后需重启安装器生效，降级安装需重启手机生效。") }
             item {
                 SwitchCard(listOf(
-                    SwRow("总开关", "跳过安全检测与指纹验证、禁止联网、隐藏推广及多余卡片，关闭后全部回退原厂", Cfg.K_PURIFY, false, scopes = S_INSTALLER),
-                    SwRow("安装包信息卡", "展示版本 / 大小 / SDK / 架构信息卡；关闭时同时隐藏安全模式提醒", Cfg.K_INFOCARD, false, scopes = S_INSTALLER),
-                    SwRow("允许降级安装", "允许安装低于当前版本号的 APK", Cfg.K_DOWNGRADE, false, scopes = S_INSTALLER)
+                    SwRow("总开关", "跳过安全检测与指纹验证、禁止联网、隐藏推广及多余卡片，关闭后全部回退原厂", Cfg.K_PURIFY, false),
+                    SwRow("安装包信息卡", "展示版本 / 大小 / SDK / 架构信息卡；关闭时同时隐藏安全模式提醒", Cfg.K_INFOCARD, false),
+                    SwRow("允许降级安装", "允许安装低于当前版本号的 APK", Cfg.K_DOWNGRADE, false)
                 ))
             }
             item { Footnote("开关后需重启安装器生效，降级开关需重启手机生效") }
@@ -2678,28 +2469,6 @@ class SettingsActivity : ComponentActivity() {
      */
     @Composable
     private fun SecurityPage(back: () -> Unit) {
-        val probeCtx = LocalContext.current
-        val lifecycleOwner = LocalLifecycleOwner.current
-        // 反诈开关的"无法判断（稍后自动重试）"必须有真实重试（N-221-21）：
-        // 这页原来只有一次性刷新，回执晚到只能退出再进。这里补上和首页同口径的
-        // 前台轮询（恢复期 3 秒、稳定后 30 秒、后台/熄屏停）；FrameworkProbe.state
-        // 只在 SwitchRow 内被读取，重组范围就是反诈那一行及其开关卡，不重建整页。
-        LaunchedEffect(probeCtx, lifecycleOwner) {
-            lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
-                // 进入这页先给 1 分钟快刷窗口（3 秒一次），之后回落到 30 秒。
-                FrameworkProbe.pokeFast(60_000L)
-                while (true) {
-                    val pm = probeCtx.getSystemService(android.content.Context.POWER_SERVICE)
-                            as? android.os.PowerManager
-                    if (pm == null || pm.isInteractive) {
-                        FrameworkProbe.refresh(probeCtx, true)
-                        FrameworkProbe.refreshProc(probeCtx)
-                    }
-                    val delayMs = if (FrameworkProbe.fastRefreshDue()) 3000L else 30000L
-                    kotlinx.coroutines.delay(delayMs)
-                }
-            }
-        }
         // 清理是独立动作：按目录多选 -> 扫描列清单 -> 备份后删除，并提供恢复入口。
         var showPurgePicker by remember { mutableStateOf(false) }
         // 默认勾选只在数据层定：一级全部默认勾选；二级、三级默认不勾。
@@ -2726,7 +2495,7 @@ class SettingsActivity : ComponentActivity() {
                                 + "securityserver 侧不注册检测观察者、开关一律返回关闭、云控校验不通过；"
                                 + "awareness 侧诈骗行为事件写不进存储层、连不上感知服务。"
                                 + "两边都拿不到数据，自然谈不上上报。",
-                        Cfg.K_NOFRAUD, true, false, confirmOnEnable = true, scopes = S_NOFRAUD,
+                        Cfg.K_NOFRAUD, true, false, confirmOnEnable = true,
                         confirmTitle = "屏蔽反诈组件采集与上报",
                         confirmLines = listOf(
                             "反诈检测不再注册观察者（检测不启动）",
@@ -2744,20 +2513,19 @@ class SettingsActivity : ComponentActivity() {
             item {
                 SwitchCard(
                     rows = listOf(
-                    SwRow("屏蔽云控下发（CPU + 温控）",
-                        "只作用于 CPU 与温控策略这三份云控：CpuCfg / PgConfig / ThermalCfg "
-                                + "三个 Receiver，以及 cpuconfig / pg_config / thermal_config 三份 legacy 文件。"
-                                + "开关开 = 三份都挡（Receiver 不触发、文件按「不存在」处理）；关 = 全部放行。"
-                                + "和「屏蔽高温限制」互补：那个管设备已经热了别降频，这个管别再推新策略。",
-                        Cfg.K_NOCLOUD, true, false, confirmOnEnable = true, scopes = S_THERMAL,
-                        confirmTitle = "屏蔽云控下发（CPU + 温控）",
+                    SwRow("屏蔽云控下发（双重保险）",
+                        "一个开关管两层：① 三份云控（CpuCfg / PgConfig / ThermalCfg）的 Receiver 不再触发，legacy 文件按「不存在」处理；② PowerGenie 进程里所有云控的下发权限禁止（写 / 追加 / 删除 / 改名都返回成功但不产生真实文件）。关闭即刻放行，不需要重启。",
+                        Cfg.K_NOCLOUD, true, false, confirmOnEnable = true,
+                        confirmTitle = "屏蔽云控下发（双重保险）",
                         confirmLines = listOf(
                             "CpuCfgCotaUpdateReceiver / PgConfigCotaUpdateReceiver / ThermalCfgCotaUpdateReceiver 三个下发入口全拦",
-                            "cpuconfig / pg_config / thermal_config 三份 legacy 文件：exists / isFile / length / canRead / isDirectory 返回不存在，list / listFiles 返回 null",
-                            "FileInputStream / FileReader / RandomAccessFile / NIO 对这三份文件抛文件不存在",
-                            "只作用于 CPU 与温控策略；无障碍、权限、胶囊等其它 cota 配置不受影响"
+                            "cpuconfig / pg_config / thermal_config 三份 legacy 文件按「不存在」处理（exists / isFile / length / list 等全部返回不存在）",
+                            "只作用于 CPU 与温控策略；无障碍、权限、胶囊等其它 cota 配置不受影响",
+                            "云控策略文件写入改走 /dev/null，调用方看到的是「写好了」",
+                            "删除 / 改名返回成功，但原文件原样保留",
+                            "只作用于本模块已注入的 PowerGenie 进程，不影响系统其它进程"
                         ),
-                        confirmNote = "这里管「让系统读不到 / 收不到新策略」；想删掉已经落盘的文件，用下面的「清理云端配置残留（ROOT）」，两者不互相替代。")
+                        confirmNote = "想删已落盘的文件，用下面的「清理云端配置残留（ROOT）」。开关关闭即刻放行，不需要重启。")
                     ),
                     trailing = {
                     Row(
@@ -2812,12 +2580,7 @@ class SettingsActivity : ComponentActivity() {
                                 + "可以正常截图录屏。"
                                 + "需要两样东西：① LSPosed 里勾选「系统框架」（system_server，钩子装在那里）；"
                                 + "② ROOT（开关值要写成系统属性 persist.sys.has.nosecure 才能传过去）。"
-                                + "注：系统框架无法向本模块上报，所以这里不显示作用域状态，"
-                                + "勾没勾请到 LSPosed 模块页确认。",
-                        // 不传 scopes：system_server 无法向模块 provider 自证
-                        // （它 binder 到普通 app 的 provider 会挂住，MainHook 里明确排除了），
-                        // 所以 FrameworkProbe 永远认为 android 作用域缺失 —— 传了只会
-                        // 一直显示"作用域未生效"，哪怕功能已经正常工作。
+                                + "注：系统框架无法向本模块上报，勾没勾请到 LSPosed 模块页确认。",
                         Cfg.K_NOSECURE, true, false, confirmOnEnable = true,
                         confirmTitle = "允许截屏 / 录屏（需要 ROOT）",
                         confirmLines = listOf(
@@ -2972,25 +2735,21 @@ class SettingsActivity : ComponentActivity() {
 
     @Composable
     private fun MiscPage(back: () -> Unit) {
-        val probeCtx = LocalContext.current
-        LaunchedEffect(Unit) { FrameworkProbe.refresh(probeCtx, true) }
-        // bumped on every toggle so the system-layer status line re-reads the
-        // property (it lives inside the switch cell, not as a separate row)
+        // 开关改完重读一次系统属性：温控那一行的"系统层状态"要立刻反映结果。
         var statusTick by remember { mutableIntStateOf(0) }
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp)) {
             item { BackHeader("系统综合", back) }
             item { TipText("通知、温控与系统行为层面的综合开关：既能改善日常听感与信息呈现，也能解除系统在高温等场景下的自我限制；各项独立生效、互不影响。") }
             item {
                 val prop = remember(statusTick) { readProp(Cfg.PROP_HOTTEMP) }
-                val status = "系统层状态：" + (if (prop == "1") "已生效" else "已失效") +
-                        "　属性=" + (if (prop.isNullOrEmpty()) "未写入" else prop)
+                val status = "系统层状态：" + (if (prop == "1") "已生效" else "已失效")
                 SwitchCard(
                     rows = listOf(
-                        SwRow("屏蔽通知回避", "播放音乐时来消息通知不再压低音乐音量，通知音与音乐同时播放；闹钟不受影响", Cfg.K_NODUCK, true, false, scopes = S_SYSTEMUI),
+                        SwRow("屏蔽通知回避", "播放音乐时来消息通知不再压低音乐音量，通知音与音乐同时播放；闹钟不受影响", Cfg.K_NODUCK, true, false),
                         SwRow("屏蔽高温限制（ROOT）",
                             "系统高温时不弹提示、不限亮度、热状态按正常上报，压制 PowerGenie 温控（游戏限帧/后台清理），高温自动关机也不再触发；内核调度与降频仍由硬件层控制，本开关不干预",
                             Cfg.K_HOTTEMP, true, false, confirmOnEnable = true,
-                            statusText = status, statusOk = prop == "1", scopes = S_THERMAL)
+                            statusText = status, statusOk = prop == "1")
                     ),
                     onAfterChange = { statusTick++ }
                 )
@@ -3099,6 +2858,38 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * 打开 App 时自动检查更新（静默）：
+     * - 1 小时内已成功检查过 → 直接跳过，不提示、不打日志；
+     * - 复用 [UpdateChecker.check]（与「关于」页手动检查同一套请求，不另开一套）；
+     * - 只有「确认有新版本」才 Toast，其余（最新 / 检查中 / 失败 / 无网络 / 被节流）全静默；
+     * - 网络在 UpdateChecker 的后台线程，回调在主线程，这里只负责弹 Toast。
+     */
+    private fun autoCheckUpdate() {
+        val now = System.currentTimeMillis()
+        val last = prefs().getLong(KEY_UPDATE_CHECK_TS, 0L)
+        if (now - last < UPDATE_CHECK_INTERVAL_MS) return   // 节流：完全静默
+        if (autoChecking) return                            // 已有一次在飞，别并发
+        autoChecking = true
+        val localCode = try {
+            val pi = packageManager.getPackageInfo(packageName, 0)
+            if (android.os.Build.VERSION.SDK_INT >= 28) pi.longVersionCode.toInt()
+            else { @Suppress("DEPRECATION") pi.versionCode }
+        } catch (_: Throwable) { BuildConfig.VERSION_CODE }
+        UpdateChecker.check(localCode) { r ->
+            autoChecking = false
+            // 只有成功拿到远端结果才写时间戳；失败/超时下次打开还能再试。
+            if (r !is UpdateResult.Failed) {
+                try {
+                    prefs().edit().putLong(KEY_UPDATE_CHECK_TS, System.currentTimeMillis()).apply()
+                } catch (_: Throwable) {}
+            }
+            if (r is UpdateResult.Newer && !isFinishing && !isDestroyed) {
+                Toast.makeText(this, "检查到更新 v${r.info.versionName}，请到「关于」页更新", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
     /** 检查更新：只连 GitHub 公开接口；超时/失败都给出具体原因。 */
     private fun checkUpdate(onDone: () -> Unit) {
         Toast.makeText(this, "正在检查更新…", Toast.LENGTH_SHORT).show()
@@ -3177,12 +2968,6 @@ class SettingsActivity : ComponentActivity() {
     }
 
     // ================= shared composable building blocks =================
-
-    @Composable
-    private fun Subtitle(text: String) {
-        Text(text, fontSize = 14.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-            modifier = Modifier.padding(start = 8.dp, top = 4.dp, bottom = 12.dp))
-    }
 
     /** in-content big page title (28sp bold, left-aligned) — shared by
      *  Mine/About; sub-pages use BackHeader (with the back affordance) */
@@ -3299,12 +3084,10 @@ class SettingsActivity : ComponentActivity() {
         val confirmLines: List<String> = emptyList(),
         /** 确认框里"为什么需要这个开关"的补充说明 */
         val confirmNote: String? = null,
-        /** optional second line under the title (live system-level state) */
+        /** 标题下一行的系统层实时状态（目前只有温控那一行用） */
         val statusText: String? = null,
-        /** statusText 是否代表"正常"（决定文字颜色；"未生效"三个字里也含"已生效"，不能靠 contains 判断） */
-        val statusOk: Boolean = true,
-        /** 这个开关依赖哪些作用域 —— 未生效时在标题下面直接点出来 */
-        val scopes: List<String> = emptyList()
+        /** statusText 是否代表"正常"（决定文字颜色；"未生效"里也含"生效"，不能靠 contains） */
+        val statusOk: Boolean = true
     )
 
     @Composable
@@ -3339,7 +3122,6 @@ class SettingsActivity : ComponentActivity() {
                             if (!ok && !v) state[r.key] = true
                             onAfterChange?.invoke()
                         }
-                        if (v) warnMissingScopes(ctx, r.scopes)
                     }
                 }
                 if (i < rows.size - 1) {
@@ -3365,7 +3147,6 @@ class SettingsActivity : ComponentActivity() {
                     onConfirm = {
                         state[r.key] = true
                         applyBinding(r.key, true, r.restart) { onAfterChange?.invoke() }
-                        warnMissingScopes(ctx, r.scopes)
                         confirmRow = null
                     },
                     onDismiss = { confirmRow = null }
@@ -3378,7 +3159,6 @@ class SettingsActivity : ComponentActivity() {
                     onConfirm = {
                         state[r.key] = true
                         applyBinding(r.key, true, r.restart) { onAfterChange?.invoke() }
-                        warnMissingScopes(ctx, r.scopes)
                         confirmRow = null
                     },
                     onDismiss = { confirmRow = null }
@@ -3704,288 +3484,11 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
-    private val WarnColor = Color(0xFFE5484D)
-
-    /**
-     * 单个作用域是否真的在跑。
-     *
-     * <p>三处特殊处理：
-     * <ul>
-     *   <li>iaware / powergenie 是同一进程的两个包名 —— LSPosed 不一定两个都回调，
-     *       只要任一有新鲜回执就算生效，避免"温控服务"随机报红；</li>
-     *   <li>system_server 永远不进 probe 表（binder 会挂住），改读
-     *       persist.sys.has.sysprobe 的属性版本；</li>
-     *   <li>其余按 probe 记录判定。</li>
-     * </ul>
-     *
-     * <p>另外与首页同一口径：系统框架自检失败 / pending 期间一律不算生效，
-     * 否则会出现"首页自检失败、开关处却显示已生效"的矛盾。
-     */
-    private fun scopeLive(pkg: String): Boolean {
-        val st = FrameworkProbe.state
-        if (!epochUiOk()) return false
-        return when {
-            pkg == "android" -> sysprobeValid()
-            pkg == "com.hihonor.iaware" || pkg == "com.hihonor.powergenie" ->
-                st.has("com.hihonor.iaware") || st.has("com.hihonor.powergenie")
-            else -> st.has(pkg)
-        }
-    }
-
-    /**
-     * 与首页同一口径：pending 必须为 0、epoch_state 不得 FAIL。
-     *
-     * <p>顺序是硬性的：sysprobe 读不到只代表「system_server 还没写自证」，
-     * 不能拿它当提前放行的理由。旧写法把 sysprobe 判空放在最前，直接 return true，
-     * 把 pending=1 和 epoch_state=FAIL 一起绕过去了 —— 首次安装 / 软重启换代 /
-     * 属性读空的那几秒，开关行会显示「已生效」，首页却写「自检失败 / 换代中」，
-     * 两处口径相反。
-     *
-     * <p>正确顺序：先判 pending，再判 FAIL，最后才允许「sysprobe 为空」按无法自证
-     * 处理（不误报红）；sysprobe 有值时仍要求 epoch_state 为 OK。
-     */
-    private fun epochUiOk(): Boolean {
-        if (readProp("persist.sys.has.epoch_pending")?.trim() == "1") return false
-        val st = currentEpochState()
-        if (st.startsWith("FAIL")) return false
-        if (readProp("persist.sys.has.sysprobe").isNullOrBlank()) return true
-        return st == "OK"
-    }
-
-    /** 本次开机上报过、进程 pid 有效（心跳可能暂停）。用于深休眠后避免误报红。 */
-    private fun scopeAlive(pkg: String): Boolean {
-        val st = FrameworkProbe.state
-        return when {
-            pkg == "android" -> sysprobeBootMatches()
-            pkg == "com.hihonor.iaware" || pkg == "com.hihonor.powergenie" ->
-                st.alive("com.hihonor.iaware") || st.alive("com.hihonor.powergenie")
-            else -> st.alive(pkg)
-        }
-    }
-
-    /** 该作用域最近一次心跳距今多少毫秒（iaware/powergenie 取更近的一条）。 */
-    private fun scopeBeatAge(pkg: String): Long? {
-        val st = FrameworkProbe.state
-        return when (pkg) {
-            "com.hihonor.iaware", "com.hihonor.powergenie" ->
-                listOfNotNull(st.beatAgeMs("com.hihonor.iaware"),
-                    st.beatAgeMs("com.hihonor.powergenie")).minOrNull()
-            else -> st.beatAgeMs(pkg)
-        }
-    }
-
-    /** 该作用域最近一次心跳的时间戳（iaware/powergenie 取更近的一条）。 */
-    private fun scopeBeatAt(pkg: String): Long? {
-        val st = FrameworkProbe.state
-        return when (pkg) {
-            "com.hihonor.iaware", "com.hihonor.powergenie" ->
-                maxOf(
-                    st.reports["com.hihonor.iaware"]?.at ?: 0L,
-                    st.reports["com.hihonor.powergenie"]?.at ?: 0L
-                ).takeIf { it > 0L }
-            else -> st.reports[pkg]?.at?.takeIf { it > 0L }
-        }
-    }
-
-    /** 有回执但心跳已停超过 5 分钟（只对 probe 类作用域；system_server 走属性）。 */
-    private fun scopeExpired(pkg: String): Boolean {
-        val st = FrameworkProbe.state
-        return when {
-            pkg == "android" -> false
-            pkg == "com.hihonor.iaware" || pkg == "com.hihonor.powergenie" ->
-                !scopeLive(pkg) &&
-                    (st.expired("com.hihonor.iaware") || st.expired("com.hihonor.powergenie"))
-            else -> st.expired(pkg)
-        }
-    }
-
-    /** 进程在跑，但跑的是旧版本模块。 */
-    private fun scopeStale(pkg: String): Boolean {
-        val st = FrameworkProbe.state
-        return when {
-            pkg == "android" -> sysprobeBootMatches() &&
-                sysprobeCode() in 1 until BuildConfig.VERSION_CODE
-            pkg == "com.hihonor.iaware" || pkg == "com.hihonor.powergenie" ->
-                st.stale("com.hihonor.iaware") || st.stale("com.hihonor.powergenie")
-            else -> st.stale(pkg)
-        }
-    }
-
-    /** 读 system_server 注入痕迹的版本号（属性格式 "3.2.73(203)|<boot_id>"）。 */
-    private fun sysprobeCode(): Int {
-        val raw = readProp("persist.sys.has.sysprobe") ?: return -1
-        val verPart = raw.substringBefore('|')
-        val n = Regex("(\\d+)").findAll(verPart).lastOrNull()?.value?.toIntOrNull()
-        return n ?: -1
-    }
-
-    /** 属性里的 boot_id 是否等于本次开机（持久属性重启后不会消失）。 */
-    private fun sysprobeBootMatches(): Boolean {
-        val raw = readProp("persist.sys.has.sysprobe") ?: return false
-        val parts = raw.split('|')
-        if (parts.size < 2 || parts[1].isBlank()) return false
-        return parts[1].trim() == currentBootId()
-    }
-
-    /** sysprobe 第三段 = system_server 这次加载时写的框架代次（216 起）。 */
-    private fun sysprobeEpoch(): String? {
-        val raw = readProp("persist.sys.has.sysprobe") ?: return null
-        val parts = raw.split('|')
-        if (parts.size < 3) return null
-        return parts[2].trim().ifEmpty { null }
-    }
-
-    /** 框架代次三方一致：sysprobe 里记的 epoch == 当前 epoch 属性。 */
-    private fun sysprobeEpochMatches(): Boolean {
-        val sysEpoch = sysprobeEpoch() ?: return false
-        val cur = readProp("persist.sys.has.framework_epoch")?.trim() ?: ""
-        return cur.isNotEmpty() && cur == sysEpoch
-    }
-
-    private fun sysprobeValid(): Boolean =
-        sysprobeBootMatches() && sysprobeCode() >= BuildConfig.VERSION_CODE
-                && sysprobeEpochMatches()
-
-    private fun currentBootId(): String = try {
-        java.io.File("/proc/sys/kernel/random/boot_id").readText().trim()
-    } catch (_: Throwable) {
-        ""
-    }
-
-    /**
-     * 反诈挂载回执（N-221-11 / N-221-17）：**只信 probe 通道**。
-     *
-     * <p>`persist.sys.has.nofraud` 仍会写，但只用于排障，UI 判色不读它：
-     * 属性没有 boot 信息，跨开机的旧值会被当成有效；两套口径也容易互相打架。
-     *
-     * <p>返回 (挂载数, 来源腿)；null = 无法判断（读不到 / 本次开机还没上报）。
-     */
-    private fun nofraudReceipt(scopes: List<String>): Pair<Int, String>? {
-        val st = FrameworkProbe.state
-        if (!st.probed) return null
-        for (p in scopes) {
-            st.nofraud(p)?.let { return it }
-        }
-        return null
-    }
-
-    private fun scopeStatusOf(required: List<String>): Pair<String, Boolean>? {
-        if (required.isEmpty()) return null
-        val st = FrameworkProbe.state
-        if (!st.probed) return null
-        if (st.proc == null) {
-            return "作用域状态：无法判断（读不到进程表，请检查 ROOT）" to false
-        }
-        if (!st.running) {
-            // 本次开机都上报过，只是心跳暂停（深休眠/Doze）→ 黄色提示，不报红。
-            // 216：必须带上最后上报时刻和已过秒数，用户才能看出"停了多久"。
-            if (required.all { scopeAlive(it) }) {
-                val ages = required.mapNotNull { scopeBeatAge(it) }
-                val worst = ages.maxOrNull() ?: 0L
-                val last = required.mapNotNull { scopeBeatAt(it) }.maxOrNull() ?: 0L
-                val time = if (last > 0L) {
-                    java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
-                        .format(java.util.Date(last))
-                } else "未知"
-                return "作用域状态：本次开机已上报，心跳暂停（最后上报 $time，已过 ${worst / 1000} 秒）" to true
-            }
-            return "作用域状态：未检测到模块运行（在 LSPosed 启用模块并勾选作用域后重启生效）" to false
-        }
-        val miss = required.filter { !scopeLive(it) }
-        if (miss.isNotEmpty()) {
-            // 把「从没上报过」和「上报过但心跳停了」分开说。
-            // 后者很可能只是进程很久没重启，不是模块坏了 —— 一律显示
-            // "作用域未生效"，用户会以为要重新配置，白折腾。
-            if (miss.all { scopeExpired(it) }) {
-                val names = miss.joinToString("、") { scopeLabel(it) }
-                // 收紧归因（审核第③条）：只有"本次开机有过该包回执 + 主进程在跑 +
-                // 回执已过期"三条同时成立，才说回执未写入、等自动补报。
-                // 主进程没在跑的过期记录仍是"心跳已停"，不要引导用户空等。
-                val mainRunning = miss.all { st.mainProcessRunning(it) == true }
-                if (mainRunning) {
-                    return "作用域状态：${names} 主进程在运行，但模块回执未写入（本次开机有过上报且已超过 5 分钟；回到本应用后最多等 1 分钟会自动补报）" to false
-                }
-                return "作用域状态：${names} 的记录已超过 5 分钟未刷新（心跳已停，重启作用域即可更新，不一定是故障）" to true
-            }
-            val names = miss.joinToString("、") { pkg ->
-                if (pkg == "android") "系统框架（仍是旧版本或未加载，需重启手机）"
-                else scopeLabel(pkg)
-            }
-            return "作用域状态：${names} 作用域未生效（勾选并重启对应作用域）" to false
-        }
-        // 全部生效 → 默认隐藏，不打扰；只有"跑着旧版本、需要手动重启"才提一句
-        if (required.any { scopeStale(it) }) {
-            return "作用域状态：进程跑的是旧版本模块（重启对应作用域后更新）" to false
-        }
-        return null
-    }
-
-    /** 上一次挂起的作用域警告（连点开关时只保留最后一条，避免 Toast 排队）。 */
-    private var scopeWarnShot: Runnable? = null
-
-    /**
-     * 打开开关时如果依赖的作用域没生效，提醒一句 —— 避免用户以为已经用上了。
-     *
-     * 延迟 2.2s：applyBinding 自己会先弹一条"已开启…"，两条立刻叠加只会让
-     * 后一条盖掉前一条。用 applicationContext 是因为这条提示可能在页面销毁后
-     * 才到点。
-     */
-    private fun warnMissingScopes(ctx: android.content.Context, scopes: List<String>) {
-        if (scopes.isEmpty()) return
-        val st = FrameworkProbe.state
-        if (!st.probed) {
-            FrameworkProbe.refresh(ctx, true)
-            return
-        }
-        val msg: String = if (!st.running) {
-            "模块还没在任何作用域生效：请在 LSPosed 勾选后重启作用域"
-        } else {
-            val miss = scopes.filter { !scopeLive(it) }
-            if (miss.isEmpty()) return
-            miss.joinToString("、") { pkg ->
-                if (pkg == "android") "系统框架" else scopeLabel(pkg)
-            } + " 作用域未生效：请在 LSPosed 勾选后重启对应作用域"
-        }
-        val appCtx = ctx.applicationContext ?: ctx
-        scopeWarnShot?.let { mainHandler.removeCallbacks(it) }
-        val shot = Runnable { Toast.makeText(appCtx, msg, Toast.LENGTH_LONG).show() }
-        scopeWarnShot = shot
-        mainHandler.postDelayed(shot, 2200L)
-    }
-
     @Composable
     private fun SwitchRow(r: SwRow, checked: Boolean, onChange: (Boolean) -> Unit) {
         Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(r.title, fontSize = 16.sp, color = MiuixTheme.colorScheme.onSurface)
-                val info = scopeStatusOf(r.scopes)
-                // 反诈开关的判色顺序（N-221-10 / N-221-18）：
-                // 1) 已勾选 → **无条件先读挂载回执**（只信 probe，主进程 pid 过滤）；
-                // 2) 回执缺失 → 中性灰"无法判断（稍后自动重试）"，不永久红；
-                // 3) 挂载数 0 → 红字"本版本未找到反诈写入类，拦截未生效"；
-                // 4) 只有挂载数 >0 才进入原来的黄色/绿色分支。
-                if (r.key == Cfg.K_NOFRAUD && checked) {
-                    val nf = nofraudReceipt(r.scopes)
-                    when {
-                        nf == null -> Text("无法判断（稍后自动重试）", fontSize = 12.sp,
-                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                            modifier = Modifier.padding(top = 2.dp))
-                        nf.first == 0 -> Text("本版本未找到反诈写入类，拦截未生效",
-                            fontSize = 12.sp, color = WarnColor,
-                            modifier = Modifier.padding(top = 2.dp))
-                        else -> info?.let { (text, ok) ->
-                            Text(text, fontSize = 12.sp,
-                                color = if (ok) MiuixTheme.colorScheme.primary else WarnColor,
-                                modifier = Modifier.padding(top = 2.dp))
-                        }
-                    }
-                } else {
-                    info?.let { (text, ok) ->
-                        Text(text, fontSize = 12.sp,
-                            color = if (ok) MiuixTheme.colorScheme.primary else WarnColor,
-                            modifier = Modifier.padding(top = 2.dp))
-                    }
-                }
                 r.statusText?.let { s ->
                     Text(s, fontSize = 12.sp,
                         color = if (r.statusOk) MiuixTheme.colorScheme.primary
@@ -4113,7 +3616,7 @@ class SettingsActivity : ComponentActivity() {
                         "· 没有埋点统计、没有第三方 SDK、不做用户画像\n" +
                         "· 开关与参数只保存在本机应用私有目录，卸载即删除\n" +
                         "· 仅在您勾选的作用域进程内运行钩子逻辑，不碰其他应用\n" +
-                        "· 只有您点击「检查更新」时才会访问 GitHub 公开接口查版本号，其余时间完全不联网\n" +
+                        "· 启动或回到应用时最多每小时成功检查一次版本号（GitHub 公开接口），失败或断网时下次打开会重试；不传输任何个人数据；也可在「关于」页手动检查\n" +
                         "· 「诊断日志」只写入本机 LSPosed 本地日志，不会外发\n" +
                         "· 「导出诊断报告」只在您点击时生成一个文本文件，存在本机「下载」目录；发不发、发给谁完全由您决定\n\n" +
                         "模块申请的唯一网络权限用于「检查更新」，除此之外没有任何后台请求。",
@@ -4427,10 +3930,7 @@ class SettingsActivity : ComponentActivity() {
                 // 3) 清旧回执 + 进入 3 秒快速刷新窗口。
                 val cleared = CfgProvider.clearProbe(this)
                 AppLog.d("scope", "软重启前清空探针记录 ok=$cleared")
-                FrameworkProbe.pokeFast(60_000L)
                 runOnUiThread {
-                    FrameworkProbe.refresh(this, true)
-                    FrameworkProbe.refreshProc(this, true)
                     Toast.makeText(this, "正在软重启，屏幕会黑十几秒到半分钟，请不要操作、不要断电…",
                         Toast.LENGTH_LONG).show()
                 }
@@ -4524,11 +4024,6 @@ class SettingsActivity : ComponentActivity() {
                 }
             val cleared = CfgProvider.clearProbe(this, *probeKeys.toTypedArray())
             AppLog.d("scope", "清空探针记录 ok=$cleared keys=" + probeKeys.joinToString(","))
-            FrameworkProbe.pokeFast(60_000L)
-            runOnUiThread {
-                FrameworkProbe.refresh(this, true)
-                FrameworkProbe.refreshProc(this, true)
-            }
             val ok = suExec(targets.joinToString(" ; ") { it.cmd })
             AppLog.d("scope", "结果=" + (if (ok) "成功" else "失败"))
             runOnUiThread {
@@ -4536,10 +4031,6 @@ class SettingsActivity : ComponentActivity() {
                     if (ok) "已重启：$names" else "重启失败：su 没执行成功（检查 KernelSU/Magisk 里的授权）",
                     Toast.LENGTH_LONG).show()
             }
-            // 这里不再另排 3s / 8s 补读：那三个 Runnable 没进 resumeProbeShots，
-            // onPause 取消不到，点完"重启选中"就退出去/熄屏会在后台继续打 provider
-            // 查询，违背"熄屏或后台不刷新"。前台循环重启后有 60 秒快速窗口，
-            // 回到页面 onResume 也会立即刷新，补读没有价值。
         }.start()
     }
 }
