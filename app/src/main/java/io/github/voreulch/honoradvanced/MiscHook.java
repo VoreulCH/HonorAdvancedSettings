@@ -97,6 +97,9 @@ public final class MiscHook {
         // 文件本身是别的进程写的，拦不住；所以还要让 PowerGenie 读不到它们。
         // 伪造"文件不存在"→ 它回退到自己的原厂内置配置，不用我们覆盖任何内容。
         hookCotaFileAccess();
+        // **写入侧拦截**（独立开关 K_NOWRITE，默认关）。与上面三个 Receiver、
+        // 读取侧伪装都互不依赖：那个管"收不到 / 读不到"，这个管"就算收到也落不了盘"。
+        hookCloudWriteBlock();
         // Idempotent, but ONLY after a successful hook pass: the first
         // handleLoadPackage in the iaware process can arrive before HAware's
         // dex is reachable from that classloader (observed CNFE at boot,
@@ -735,12 +738,11 @@ public final class MiscHook {
     private static void hookAntiFraud(ClassLoader cl, String apkPath, String[] splitPaths) {
         // **总闸 / 断链 / 门面必须放在 sFraudDone 检查之前**。
         //
-        // 这是个真实的顺序 bug：这三层各自有幂等标记（失败会复位以便重试），
+        // 这是个真实的顺序 bug：这两层各自有幂等标记（失败会复位以便重试），
         // 但如果它们写在 `if (sFraudDone) return;` 之后，一旦逐点那部分先挂满
         // 把 sFraudDone 置成 true，这三个就再也不会被调用 ——
         // 其中任何一个曾经失败过，就永久失效，而且日志里看不出来。
         hookFraudSettings();
-        hookAwarenessBind();
         hookAwarenessClientWhole(cl);
 
         if (sFraudDone) return;
@@ -863,10 +865,10 @@ public final class MiscHook {
                         || nm.startsWith("scanCollect") || nm.startsWith("scanPayCollect")
                         || nm.startsWith("metroCollect") || nm.startsWith("cellularCollect")
                         || nm.startsWith("addJob") || nm.startsWith("addAppPredict")
-                        || nm.startsWith("addNearByCell")
-                        // beginDispatch 是所有请求的**起点**（dispatch* 只是分发），
-                        // 漏了它等于没堵住总入口
-                        || nm.startsWith("dispatch") || "beginDispatch".equals(nm);
+                        || nm.startsWith("addNearByCell");
+                // dispatchRequest / beginDispatch / dispatchWaitingRequest 不再按方法名
+                // 一刀切：它们的放行判断在 hookAwarenessClientWhole 的围栏白名单里，
+                // 只放行机主围栏 hostAoFaceIdFence，其余照拦。
                 if (!target) continue;
                 final String tag2 = nm;
                 try {
@@ -1049,117 +1051,75 @@ public final class MiscHook {
     }
 
     /**
-     * **断链**—— 不让 securityserver 连上感知服务。
+     * **请求级收窄** —— 只放行机主围栏 {@code hostAoFaceIdFence}，其余请求照旧拦。
      *
-     * <p>这是"整体拦截"里最省事的一刀：反诈的所有数据都来自
-     * {@code com.hihonor.awareness} 的围栏。围栏要工作，客户端必须先
-     * {@code bindService} 连上那个服务。**绑定直接返回失败**，后面
-     * 注册围栏、接收事件、上报数据整条链子自然全断，不用再逐个方法点去堵。
-     *
-     * <p>比拦 {@code awareness.dispatch*} 更靠上游：
+     * <p>为什么不再“整类置空”：连续认证（智能显示）与服务连接都走
+     * {@code AwarenessClient}。整类置空会把 {@code connectService} 与
+     * {@code dispatchRequest} 一起掐掉，securityserver 的机主识别因此永远
+     * 拿不到围栏事件。现在只保留“按请求判定”这一层：
      * <ul>
-     *   <li>dispatch 拦的是"数据已经采集完、准备分发"</li>
-     *   <li>这里拦的是"连不上服务" —— **采集根本没开始**</li>
+     *   <li>{@code dispatchRequest} / {@code beginDispatch} /
+     *       {@code dispatchWaitingRequest}：取围栏 ID，命中白名单才放行；</li>
+     *   <li>白名单为全等匹配、区分大小写；其余请求与取不到 ID 的一律拦；</li>
+     *   <li>连接/释放等内部方法不再拦，保证白名单请求真的发得出去。</li>
      * </ul>
-     *
-     * <p>代价（用户已确认接受）：securityserver 进程里其它依赖感知服务的
-     * 功能（统一认证的环境风控、异地登录判断）会一起失灵。查找手机
-     * （{@code HnAntiTheftDetectionService}）实测对 awareness 零依赖，不受影响。
-     *
-     * <p>作用域：只在 securityserver 进程里生效（Xposed 作用域限制），
-     * YOYO / 情景智能在它们自己的进程里，完全不受影响。
-     */
-    private static void hookAwarenessBind() {
-        if (!sAwarenessBindHooked.compareAndSet(false, true)) return;
-        try {
-            XC_MethodHook deny = new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        if (!Cfg.isOn(Cfg.K_NOFRAUD)) return;
-                        if (param.args == null || param.args.length == 0) return;
-                        Object a0 = param.args[0];
-                        if (!(a0 instanceof android.content.Intent)) return;
-                        android.content.Intent it = (android.content.Intent) a0;
-                        String pkg = it.getPackage();
-                        android.content.ComponentName cn = it.getComponent();
-                        String cls = cn == null ? null : cn.getClassName();
-                        boolean hit = (pkg != null && pkg.contains("awareness"))
-                                || (cls != null && cls.contains("awareness"));
-                        if (!hit) return;
-                        param.setResult(Boolean.FALSE);
-                        if (!sAwarenessBindLogged) {
-                            sAwarenessBindLogged = true;
-                            Diag.note("nofraud: 已拒绝绑定感知服务 -> "
-                                    + (pkg != null ? pkg : cls)
-                                    + "（围栏注册/采集/上报整链断开）");
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                }
-            };
-            int n = 0;
-            Class<?> impl = Class.forName("android.app.ContextImpl");
-            for (String mn : new String[]{"bindService", "bindServiceAsUser",
-                    "bindServiceInstance"}) {
-                try {
-                    XposedBridge.hookAllMethods(impl, mn, deny);
-                    n++;
-                } catch (Throwable ignored) {
-                }
-            }
-            Diag.note("ok: nofraud 断链拦截已挂上（ContextImpl " + n + " 个 bind 入口）");
-        } catch (Throwable t) {
-            sAwarenessBindHooked.set(false);
-            Diag.note("skip: nofraud 断链拦截失败 (" + t.getClass().getSimpleName() + ")");
-        }
-    }
-
-    /**
-     * **门面类整体拦截**—— 把 awareness 客户端的每个入口一次性全掐掉。
-     *
-     * <p>为什么不用字符串锚点：实测 {@code REGISTER_FENCE_BY_INTENT} /
-     * {@code AWARENESS_FENCE_IDENTIFIER} / 各种围栏名这些字符串**出现在字段初始化和
-     * 静态常量里，不在方法体内**，DexKit 的 {@code usingStrings} 按方法扫一个都命中不了
-     * （加进去之后挂载数还是 8，一点没涨）。
-     *
-     * <p>所以直接按**类**来：{@code AwarenessClient} 是围栏能力的唯一门面，注册、查询、
-     * 注销全从它走。把它的 boolean/int/void 方法全部按"失败/空"处理，等于整条能力下线。
-     *
-     * <p>保守边界：**只处理 boolean / int / void** 三种返回类型。
-     * 返回对象的方法一律不动 —— 给 null 会让调用方 NPE（比如链式调用
-     * {@code client.getXxx().doYyy()}），这类崩溃比"少拦一个方法"严重得多。
      */
     private static void hookAwarenessClientWhole(ClassLoader cl) {
         if (!sAwarenessClientHooked.compareAndSet(false, true)) return;
         try {
             Class<?> ac = cl.loadClass("com.hihonor.awareness.client.AwarenessClient");
             int n = 0;
-            for (final java.lang.reflect.Method m : ac.getDeclaredMethods()) {
+            for (java.lang.reflect.Method m : ac.getDeclaredMethods()) {
+                String nm = m.getName();
+                if (!"dispatchRequest".equals(nm)
+                        && !"beginDispatch".equals(nm)
+                        && !"dispatchWaitingRequest".equals(nm)) {
+                    continue;
+                }
                 Class<?> rt = m.getReturnType();
                 final boolean isBool = rt == boolean.class;
                 final boolean isInt = rt == int.class;
                 final boolean isVoid = rt == void.class;
-                if (!isBool && !isInt && !isVoid) {
-                    continue;
-                }
+                if (!isBool && !isInt && !isVoid) continue;
+                final String tag2 = nm;
                 try {
                     XposedBridge.hookMethod(m, new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             try {
-                                if (!Cfg.isOn(Cfg.K_NOFRAUD)) return;
+                                if (!Cfg.isOn(Cfg.K_NOFRAUD)) {
+                                    // 必修 2：一次性证明"请求确实到达了钩子，只是开关关着"。
+                                    if (sAwarenessOffLog < 1) {
+                                        sAwarenessOffLog++;
+                                        Diag.note("nofraud: off (围栏请求已到达，反诈开关为关)");
+                                    }
+                                    return;
+                                }
+                                String fid = fenceIdOf(param);
+                                if (isAllowedFence(fid)) {
+                                    if (sAwarenessAllowLog < 12) {
+                                        sAwarenessAllowLog++;
+                                        Diag.note("nofraud: allow fence=" + fid
+                                                + " via=" + tag2 + " type=" + messageTypeOf(param));
+                                    }
+                                    return;
+                                }
+                                if (fid == null) {
+                                    if (sAwarenessHoldLog < 12) {
+                                        sAwarenessHoldLog++;
+                                        Diag.note("nofraud: hold via=" + tag2
+                                                + " arg=" + argClassOf(param));
+                                    }
+                                } else if (sAwarenessBlockLog < 12) {
+                                    sAwarenessBlockLog++;
+                                    Diag.note("nofraud: 已阻断 " + tag2 + " fence=" + fid);
+                                }
                                 if (isVoid) {
                                     param.setResult(null);
                                 } else if (isBool) {
                                     param.setResult(Boolean.FALSE);
                                 } else {
                                     param.setResult(Integer.valueOf(0));
-                                }
-                                if (sAwarenessClientLog < 10) {
-                                    sAwarenessClientLog++;
-                                    Diag.note("nofraud: 已掐 AwarenessClient."
-                                            + m.getName() + "() → 空/失败");
                                 }
                             } catch (Throwable ignored) {
                             }
@@ -1170,24 +1130,159 @@ public final class MiscHook {
                 }
             }
             if (n > 0) {
-                Diag.note("ok: nofraud AwarenessClient 整体拦截已挂上（" + n + " 个入口）");
+                Diag.note("ok: nofraud 围栏白名单已挂上（" + n + " 个请求入口）");
             } else {
-                Diag.note("skip: nofraud AwarenessClient 无可挂方法");
+                Diag.note("skip: nofraud AwarenessClient 无可挂请求入口");
             }
+            // 必修 4：只读锚点，用来区分"没开 / 没挂 / 没连上 / 没发起"。
+            hookAwarenessConnectAnchors(ac);
         } catch (Throwable t) {
             sAwarenessClientHooked.set(false);
-            Diag.note("skip: nofraud AwarenessClient 整体拦截失败 ("
+            Diag.note("skip: nofraud 围栏白名单挂载失败 ("
                     + t.getClass().getSimpleName() + ")");
         }
     }
 
+    /**
+     * 只读锚点（必修 4）：{@code connectService} 与 {@code conn.onServiceConnected}。
+     * <p>只记录，绝不 {@code setResult}、绝不拦；挂不上如实报。
+     */
+    private static void hookAwarenessConnectAnchors(Class<?> ac) {
+        try {
+            java.util.Set<XC_MethodHook.Unhook> u =
+                    XposedBridge.hookAllMethods(ac, "connectService", new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            if (sAwarenessConnectLog < 12) {
+                                sAwarenessConnectLog++;
+                                Diag.note("nofraud: connectService -> bind");
+                            }
+                        }
+                    });
+            if (u == null || u.isEmpty()) {
+                Diag.note("skip: nofraud connectService 未挂上");
+            }
+        } catch (Throwable t) {
+            Diag.note("skip: nofraud connectService 未挂上 ("
+                    + t.getClass().getSimpleName() + ")");
+        }
+
+        // getDeclaredClasses() 按 JLS 不返回匿名类，conn / connNoSigned 只能按名探测（必修 1）。
+        java.util.LinkedHashSet<Class<?>> candidates = new java.util.LinkedHashSet<>();
+        try {
+            for (Class<?> c : ac.getDeclaredClasses()) candidates.add(c);
+        } catch (Throwable ignored) {
+        }
+        for (int i = 1; i <= 8; i++) {
+            try {
+                candidates.add(Class.forName(ac.getName() + "$" + i, false, ac.getClassLoader()));
+            } catch (Throwable ignored) {
+            }
+        }
+
+        int sites = 0;   // 探测到并声明了 onServiceConnected 的类数（= expect）
+        int hooked = 0;  // 实际挂上的方法数
+        for (Class<?> c : candidates) {
+            boolean declares = false;
+            try {
+                for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                    if ("onServiceConnected".equals(m.getName())) {
+                        declares = true;
+                        break;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            if (!declares) continue;
+            sites++;
+            final String via = probeTag(c, ac.getName());
+            try {
+                java.util.Set<XC_MethodHook.Unhook> u =
+                        XposedBridge.hookAllMethods(c, "onServiceConnected", new XC_MethodHook() {
+                            @Override
+                            protected void afterHookedMethod(MethodHookParam param) {
+                                if (sAwarenessConnectedLog < 12) {
+                                    sAwarenessConnectedLog++;
+                                    Diag.note("nofraud: onServiceConnected via=" + via);
+                                }
+                            }
+                        });
+                if (u != null) hooked += u.size();
+            } catch (Throwable ignored) {
+            }
+        }
+        if (sites > 0) {
+            // expect = 探测到的类数：少挂一个会显示"部分命中"，不再被 1/1 掩盖（必修 3）。
+            Diag.mount("nofraud.AwarenessClient.onServiceConnected", hooked, sites);
+        } else {
+            Diag.note("skip: nofraud onServiceConnected 未挂上");
+        }
+    }
+
+    /** 匿名类的 {@code getSimpleName()} 为空，退回二进制名后缀（{@code $2}/{@code $3}）以便区分签名/非签名服务。 */
+    private static String probeTag(Class<?> c, String base) {
+        String s = c.getSimpleName();
+        if (s != null && !s.isEmpty()) return s;
+        String n = c.getName();
+        return n.startsWith(base) ? n.substring(base.length()) : n;
+    }
+
+    /** 只放行机主围栏 {@code hostAoFaceIdFence}（注册与注销同 id）；全等匹配、区分大小写。 */
+    private static final String[] AWARENESS_ALLOWED_FENCE_IDS = {
+            "hostAoFaceIdFence"};
+
+    private static boolean isAllowedFence(String fenceId) {
+        if (fenceId == null) return false;
+        for (String id : AWARENESS_ALLOWED_FENCE_IDS) {
+            if (id.equals(fenceId)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 取请求的围栏 ID：{@code dispatchWaitingRequest(String)} 直接给 String；
+     * 其余请求对象反射 {@code getFenceId()}。取不到返回 null，调用方按“默认拦”。
+     */
+    private static String fenceIdOf(XC_MethodHook.MethodHookParam param) {
+        try {
+            if (param.args == null || param.args.length == 0) return null;
+            Object a0 = param.args[0];
+            if (a0 == null) return null;
+            if (a0 instanceof String) return (String) a0;
+            java.lang.reflect.Method g = a0.getClass().getMethod("getFenceId");
+            Object v = g.invoke(a0);
+            return v instanceof String ? (String) v : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 请求类型（{@code AwarenessRequest.getMessageType()}）；取不到打 ?，绝不打印参数内容。 */
+    private static String messageTypeOf(XC_MethodHook.MethodHookParam param) {
+        try {
+            if (param.args == null || param.args.length == 0 || param.args[0] == null) return "?";
+            Object v = XposedHelpers.callMethod(param.args[0], "getMessageType");
+            return v == null ? "?" : String.valueOf(v);
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
+    /** 只取第一个参数的类型名，绝不打印参数值。 */
+    private static String argClassOf(XC_MethodHook.MethodHookParam param) {
+        Object a0 = (param.args == null || param.args.length == 0) ? null : param.args[0];
+        return a0 == null ? "null" : a0.getClass().getSimpleName();
+    }
+
     private static final java.util.concurrent.atomic.AtomicBoolean sAwarenessClientHooked =
             new java.util.concurrent.atomic.AtomicBoolean(false);
-    private static volatile int sAwarenessClientLog = 0;
-
-    private static final java.util.concurrent.atomic.AtomicBoolean sAwarenessBindHooked =
-            new java.util.concurrent.atomic.AtomicBoolean(false);
-    private static volatile boolean sAwarenessBindLogged = false;
+    /** 允许与阻断分开限频：阻断先占满不能把白名单命中挤掉（必修 2）。 */
+    private static volatile int sAwarenessAllowLog = 0;
+    private static volatile int sAwarenessBlockLog = 0;
+    private static volatile int sAwarenessHoldLog = 0;
+    private static volatile int sAwarenessOffLog = 0;
+    private static volatile int sAwarenessConnectLog = 0;
+    private static volatile int sAwarenessConnectedLog = 0;
 
 
     /** 只认名字里带 fraud 的 key —— 别的 Settings（亮度、超时…）一概不碰。 */
@@ -1760,6 +1855,220 @@ public final class MiscHook {
     private static final java.util.concurrent.atomic.AtomicBoolean sCotaHideHooked =
             new java.util.concurrent.atomic.AtomicBoolean(false);
     private static volatile boolean sCotaHideLogged = false;
+
+    // ==================== 云控「禁止写入文件」（K_NOWRITE，默认关） ====================
+
+    /**
+     * 命中即禁写的路径前缀。只做前缀匹配，不做通配/正则，避免误伤。
+     *
+     * <p>来源（反编译实证，HAware 18.12.14.10）：
+     * <pre>
+     *   PGConfigUpdateManager.c0(...)  →  AtomicFile.startWrite()
+     *     · getDir("cloud_config", 0)/&lt;pushType&gt;.xml   云端下发的策略文件
+     *     · /data/cota/para/...                        legacy 云控配置
+     *   除此之外 PowerGenie 写文件都是电池统计 / 调试日志 / 数据库，
+     *   与云控无关，不在本开关范围内。
+     * </pre>
+     * {@code getDir("cloud_config", 0)} 的目录名固定为 {@code app_cloud_config}，
+     * 用 {@code contains} 匹配是为了同时覆盖 /data/data 与 /data/user/0 两种路径形态。
+     */
+    private static final String[] WRITE_BLOCK_PREFIXES = {
+            "/data/cota/para",
+            "/app_cloud_config/",
+    };
+
+    private static final java.util.concurrent.atomic.AtomicBoolean sWriteHooked =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    /** 日志限频：只打前 3 条，之后静默。 */
+    private static volatile int sWriteLogged = 0;
+
+    /** 路径是否命中禁写前缀（只读判断，不读开关）。 */
+    private static boolean isWriteBlockedPath(String p) {
+        if (p == null || p.length() < 8) return false;
+        for (String pre : WRITE_BLOCK_PREFIXES) {
+            if (p.startsWith(pre) || p.contains(pre)) return true;
+        }
+        return false;
+    }
+
+    /** 只记命中的**前缀**：不记完整路径、不记文件内容、不记包名。 */
+    private static void noteWriteBlock(String p) {
+        if (sWriteLogged >= 3) return;
+        for (String pre : WRITE_BLOCK_PREFIXES) {
+            if (p.startsWith(pre) || p.contains(pre)) {
+                sWriteLogged++;
+                Diag.note("nowrite: 已拦截写入（前缀 " + pre + "）" + sWriteLogged);
+                return;
+            }
+        }
+    }
+
+    /**
+     * 让云控配置**写不进磁盘**：命中路径前缀 -> 写/追加/删/改名全部变成空操作，
+     * 并且让调用方看到"成功"。
+     *
+     * <p>不抛异常、不返回 null：
+     * <ul>
+     *   <li>写流：把目标换成 {@code /dev/null}（真实可写设备），写调用本身完全正常；</li>
+     *   <li>AtomicFile.startWrite：给一个真实的 /dev/null 流，<b>绝不 setResult(null)</b>
+     *       —— 调用方 {@code PGConfigUpdateManager.c0} 会直接 writeTo(流)，null 必 NPE；</li>
+     *   <li>delete / renameTo：返回 true（假装成功），原文件原样保留；</li>
+     *   <li>NIO：delete/deleteIfExists/move/write/newOutputStream 各给一个安全返回值。</li>
+     * </ul>
+     *
+     * <p><b>作用域</b>：只在 {@link #initPowerGenie} 里安装 —— 也就是模块已注入的
+     * PowerGenie / IAware 进程，系统其它进程和别的包完全不受影响。
+     *
+     * <p><b>开关</b>：每个回调都现场读 {@link Cfg#isOn(String)}，不在安装时缓存；
+     * 关掉即刻放行，已挂的钩子保持惰性。
+     *
+     * <p><b>为什么不会引发重试刷屏</b>：所有入口都返回"成功"语义（流可写、delete/rename
+     * true），上层不会把失败当异常重试；写进 /dev/null 也没有任何 IO 错误。
+     */
+    private static void hookCloudWriteBlock() {
+        if (!sWriteHooked.compareAndSet(false, true)) return;
+        int points = 0;
+        // 1) 云控配置**唯一**的真实落盘入口：AtomicFile.startWrite（反编译确认
+        //    PGConfigUpdateManager.c0 是唯一调用点）。
+        try {
+            XC_MethodHook startWrite = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!Cfg.isOn(Cfg.K_NOWRITE)) return;
+                        Object o = param.thisObject;
+                        if (!(o instanceof android.util.AtomicFile)) return;
+                        String p = ((android.util.AtomicFile) o).getBaseFile().getPath();
+                        if (!isWriteBlockedPath(p)) return;
+                        param.setResult(new java.io.FileOutputStream("/dev/null"));
+                        noteWriteBlock(p);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            };
+            XposedBridge.hookAllMethods(android.util.AtomicFile.class, "startWrite", startWrite);
+            points++;
+        } catch (Throwable ignored) {
+        }
+        // 2) 普通写 / 追加（FileOutputStream(File|String, append) 全部构造器）。
+        //    FileWriter 内部也是 new FileOutputStream，一并覆盖。
+        try {
+            XC_MethodHook fos = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!Cfg.isOn(Cfg.K_NOWRITE)) return;
+                        if (param.args == null || param.args.length == 0) return;
+                        Object a0 = param.args[0];
+                        String p;
+                        if (a0 instanceof String) p = (String) a0;
+                        else if (a0 instanceof java.io.File) p = ((java.io.File) a0).getPath();
+                        else return;   // FileDescriptor 构造器没有路径，放行
+                        if (!isWriteBlockedPath(p)) return;
+                        // 换目标而不是抛异常：/dev/null 必然可写，调用方看到的是"写好了"。
+                        param.args[0] = (a0 instanceof String)
+                                ? (Object) "/dev/null" : (Object) new java.io.File("/dev/null");
+                        noteWriteBlock(p);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            };
+            XposedBridge.hookAllConstructors(java.io.FileOutputStream.class, fos);
+            points++;
+        } catch (Throwable ignored) {
+        }
+        // 3) 删文件：返回 true（假装成功），不删真实文件。
+        try {
+            XC_MethodHook del = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!Cfg.isOn(Cfg.K_NOWRITE)) return;
+                        Object o = param.thisObject;
+                        if (!(o instanceof java.io.File)) return;
+                        String p = ((java.io.File) o).getPath();
+                        if (!isWriteBlockedPath(p)) return;
+                        param.setResult(Boolean.TRUE);
+                        noteWriteBlock(p);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            };
+            XposedBridge.hookAllMethods(java.io.File.class, "delete", del);
+            points++;
+        } catch (Throwable ignored) {
+        }
+        // 4) 改名：AtomicFile.finishWrite 会把 .new 改名成正式文件，必须一起挡，
+        //    否则"写 /dev/null + 改名"仍会把目标文件换掉。返回 true 假装成功。
+        try {
+            XC_MethodHook ren = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!Cfg.isOn(Cfg.K_NOWRITE)) return;
+                        String p = null;
+                        Object o = param.thisObject;
+                        if (o instanceof java.io.File) p = ((java.io.File) o).getPath();
+                        Object a0 = (param.args != null && param.args.length > 0) ? param.args[0] : null;
+                        if (a0 instanceof java.io.File) {
+                            String q = ((java.io.File) a0).getPath();
+                            if (p == null || isWriteBlockedPath(q)) p = q;
+                        }
+                        if (!isWriteBlockedPath(p)) return;
+                        param.setResult(Boolean.TRUE);
+                        noteWriteBlock(p);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            };
+            XposedBridge.hookAllMethods(java.io.File.class, "renameTo", ren);
+            points++;
+        } catch (Throwable ignored) {
+        }
+        // 5) NIO 兜底（OTA 换实现时 java.io 那套可能被绕过）。
+        try {
+            XC_MethodHook nio = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!Cfg.isOn(Cfg.K_NOWRITE)) return;
+                        if (param.args == null || param.args.length == 0) return;
+                        String p = null;
+                        for (Object a : param.args) {
+                            if (a instanceof java.nio.file.Path) {
+                                String q = a.toString();
+                                if (isWriteBlockedPath(q)) {
+                                    p = q;
+                                    break;
+                                }
+                            }
+                        }
+                        if (p == null) return;
+                        String nm = param.method.getName();
+                        if ("delete".equals(nm)) param.setResult(null);               // void
+                        else if ("deleteIfExists".equals(nm)) param.setResult(Boolean.TRUE);
+                        else if ("move".equals(nm) || "write".equals(nm)) {
+                            param.setResult(param.args[0]);                            // 返回目标 Path
+                        } else if ("newOutputStream".equals(nm)) {
+                            param.setResult(new java.io.FileOutputStream("/dev/null"));
+                        } else return;
+                        noteWriteBlock(p);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            };
+            for (String mn : new String[]{"write", "delete", "deleteIfExists",
+                    "move", "newOutputStream"}) {
+                try {
+                    XposedBridge.hookAllMethods(java.nio.file.Files.class, mn, nio);
+                    points++;
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        Diag.note("nowrite: 云控禁止写入已挂载 " + points + " 个入口（开关默认关，开=生效）");
+    }
 
     private static boolean sExtraDone = false;
 
