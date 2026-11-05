@@ -109,8 +109,9 @@ public final class MainHook implements IXposedHookLoadPackage {
             // ⚠ 这个分支**一直没有 startPreload**。
             // 后果和 修的反诈分支一模一样：
             //   sSnapshot 永远是 null → isOn(K_NOCLOUD) 对 opt-in 键返回 false
-            //   → hookCloudPolicy 的每一处拦截都在 `if (!Cfg.isOn(K_NOCLOUD)) return`
-            //     那一行提前退出 → **云控屏蔽从头到尾没生效过**。
+            //   → 云控屏蔽（读/收 + 落盘两层同键）的每一处门控都在
+            //     `if (!Cfg.isOn(Cfg.K_NOCLOUD)) return` / `isOn(Cfg.K_NOWRITE)` 那一行提前退出
+            //     → **云控屏蔽从头到尾没生效过**。
             // 日志里只看得见"云控拦截至 23 处"（挂载计数），看不到任何一条
             // 实际拦截记录 —— 正好把这件事掩盖了。
             // 走 true：用户在设置里改开关后，下一次配置读取立即按新值判定。
@@ -134,6 +135,7 @@ public final class MainHook implements IXposedHookLoadPackage {
         if ("com.android.systemui".equals(pkg)) {
             enter("systemui", pkg, lpparam);
             MiscHook.initSystemUI(cl); // misc line: notification-ducking blocker
+            BannerContrastHook.init(cl); // 222: heads-up text contrast by real background
         } else if ("com.hihonor.android.launcher".equals(pkg)) {
             enter("launcher", pkg, lpparam);
         } else if ("com.hihonor.photos".equals(pkg)) {
