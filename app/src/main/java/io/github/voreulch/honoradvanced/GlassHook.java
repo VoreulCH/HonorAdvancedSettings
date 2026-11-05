@@ -2097,15 +2097,32 @@ public final class GlassHook implements IXposedHookLoadPackage {
                     if (lum > 0.35) return; // already light text
                     StackTraceElement[] st = Thread.currentThread().getStackTrace();
                     boolean notif = false;
+                    boolean headsUp = false;
+                    // 必须把 25 帧全部扫完：HUN 的绑定栈通常是
+                    // ...NotifInflater → NotificationRowBinderImpl → HeadsUpNotificationViewBinder，
+                    // 通用的 notification 帧在前，heads-up 帧在后；早先 break 在第一个匹配上，
+                    // 永远看不到后面的 heads-up。
                     for (int i = 0; i < st.length && i < 25; i++) {
                         String cn = st[i].getClassName();
-                        if (cn.contains("notification") || cn.contains("headsup")
-                                || cn.contains("HeadsUp") || cn.contains("NotifInflater")) {
+                        if (cn.contains("notification") || cn.contains("NotifInflater")) {
                             notif = true;
-                            break;
+                        }
+                        if (cn.contains("headsup") || cn.contains("HeadsUp")) {
+                            headsUp = true;
                         }
                     }
                     if (!notif) return;
+                    // N-222-03：inflate 阶段 TextView 往往还没挂到 ExpandableNotificationRow
+                    // 的父链上，靠栈帧/父链都判不出它将来是不是横幅。这种"尚未 attach"
+                    // 的文本一律不改色 —— 宁可不改，不许错改；通知类文字的最终着色
+                    // 统一交给 BannerContrastHook（按合成后的真实底色判定）。
+                    android.view.View row = notificationRowOf(param.thisObject);
+                    if (row == null) return;
+                    // 已经确定是横幅的也不在这里做（N-222）：这里只看壁纸明暗，
+                    // 与横幅玻璃后的实际底色无关，深色壁纸 + 浅色玻璃横幅就会把
+                    // 黑字刷成白字（用户实机截图）。通知栏卡片（非 heads-up）继续走
+                    // 原来的兜底，观感常数一个不动。
+                    if (headsUp || isHeadsUpRow(row)) return;
                     Object v = param.thisObject;
                     if (v instanceof android.widget.TextView) {
                         if (isWallpaperDark(((android.widget.TextView) v).getContext())) {
@@ -2122,6 +2139,36 @@ public final class GlassHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             log("skip: text-color fail: " + t);
         }
+    }
+
+    /**
+     * 目标 TextView 是否已经挂在 heads-up 行上（{@code ExpandableNotificationRow.mIsHeadsUp}）。
+     *
+     * <p>新横幅在 bind 阶段往往还没 attach，parent 链会断在 null；那种情况由
+     * {@link #hookTextColor()} 的栈帧判定兜底。两个判据任一成立就跳过壁纸反白。
+     */
+    private static boolean isHeadsUpRow(Object v) {
+        android.view.View row = notificationRowOf(v);
+        if (row == null) return false;
+        try {
+            return XposedHelpers.getBooleanField(row, "mIsHeadsUp");
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * 向上找到 {@code ExpandableNotificationRow}。找不到（TextView 尚未 attach）返回 null。
+     */
+    private static android.view.View notificationRowOf(Object v) {
+        if (!(v instanceof android.view.View)) return null;
+        android.view.View cur = (android.view.View) v;
+        for (int depth = 0; depth < 16 && cur != null; depth++) {
+            if (cur.getClass().getName().endsWith("ExpandableNotificationRow")) return cur;
+            android.view.ViewParent p = cur.getParent();
+            cur = p instanceof android.view.View ? (android.view.View) p : null;
+        }
+        return null;
     }
 
     private static void scaleAlphaField(Object obj, String field, float scale) throws Throwable {
