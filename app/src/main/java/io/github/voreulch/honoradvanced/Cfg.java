@@ -44,6 +44,14 @@ public final class Cfg {
     public static final String K_KEYGUARD = "keyguard";   // lockscreen buttons + cards (merged)
     public static final String K_GALLERY = "gallery";     // gallery photo page
     public static final String K_BANNER = "banner";       // heads-up banner (来通知时弹出的那条)
+    /**
+     * 通知横幅文字自适应反色（默认开启）。
+     *
+     * <p>与 {@link #K_BANNER}（横幅液态玻璃）相互独立：玻璃总闸关掉时本项仍然生效，
+     * 它只读横幅实际渲染出来的背景亮度来决定用亮字还是暗字。
+     * 默认开启 = 不进 {@link #isOptIn}，由 {@link #isOn} 的"缺失键 = !isOptIn"自动给出 true。
+     */
+    public static final String K_HUN_INVERT = "hun_invert";
     public static final String K_DESK = "desk";           // launcher 卡片玻璃（v2.6.20）
     public static final String K_PURIFY = "purify";       // installer purify master
     public static final String K_INFOCARD = "infocard";   // package info card
@@ -56,6 +64,13 @@ public final class Cfg {
     // 这几个都是"解除系统限制"型开关，默认全关、需要用户显式打开。
     public static final String K_NOSECURE = "nosecure";   // 允许截屏/录屏（清 FLAG_SECURE）
     public static final String K_NOCLOUD = "nocloud";     // 屏蔽性能/温控策略的云控下发
+    /**
+     * 云控「读/收」与「写盘」两层共用 {@link #K_NOCLOUD} 单键门控；
+     * 本常量只是同键别名，保留两个门控点是为了将来可一行拆回两个开关。
+     *
+     * <p>默认关，关掉即刻放行，不需要重启。
+     */
+    public static final String K_NOWRITE = K_NOCLOUD;
     public static final String K_NOFRAUD = "nofraud";     // 屏蔽反诈组件的数据采集与上报（只含 2 个 Fraud Processor）
     /**
      * 清理云端配置残留的占位键。
@@ -93,7 +108,7 @@ public final class Cfg {
 
     public static final String[] KEYS = {
             K_GLASS,
-            K_NOSECURE, K_NOCLOUD, K_NOFRAUD, K_PURGECOTA, K_SYSTEM, K_KEYGUARD, K_GALLERY, K_BANNER, K_DESK,
+            K_NOSECURE, K_NOCLOUD, K_NOFRAUD, K_PURGECOTA, K_SYSTEM, K_KEYGUARD, K_GALLERY, K_BANNER, K_HUN_INVERT, K_DESK,
             K_PURIFY, K_INFOCARD, K_DOWNGRADE, K_NODUCK, K_HOTTEMP, K_DIAG,
     };
 
