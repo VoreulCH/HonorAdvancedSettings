@@ -7,6 +7,12 @@ app/build/
 *.keystore
 local.properties
 
+# local backups / quarantine / scripts (never commit)
+_bak/
+tmp/
+*.ps1
+*.orig
+
 # IDE
 .idea/
 *.iml
